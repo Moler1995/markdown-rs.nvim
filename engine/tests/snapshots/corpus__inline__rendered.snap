@@ -1,0 +1,27 @@
+---
+source: engine/tests/corpus.rs
+expression: annotate(&doc)
+---
+width 80: 21 lines, 8 styles
+
+  0   0 |Text with bold, italic, both, `inline code` and struck through words.
+  1   0 |
+  2   2 |A link to somewhere and an
+  3   3 |autolink https://example.com/ and a bare URL https://example.com/plain.
+  4   3 |
+  5   5 |A link whose text is long enough that it would wrap if the wrapper were allowed
+  6   5 |to
+  7   6 |break inside it: this link's text is quite long indeed and keeps going.
+  8   6 |
+  9   8 |Escapes: *not italic*, _not emphasised_, and a backslash \ on its own.
+ 10   8 |
+ 11  10 |An em dash — and an ellipsis … and some CJK 中文文本 mixed in, plus an emoji 🎉.
+ 12  10 |
+ 13  12 |
+ 14  12 |────────────────────────────────────────────────────────────
+ 15  12 |
+ 16  14 |A horizontal rule sits above this paragraph.
+ 17  14 |
+ 18  16 |Hard break at the end of this line
+ 19  17 |and the next line follows immediately.
+ 20  17 |

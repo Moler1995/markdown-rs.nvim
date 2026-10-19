@@ -1,0 +1,26 @@
+---
+source: engine/tests/corpus.rs
+expression: annotate(&doc)
+---
+width 80: 20 lines, 10 styles
+
+  0   0 |
+  1   0 |╭ frontmatter ───────────────────────╮
+  2   1 |│ title: A document with frontmatter │
+  3   2 |│ tags:                              │
+  4   3 |│   - markdown                       │
+  5   4 |│   - rendering                      │
+  6   5 |│ date: 2026-10-19                   │
+  7   6 |╰────────────────────────────────────╯
+  8   7 |
+  9   8 |█ The body starts here
+ 10   8 |
+ 11  10 |Frontmatter is metadata, not a thematic break followed by text, so it renders as
+ 12  11 |a labelled block rather than as a horizontal rule.
+ 13  11 |
+ 14  13 |
+ 15  13 |────────────────────────────────────────────────────────────
+ 16  13 |
+ 17  15 |A `---` in the middle of a document is still a rule, because only a block at the
+ 18  16 |very start of the document is metadata.
+ 19  16 |

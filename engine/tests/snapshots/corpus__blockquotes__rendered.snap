@@ -1,0 +1,38 @@
+---
+source: engine/tests/corpus.rs
+expression: annotate(&doc)
+---
+width 80: 32 lines, 9 styles
+
+  0   0 |│ A single-level quote with a paragraph long enough to wrap at the corpus width
+  1   0 |so
+  2   1 |│ the quote border is repeated on the continuation line.
+  3   1 |
+  4   1 |
+  5   3 |│ A quote containing a list:
+  6   3 |
+  7   5 |│ • first
+  8   7 |│ • second
+  9   7 |│   ◦ nested
+ 10   7 |│
+ 11   7 |
+ 12   7 |
+ 13   9 |│ An outer quote
+ 14   9 |
+ 15  11 |│ with a nested quote inside it
+ 16  11 |
+ 17  13 |│ and a third level
+ 18  13 |
+ 19  13 |
+ 20  13 |
+ 21  13 |
+ 22  15 |│ A quote containing a fenced block:
+ 23  15 |
+ 24  17 |
+ 25  17 |╭──────────────────────╮
+ 26  18 |│ let quoted = true;   │
+ 27  19 |╰──────────────────────╯
+ 28  20 |
+ 29  20 |
+ 30  21 |A normal paragraph after the quotes, to check the border is not carried over.
+ 31  21 |

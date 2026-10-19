@@ -2,6 +2,15 @@
 //!
 //! Width-aware span wrapping and measurement.
 //!
+//! # Departure from the origin
+//!
+//! [`wrap_spans`] drops a character whose display width exceeds `max_width`
+//! outright. The origin placed such a character on a row of its own, which
+//! produced both a row wider than the budget and a spurious empty row before
+//! it. The origin never hit this — it laid out to a real terminal's width —
+//! but the engine's width guarantee is unconditional, so the character is
+//! dropped rather than allowed to overflow.
+//!
 //! This module is the **single source of truth** for display-width calculation
 //! over span lists. All other code in the crate that needs to know how wide a
 //! sequence of styled spans is, or how many visual rows it occupies at a given
@@ -291,6 +300,15 @@ fn emit_wrapped_hard_line(chars: &[(char, usize, Style)], max_width: usize, out:
             }
             let mut chunk_w: usize = 0;
             for &(ch, cw, style) in *word {
+                // A character wider than the entire budget can never be placed
+                // on any row. The origin emitted it anyway, which produced a
+                // row wider than `max_width` plus a spurious empty row before
+                // it (the flush fired with `chunk_w == 0`). The width guarantee
+                // is what callers size their windows against, so the character
+                // is dropped instead of allowed to overflow.
+                if cw > max_width {
+                    continue;
+                }
                 if chunk_w + cw > max_width {
                     out.push(pack_row(&row_buf));
                     row_buf.clear();
@@ -566,6 +584,41 @@ mod tests {
             let s: String = "你好世界".repeat(20);
             wrap_spans(&[raw(&s)], w)
         });
+    }
+
+    // ── case 8b: a character wider than the whole budget ─────────────────────
+
+    #[test]
+    fn a_character_wider_than_the_width_never_overflows() {
+        // A CJK character is two columns wide, so at a width of 1 there is no
+        // row it can be placed on — not even a row of its own. Every emitted
+        // row must still respect the budget, and there must be no spurious
+        // empty row ahead of the content.
+        let rows = wrap_spans(&[raw("你好世界")], 1);
+        for (i, row) in rows.iter().enumerate() {
+            assert!(
+                row.width <= 1,
+                "row {i} is {} columns wide at a width of 1",
+                row.width
+            );
+        }
+        assert_eq!(
+            rows.len(),
+            1,
+            "nothing can be placed at width 1, so the result is a single empty row"
+        );
+        assert!(rows[0].spans.is_empty());
+
+        // Narrower characters around the wide one are still placed.
+        let rows = wrap_spans(&[raw("a你b")], 1);
+        let placed: String = rows
+            .iter()
+            .flat_map(|r| r.spans.iter().map(|s| s.content.as_str()))
+            .collect();
+        assert_eq!(placed, "ab", "characters that do fit must still be emitted");
+        for row in &rows {
+            assert!(row.width <= 1);
+        }
     }
 
     // ── case 9: combining marks stay glued to their base char ────────────────

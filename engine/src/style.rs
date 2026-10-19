@@ -1,13 +1,18 @@
 //! The engine's display types.
 //!
-//! Ported from `markdown-reader` revision 4f0f635 (2026-10-14), MIT, (c) leboiko.
-//!
 //! These mirror the shape of the `ratatui` text types the render pipeline was
 //! written against, so the ported logic could be carried over in structure
 //! rather than rewritten around a different data model. Nothing here draws:
 //! a colour is three bytes, a style is a small struct, a span is text plus a
 //! style. The engine's only reason to have them is to describe what a reader
 //! should see; how it is painted is the caller's business.
+//!
+//! This module is new code. The `ratatui` types it stands in for are not
+//! ported — they are the API the origin's pipeline happened to be written
+//! against. The slice of that API the pipeline actually used turned out to be
+//! small (no `Stylize` calls, no `Alignment`, no layout or buffer types), so
+//! reimplementing it here was cheaper and clearer than rewriting every ported
+//! call site around a different data model.
 
 /// A colour, either absolute or one of the terminal's sixteen.
 ///

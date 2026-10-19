@@ -1,0 +1,33 @@
+---
+source: engine/tests/corpus.rs
+expression: annotate(&doc)
+---
+width 80: 27 lines, 4 styles
+
+  0   - |┌────────┬────────┬──────────┬───────────────────────────────────────────────┐
+  1   0 |│ Name   │  Type  │  Default │ Description                                   │
+  2   - |├────────┼────────┼──────────┼───────────────────────────────────────────────┤
+  3   2 |│ `width │ intege │       80 │ The column width to lay the document out for. │
+  4   2 |│ `      │   r    │          │                                               │
+  5   3 |│ `theme │ string │ `default │ The colour theme to render with.              │
+  6   3 |│ `      │        │        ` │                                               │
+  7   4 |│ `path` │ string │        — │ The markdown file to read; standard input     │
+  8   4 |│        │        │          │ when omitted.                                 │
+  9   - |└────────┴────────┴──────────┴───────────────────────────────────────────────┘
+ 10   6 |A table whose columns cannot all fit at their natural width:
+ 11   6 |
+ 12   - |┌──────────┬──────────────────────────────────────────────────────────────────┐
+ 13   8 |│ Identifi │ Summary                                                          │
+ 14   8 |│ er       │                                                                  │
+ 15   - |├──────────┼──────────────────────────────────────────────────────────────────┤
+ 16  10 |│ alpha    │ A description that is comfortably longer than the column can     │
+ 17  10 |│          │ hold at the corpus width, so the cell has to wrap.               │
+ 18  11 |│ beta     │ Short.                                                           │
+ 19   - |└──────────┴──────────────────────────────────────────────────────────────────┘
+ 20  13 |A minimal table:
+ 21  13 |
+ 22   - |┌───┬───┐
+ 23  15 |│ a │ b │
+ 24   - |├───┼───┤
+ 25  17 |│ 1 │ 2 │
+ 26   - |└───┴───┘

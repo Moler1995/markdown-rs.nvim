@@ -132,13 +132,26 @@ impl<'a> Layout<'a> {
         let source_line = source_line.min(self.max_source);
         let art_style = Style::default().fg(self.palette.foreground);
 
-        match render_text(source, Some(self.width as usize), MermaidTextBackend::Auto) {
-            Ok(art) => {
+        // `max_width` is a hint the layout backend uses to pick an orientation,
+        // not a clamp: a diagram can still come back wider than the budget.
+        // `push` would then word-wrap the artwork, shredding it into something
+        // that is neither a diagram nor readable source — so an over-wide
+        // drawing falls back to showing its source, exactly as a failed render
+        // does.
+        let art = render_text(source, Some(self.width as usize), MermaidTextBackend::Auto)
+            .ok()
+            .filter(|art| {
+                art.lines()
+                    .all(|line| UnicodeWidthStr::width(line) <= self.width as usize)
+            });
+
+        match art {
+            Some(art) => {
                 for line in art.lines() {
                     self.push(Some(source_line), &Line::from(Span::styled(line, art_style)));
                 }
             }
-            Err(_) => {
+            None => {
                 for (i, line) in source.lines().enumerate() {
                     let line_source = source_line.saturating_add(1).saturating_add(
                         crate::cast::u32_sat(i),

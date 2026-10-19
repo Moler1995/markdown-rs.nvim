@@ -142,8 +142,16 @@ struct MdRenderer {
     /// Invariant: `current_source_lines.len() == lines.len()` after every
     /// `flush_line` / `push_blank_line` call.
     current_source_lines: Vec<u32>,
-    /// 0-indexed source line where the current code block's opening fence sits.
+    /// 0-indexed source line where the current verbatim block begins.
+    ///
+    /// For a fenced block or a frontmatter block this is the line holding the
+    /// opening delimiter, and the content starts on the next line. An indented
+    /// code block has no delimiter, so its `span.start` *is* its first content
+    /// line. `code_block_fenced` is what tells the two apart — the language is
+    /// not a reliable signal, because an untagged fence has none either.
     code_block_start_line: u32,
+    /// Whether the current verbatim block was opened by a delimiter.
+    code_block_fenced: bool,
     /// 0-indexed source line where the current table's opening row sits.
     table_start_line: u32,
     /// Source line of the table row currently being accumulated.
@@ -181,6 +189,7 @@ impl MdRenderer {
             current_source_line: 0,
             current_source_lines: Vec::new(),
             code_block_start_line: 0,
+            code_block_fenced: false,
             table_start_line: 0,
             current_table_row_source_line: 0,
             table_row_source_lines: Vec::new(),
@@ -466,7 +475,7 @@ impl MdRenderer {
                     }
                     CodeBlockKind::Indented => None,
                 };
-                self.open_verbatim_block(lang, span);
+                self.open_verbatim_block(lang, span, matches!(kind, CodeBlockKind::Fenced(_)));
             }
             // Leading `---`/`+++` frontmatter. Accumulated exactly like a fenced
             // code block — the delimiters are not part of the event stream, so
@@ -477,7 +486,7 @@ impl MdRenderer {
                     MetadataBlockKind::YamlStyle => "yaml",
                     MetadataBlockKind::PlusesStyle => "toml",
                 };
-                self.open_verbatim_block(Some(lang.to_string()), span);
+                self.open_verbatim_block(Some(lang.to_string()), span, true);
             }
             Tag::List(start) => {
                 self.list_depth += 1;
@@ -689,9 +698,16 @@ impl MdRenderer {
     /// Both feed their body through `Event::Text` and both are closed by
     /// `render_code_block`, so they share this entry point rather than
     /// duplicating the bookkeeping. `span` is the opening tag's byte range.
-    fn open_verbatim_block(&mut self, lang: Option<String>, span: &Range<usize>) {
+    ///
+    /// `fenced` distinguishes the two shapes a code block can take. A fenced
+    /// block's `span.start` is the opening delimiter, so its first content line
+    /// is one further down; an indented block has no delimiter and its
+    /// `span.start` is already the first content line. Guessing from the
+    /// language would be wrong for an untagged fence.
+    fn open_verbatim_block(&mut self, lang: Option<String>, span: &Range<usize>, fenced: bool) {
         self.in_code_block = true;
         self.code_block_lang = lang;
+        self.code_block_fenced = fenced;
         self.code_block_content.clear();
         // Resolve the fence's source line.
         self.code_block_start_line = byte_offset_to_line(span.start, &self.line_boundaries);
@@ -747,6 +763,9 @@ impl MdRenderer {
 
         // Capture the fence's source line before any mutable borrows below.
         let code_start_line = self.code_block_start_line;
+        // Content line i of a fenced block sits on `start + 1 + i`; an indented
+        // block starts its content on `start` itself.
+        let content_offset: u32 = if self.code_block_fenced { 1 } else { 0 };
 
         // Widths are measured in display cells, not bytes, so that lines
         // containing multi-byte characters (em dashes, CJK, emoji, …) align with
@@ -779,9 +798,15 @@ impl MdRenderer {
             self.tokens.surface.raised,
         );
 
-        // Blank line before the box — maps to whatever was current before the
-        // block.
+        // Blank line before the box. It anchors to the block's own opening
+        // line, not to whatever `current_source_line` holds: the caller has
+        // already advanced that past the closing delimiter, and a blank
+        // claiming a *later* source line than the border that follows it would
+        // make the anchors non-monotone, which `build_source_map`'s forward
+        // scan cannot represent.
+        let restore_line = std::mem::replace(&mut self.current_source_line, code_start_line);
         self.push_blank_line();
+        self.current_source_line = restore_line;
 
         // Top border maps to the fence line. With a label the rule is split
         // around it; the total width is identical either way so the top and
@@ -859,14 +884,15 @@ impl MdRenderer {
             ));
 
             self.lines.push(Line::from(spans));
-            // Content line i (0-indexed) lives one source line after the fence.
+            // Content line i (0-indexed), offset past the delimiter when there
+            // is one.
             self.current_source_lines
-                .push(code_start_line + 1 + crate::cast::u32_sat(i));
+                .push(code_start_line + content_offset + crate::cast::u32_sat(i));
         }
 
         // Bottom border maps to the line after the last content line.
         let bottom_source_line =
-            code_start_line + 1 + crate::cast::u32_sat(self.code_block_content.len());
+            code_start_line + content_offset + crate::cast::u32_sat(self.code_block_content.len());
         self.lines.push(Line::from(Span::styled(
             format!("╰{}╯", "─".repeat(inner_width + 1)),
             border_style,

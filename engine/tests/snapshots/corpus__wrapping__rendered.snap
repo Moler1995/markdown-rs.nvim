@@ -1,0 +1,29 @@
+---
+source: engine/tests/corpus.rs
+expression: annotate(&doc)
+---
+width 80: 23 lines, 1 styles
+
+  0   0 |A paragraph with no explicit line breaks at all, which is the case that most
+  1   0 |exercises the wrapper: it has to find the break points itself, and the resulting
+  2   0 |lines must each fit the budget exactly while the whole paragraph still reads as
+  3   0 |one.
+  4   0 |
+  5   2 |A paragraph containing a word that is longer than any sensible column budget and
+  6   2 |therefore has to be split mid-word:
+  7   2 |pseudopseudohypoparathyroidismandthensomemoreletterstomakeitabsurdlylongindeed.
+  8   2 |
+  9   4 |A paragraph of CJK text, where every character is two columns wide, so the
+ 10   4 |wrapper cannot pack them the way it packs Latin words:
+ 11   4 |这是一段中文文本用来测试换行行为因为每个汉字都是两个显示列宽所以换行器不能像处理
+ 12   4 |英文单词那样处理它。
+ 13   4 |
+ 14   6 |A paragraph mixing both, 中文 and Latin words, so the width accounting has to be
+ 15   6 |right across the boundary.
+ 16   6 |
+ 17   8 |Short.
+ 18   8 |
+ 19  10 |A paragraph with multiple consecutive spaces which must survive verbatim because
+ 20  10 |they are load-bearing inside preformatted content, even though the line has to
+ 21  10 |wrap.
+ 22  10 |

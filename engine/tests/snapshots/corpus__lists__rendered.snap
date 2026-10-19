@@ -1,0 +1,36 @@
+---
+source: engine/tests/corpus.rs
+expression: annotate(&doc)
+---
+width 80: 30 lines, 3 styles
+
+  0   0 |• First bullet
+  1   2 |• Second bullet
+  2   2 |  ◦ Nested one
+  3   4 |  ◦ Nested two
+  4   4 |    ▪ Nested deeper
+  5   4 |
+  6   4 |
+  7   5 |• Third bullet
+  8   5 |
+  9   7 |1. First numbered
+ 10   9 |2. Second numbered
+ 11   9 |  1. Nested numbered
+ 12  10 |  2. Another nested numbered
+ 13  10 |
+ 14  11 |3. Third numbered
+ 15  11 |
+ 16  13 |• ☐ An unchecked task
+ 17  13 |
+ 18  13 |
+ 19  14 |• ☑ A checked task
+ 20  14 |
+ 21  14 |
+ 22  15 |• ☐ Another unchecked task
+ 23  15 |
+ 24  15 |
+ 25  18 |• A bullet with a paragraph long enough to wrap onto a second display line at
+ 26  18 |the width the corpus is rendered at, which exercises the continuation indent.
+ 27  18 |
+ 28  18 |
+ 29  18 |

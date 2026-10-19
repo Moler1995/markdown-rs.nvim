@@ -1,0 +1,21 @@
+---
+source: engine/tests/corpus.rs
+expression: annotate(&doc)
+---
+width 80: 15 lines, 5 styles
+
+  0   0 |█ Level one
+  1   0 |
+  2   2 |▌ Level two
+  3   2 |
+  4   4 |▎ Level three
+  5   4 |
+  6   6 |  Level four
+  7   6 |
+  8   8 |  Level five
+  9   8 |
+ 10  10 |  Level six
+ 11  10 |
+ 12  12 |A paragraph between headings, so that the blank-line handling around each
+ 13  13 |heading is exercised rather than being the only thing in the document.
+ 14  13 |

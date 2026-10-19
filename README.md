@@ -55,8 +55,22 @@ cargo test
 
 The committed `bin/md-render.exe` is a Windows build cross-compiled from Linux
 against the `x86_64-pc-windows-gnu` target. See
-[`docs/porting.md`](docs/porting.md) for how it is produced and what the plugin
-does when it is missing.
+[`docs/porting.md`](docs/porting.md) for what the plugin does when it is
+missing.
+
+### Rebuilding the committed binary
+
+There is no Windows Rust toolchain on the development machine, so the binary is
+built on a Linux host and copied back. From the repository root:
+
+```bash
+cargo build --release --target x86_64-pc-windows-gnu --bin md-render
+cp target/x86_64-pc-windows-gnu/release/md-render.exe bin/md-render.exe
+```
+
+The copy is the step that matters: `bin/md-render.exe` is what the plugin
+falls back to when `md-render` is not on `PATH`, and a stale copy is a plugin
+that renders with an old engine. Commit the result.
 
 ## Provenance
 

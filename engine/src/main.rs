@@ -27,8 +27,11 @@ struct Cli {
     /// Display width in columns.
     ///
     /// Every emitted line fits within this many columns.
-    #[arg(long)]
-    width: u16,
+    ///
+    /// Required for a render, but not for `--themes`, which exits before a
+    /// width could mean anything.
+    #[arg(long, required_unless_present = "themes")]
+    width: Option<u16>,
 
     /// Colour theme.
     ///
@@ -70,7 +73,10 @@ fn fail(message: &str) -> ExitCode {
 }
 
 fn run(cli: &Cli) -> Result<String, String> {
-    if cli.width == 0 {
+    // clap guarantees a width here: it is required unless `--themes` is set,
+    // and that path returns before reaching `run`.
+    let width = cli.width.unwrap_or(0);
+    if width == 0 {
         return Err("--width must be at least 1".to_string());
     }
 
@@ -79,7 +85,7 @@ fn run(cli: &Cli) -> Result<String, String> {
 
     let palette = Palette::from_theme(theme);
     let blocks = render_markdown(&content, &palette, theme);
-    let doc = layout_document(&blocks, cli.width, &palette, source_line_count(&content));
+    let doc = layout_document(&blocks, width, &palette, source_line_count(&content));
 
     serde_json::to_string(&doc).map_err(|err| format!("could not serialise the document: {err}"))
 }

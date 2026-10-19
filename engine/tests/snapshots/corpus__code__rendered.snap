@@ -1,0 +1,62 @@
+---
+source: engine/tests/corpus.rs
+expression: annotate(&doc)
+---
+width 80: 56 lines, 12 styles
+
+  0   0 |A fenced Rust block:
+  1   0 |
+  2   2 |
+  3   2 |╭─────────────────────────────────╮
+  4   3 |│ /// Doubles its argument.       │
+  5   4 |│ fn double(x: u32) -> u32 {      │
+  6   5 |│     x * 2                       │
+  7   6 |│ }                               │
+  8   7 |│                                 │
+  9   8 |│ fn main() {                     │
+ 10   9 |│     println!("{}", double(21)); │
+ 11  10 |│ }                               │
+ 12  11 |╰─────────────────────────────────╯
+ 13  12 |
+ 14  13 |A fenced Python block:
+ 15  13 |
+ 16  15 |
+ 17  15 |╭────────────────────────────╮
+ 18  16 |│ def double(x: int) -> int: │
+ 19  17 |│     return x * 2           │
+ 20  18 |│                            │
+ 21  19 |│ print(double(21))          │
+ 22  20 |╰────────────────────────────╯
+ 23  21 |
+ 24  22 |A fenced shell block:
+ 25  22 |
+ 26  24 |
+ 27  24 |╭──────────────────────╮
+ 28  25 |│ #!/usr/bin/env bash  │
+ 29  26 |│ set -euo pipefail    │
+ 30  27 |│ echo "$(date) hello" │
+ 31  28 |╰──────────────────────╯
+ 32  29 |
+ 33  30 |A block in a language the highlighter does not know:
+ 34  30 |
+ 35  32 |
+ 36  32 |╭────────────────────────────────────────╮
+ 37  33 |│ this line has no highlighting at all   │
+ 38  34 |│ but it must still be framed and padded │
+ 39  35 |╰────────────────────────────────────────╯
+ 40  36 |
+ 41  37 |An indented block:
+ 42  37 |
+ 43  39 |
+ 44  39 |╭─────────────────────────╮
+ 45  39 |│ indented code, no fence │
+ 46  40 |│ second line             │
+ 47  41 |╰─────────────────────────╯
+ 48  41 |
+ 49  42 |An untagged fence:
+ 50  42 |
+ 51  44 |
+ 52  44 |╭─────────────────────────────╮
+ 53  45 |│ plain text with no language │
+ 54  46 |╰─────────────────────────────╯
+ 55  46 |

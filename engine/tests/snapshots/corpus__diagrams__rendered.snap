@@ -1,0 +1,54 @@
+---
+source: engine/tests/corpus.rs
+expression: annotate(&doc)
+---
+width 80: 48 lines, 1 styles
+
+  0   0 |A flowchart:
+  1   0 |
+  2   2 |                                 ┌──────────────┐
+  3   2 |                                ▸│ Do the thing │────────────┐
+  4   2 |                             yes│└──────────────┘            │
+  5   2 |┌───────┐       ╱────────╲──────┘                            ▸┌──────┐
+  6   2 |│ Start │──────▸│ Choice │   no                               │ Done │
+  7   2 |└───────┘       ╲────────╱──────┐                            ▸└──────┘
+  8   2 |                                │┌────────────────────┐      │
+  9   2 |                                ▸│ Do the other thing │──────┘
+ 10   2 |                                 └────────────────────┘
+ 11  10 |
+ 12  11 |A sequence diagram:
+ 13  11 |
+ 14  13 | ┌──────────┐          ┌──────────┐
+ 15  13 | │  Client  │          │  Server  │
+ 16  13 | └──────────┘          └──────────┘
+ 17  13 |       ┆ request             ┆
+ 18  13 |       ──────────────────────▸
+ 19  13 |       ┆ response            ┆
+ 20  13 |       ◂┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+ 21  13 |       ┆                     ┆
+ 22  13 | ┌──────────┐          ┌──────────┐
+ 23  13 | │  Client  │          │  Server  │
+ 24  13 | └──────────┘          └──────────┘
+ 25  20 |
+ 26  21 |A state diagram:
+ 27  21 |
+ 28  23 |                                                      ╭───────╮
+ 29  23 |╭─────╮       ╭──────╮      start   ╭─────────╮  crash│╭─────╮│
+ 30  23 |(  ●  )──────▸│ Idle │─────────────▸│ Running │──────▸││  ●  ││
+ 31  23 |╰─────╯       ╰───▴──╯              ╰─────────╯       │╰─────╯│
+ 32  23 |                  │                    stop           ╰───────╯
+ 33  23 |                  └──────────────────────┘
+ 34  30 |
+ 35  31 |A diagram whose natural layout is wider than the corpus width. The layout
+ 36  32 |backend treats the width as a hint, not a clamp, so this one comes back 119
+ 37  33 |columns wide at any budget and must fall back to its source rather than being
+ 38  34 |word-wrapped into confetti:
+ 39  34 |
+ 40  37 |graph LR
+ 41  38 |A_Very_Long_Node_Identifier --> B_Another_Long_Node_Identifier -->
+ 42  38 |C_And_A_Third_One --> D_And_A_Fourth
+ 43  40 |
+ 44  41 |A fence that is not a diagram at all, which must fall back to its source:
+ 45  41 |
+ 46  44 |this is not a diagram
+ 47  45 |

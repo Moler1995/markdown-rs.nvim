@@ -1,6 +1,6 @@
-//! Saturating numeric casts.
-//!
 //! Ported from `markdown-reader` revision 4f0f635 (2026-10-14), MIT, (c) leboiko.
+//!
+//! Saturating numeric casts.
 //!
 //! The layout code counts things as `usize` and addresses display coordinates
 //! as `u16`/`u32`. Every conversion between them has to saturate rather than
