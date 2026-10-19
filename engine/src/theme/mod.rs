@@ -52,6 +52,7 @@ pub enum Theme {
     GruvboxDark,
     GruvboxLight,
     GithubLight,
+    CatppuccinMocha,
 }
 
 impl Theme {
@@ -65,6 +66,7 @@ impl Theme {
         Theme::GruvboxDark,
         Theme::GruvboxLight,
         Theme::GithubLight,
+        Theme::CatppuccinMocha,
     ];
 
     /// Human-readable display name for the theme.
@@ -78,6 +80,7 @@ impl Theme {
             Theme::GruvboxDark => "Gruvbox Dark",
             Theme::GruvboxLight => "Gruvbox Light",
             Theme::GithubLight => "GitHub Light",
+            Theme::CatppuccinMocha => "Catppuccin Mocha",
         }
     }
 
@@ -95,7 +98,7 @@ impl Theme {
     pub fn syntax_theme_name(self) -> &'static str {
         match self {
             Theme::Default | Theme::SolarizedDark | Theme::Nord => "base16-ocean.dark",
-            Theme::Dracula | Theme::GruvboxDark => "base16-eighties.dark",
+            Theme::Dracula | Theme::GruvboxDark | Theme::CatppuccinMocha => "base16-eighties.dark",
             Theme::SolarizedLight | Theme::GruvboxLight | Theme::GithubLight => "InspiredGitHub",
         }
     }
@@ -276,6 +279,56 @@ mod tests {
             assert_ne!(
                 p.on_accent_fg, p.accent,
                 "Theme {theme:?}: on_accent_fg == accent — text would be invisible",
+            );
+        }
+    }
+
+    /// Catppuccin Mocha's shipped values, checked against the upstream
+    /// palette rather than against whatever the theme constructor happens to
+    /// contain. A theme that drifts silently is worse than no theme: the
+    /// editor's catppuccin colours and the engine's would disagree on the same
+    /// screen, which is exactly the mismatch this theme exists to avoid.
+    #[test]
+    fn catppuccin_mocha_matches_the_upstream_palette() {
+        let p = Palette::from_theme(Theme::CatppuccinMocha);
+        let rgb = Color::Rgb;
+        for (slot, actual, expected, name) in [
+            ("background", p.background, rgb(0x1e, 0x1e, 0x2e), "base"),
+            ("foreground", p.foreground, rgb(0xcd, 0xd6, 0xf4), "text"),
+            ("dim", p.dim, rgb(0x6c, 0x70, 0x86), "overlay0"),
+            ("code_bg", p.code_bg, rgb(0x31, 0x32, 0x44), "surface0"),
+            ("border", p.border, rgb(0x45, 0x47, 0x5a), "surface1"),
+            ("accent", p.accent, rgb(0xcb, 0xa6, 0xf7), "mauve"),
+            ("accent_alt", p.accent_alt, rgb(0xf5, 0xc2, 0xe7), "pink"),
+            ("link", p.link, rgb(0x74, 0xc7, 0xec), "sapphire"),
+            ("h1", p.h1, rgb(0xf3, 0x8b, 0xa8), "red"),
+            ("h2", p.h2, rgb(0xfa, 0xb3, 0x87), "peach"),
+            ("h3", p.h3, rgb(0xf9, 0xe2, 0xaf), "yellow"),
+            ("inline_code", p.inline_code, rgb(0xa6, 0xe3, 0xa1), "green"),
+            ("table_header", p.table_header, rgb(0xb4, 0xbe, 0xfe), "lavender"),
+            ("list_marker", p.list_marker, rgb(0x74, 0xc7, 0xec), "sapphire"),
+            ("task_marker", p.task_marker, rgb(0xa6, 0xe3, 0xa1), "green"),
+            ("git_new", p.git_new, rgb(0xa6, 0xe3, 0xa1), "green"),
+            ("git_modified", p.git_modified, rgb(0xf9, 0xe2, 0xaf), "yellow"),
+        ] {
+            assert_eq!(actual, expected, "catppuccin_mocha {slot} should be {name}");
+        }
+    }
+
+    /// The new theme must not be a copy of an existing one — a variant that
+    /// renders identically is a variant nobody can tell they selected.
+    #[test]
+    fn catppuccin_mocha_is_distinct_from_the_other_themes() {
+        let mocha = Palette::from_theme(Theme::CatppuccinMocha);
+        for &theme in Theme::ALL {
+            if theme == Theme::CatppuccinMocha {
+                continue;
+            }
+            let other = Palette::from_theme(theme);
+            assert_ne!(
+                (mocha.background, mocha.accent, mocha.h1),
+                (other.background, other.accent, other.h1),
+                "catppuccin_mocha renders like {theme:?}",
             );
         }
     }

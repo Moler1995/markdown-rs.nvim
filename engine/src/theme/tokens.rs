@@ -142,6 +142,7 @@ impl Tokens {
             Theme::GruvboxDark => super::themes::gruvbox_dark(),
             Theme::GruvboxLight => super::themes::gruvbox_light(),
             Theme::GithubLight => super::themes::github_light(),
+            Theme::CatppuccinMocha => super::themes::catppuccin_mocha(),
         }
     }
 }

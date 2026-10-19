@@ -124,7 +124,13 @@ fn theme_name(theme: Theme) -> String {
 }
 
 fn parse_theme(name: &str) -> Result<Theme, String> {
-    serde_json::from_value(serde_json::Value::String(name.to_string())).map_err(|_| {
+    // Hyphens are accepted as well as underscores so that
+    // `--theme catppuccin-mocha` works alongside the canonical
+    // `catppuccin_mocha`. One spelling is canonical — the serde name, which
+    // `--themes` prints — and the other is a courtesy, not a second name to
+    // keep in step.
+    let normalised = name.replace('-', "_");
+    serde_json::from_value(serde_json::Value::String(normalised)).map_err(|_| {
         let names: Vec<String> = Theme::ALL.iter().copied().map(theme_name).collect();
         format!("unknown theme `{name}`; expected one of: {}", names.join(", "))
     })

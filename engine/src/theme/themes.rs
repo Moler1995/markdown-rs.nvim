@@ -637,3 +637,90 @@ pub(super) fn github_light() -> Tokens {
         },
     }
 }
+
+/// Catppuccin Mocha — official palette:
+/// <https://github.com/catppuccin/catppuccin#-palette>
+///
+/// The Mocha flavour's named hues, carried through under their upstream
+/// names. Slots with no obvious Catppuccin counterpart follow the same
+/// shape as the other dark themes here: `selection_bg` takes the third
+/// surface tier (so it clears both `base` and `raised` on the
+/// perceptual-distance invariant), and `on_accent` takes the page
+/// background, because every Catppuccin accent hue is bright enough
+/// that dark text on it is the readable choice.
+pub(super) fn catppuccin_mocha() -> Tokens {
+    let base = Color::Rgb(0x1e, 0x1e, 0x2e);
+    let mantle = Color::Rgb(0x18, 0x18, 0x25);
+    let surface0 = Color::Rgb(0x31, 0x32, 0x44);
+    let surface1 = Color::Rgb(0x45, 0x47, 0x5a);
+    let surface2 = Color::Rgb(0x58, 0x5b, 0x70);
+    let overlay0 = Color::Rgb(0x6c, 0x70, 0x86);
+    let subtext0 = Color::Rgb(0xa6, 0xad, 0xc8);
+    let text = Color::Rgb(0xcd, 0xd6, 0xf4);
+    let lavender = Color::Rgb(0xb4, 0xbe, 0xfe);
+    let sapphire = Color::Rgb(0x74, 0xc7, 0xec);
+    let green = Color::Rgb(0xa6, 0xe3, 0xa1);
+    let yellow = Color::Rgb(0xf9, 0xe2, 0xaf);
+    let peach = Color::Rgb(0xfa, 0xb3, 0x87);
+    let red = Color::Rgb(0xf3, 0x8b, 0xa8);
+    let mauve = Color::Rgb(0xcb, 0xa6, 0xf7);
+    let pink = Color::Rgb(0xf5, 0xc2, 0xe7);
+    Tokens {
+        surface: Surface {
+            base,
+            raised: surface0,
+            border: surface1,
+        },
+        text: Text {
+            primary: text,
+            muted: overlay0,
+            // Dark text on the bright mauve accent: 8.07:1.
+            on_accent: base,
+            title: text,
+        },
+        state: State {
+            selection_bg: surface2,
+            selection_fg: text,
+            focus: mauve,
+            search_bg: yellow,
+            current_match_bg: peach,
+            match_fg: base,
+        },
+        accent: Accent {
+            primary: mauve,
+            alt: pink,
+            link: sapphire,
+        },
+        syntax: Syntax {
+            inline_code: green,
+            code_fg: text,
+            code_border: surface2,
+        },
+        heading: Heading {
+            h1: red,
+            h2: peach,
+            h3: yellow,
+            other: text,
+        },
+        status: Status {
+            bg: mantle,
+            fg: subtext0,
+            help_bg: mantle,
+            gutter: overlay0,
+        },
+        list: List {
+            marker: sapphire,
+            task_marker: green,
+            block_quote_fg: subtext0,
+            block_quote_border: surface2,
+        },
+        table: Table {
+            header: lavender,
+            border: surface1,
+        },
+        git: Git {
+            new: green,
+            modified: yellow,
+        },
+    }
+}
