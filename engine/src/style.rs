@@ -273,3 +273,88 @@ impl From<Vec<Line>> for Text {
         Text { lines }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_default_colour_is_distinct_from_the_named_ones() {
+        // `Reset` means "leave the caller's colour alone" and must not be
+        // confused with a colour that happens to look like the terminal's
+        // default.
+        assert_eq!(Color::default(), Color::Reset);
+        assert_ne!(Color::Reset, Color::Gray);
+    }
+
+    #[test]
+    fn absolute_colours_keep_their_components() {
+        assert_eq!(Color::Rgb(0x12, 0x34, 0x56), Color::Rgb(0x12, 0x34, 0x56));
+        assert_ne!(Color::Rgb(0x12, 0x34, 0x56), Color::Rgb(0x12, 0x34, 0x57));
+        assert_ne!(Color::Indexed(1), Color::Indexed(2));
+        // An indexed colour is not the named colour that shares its slot: one
+        // is resolved by the caller's palette, the other by the terminal.
+        assert_ne!(Color::Indexed(1), Color::Red);
+    }
+
+    #[test]
+    fn a_style_can_combine_several_modifiers() {
+        let style = Style::new()
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::ITALIC);
+        assert!(style.has_modifier(Modifier::BOLD));
+        assert!(style.has_modifier(Modifier::ITALIC));
+        assert!(style.has_modifier(Modifier::BOLD.union(Modifier::ITALIC)));
+        assert!(!style.has_modifier(Modifier::UNDERLINED));
+
+        let style = style.remove_modifier(Modifier::BOLD);
+        assert!(!style.has_modifier(Modifier::BOLD));
+        assert!(style.has_modifier(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn an_empty_modifier_set_has_nothing_set() {
+        assert!(Modifier::empty().is_empty());
+        assert!(!Modifier::BOLD.is_empty());
+        assert!(Modifier::all().contains(Modifier::BOLD.union(Modifier::REVERSED)));
+    }
+
+    #[test]
+    fn patch_lets_the_overlay_win_and_keeps_what_it_leaves_unset() {
+        let base = Style::new()
+            .fg(Color::Red)
+            .bg(Color::Black)
+            .add_modifier(Modifier::BOLD);
+        // The overlay sets a foreground and italic, and says nothing about the
+        // background — which is the point: an unset field must not clear.
+        let patched = base.patch(Style::new().fg(Color::Blue).add_modifier(Modifier::ITALIC));
+
+        assert_eq!(patched.fg, Some(Color::Blue));
+        assert_eq!(patched.bg, Some(Color::Black));
+        assert!(patched.has_modifier(Modifier::BOLD));
+        assert!(patched.has_modifier(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn a_line_measures_its_columns_not_its_bytes() {
+        let line = Line::from(vec![
+            Span::raw("ab"),
+            Span::styled("中", Style::new().fg(Color::Rgb(1, 2, 3))),
+        ]);
+        assert_eq!(line.text(), "ab中");
+        // Three characters, four columns, five bytes: neither the byte length
+        // nor the character count is the number a layout cares about.
+        assert_eq!(line.width(), 4);
+        assert_eq!(line.text().chars().count(), 3);
+        assert_eq!(line.text().len(), 5);
+    }
+
+    #[test]
+    fn an_empty_string_makes_an_empty_line_not_a_span_of_nothing() {
+        // A span holding "" would still be a span, and the wire format would
+        // emit a zero-length entry for it.
+        assert!(Line::from("").spans.is_empty());
+        assert!(Line::from(String::new()).spans.is_empty());
+        assert_eq!(Line::from("x").spans.len(), 1);
+    }
+}
