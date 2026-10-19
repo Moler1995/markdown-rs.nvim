@@ -1,0 +1,31 @@
+[package]
+name = "md-render"
+description = "Render markdown to width-bounded styled display lines"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "md_render"
+path = "src/lib.rs"
+
+[[bin]]
+name = "md-render"
+path = "src/main.rs"
+
+# The dependency set is deliberately small and is asserted by a test in the
+# build: no terminal-drawing crate, no async runtime, no image decoder. The
+# engine renders once and hands back data, so anything that exists to own a
+# screen or a thread pool is weight it should not carry.
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+mermaid-text = { path = "../crates/mermaid-text" }
+pulldown-cmark = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+unicode-width = "0.2"
+
+[dev-dependencies]
+insta = "1"

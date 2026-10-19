@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = ["engine", "crates/mermaid-text"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT"
+
+[profile.release]
+# The engine is spawned once per render, so start-up latency is user-visible
+# and a smaller binary is a faster one to page in.
+opt-level = 3
+lto = "thin"
+strip = "symbols"
+panic = "abort"

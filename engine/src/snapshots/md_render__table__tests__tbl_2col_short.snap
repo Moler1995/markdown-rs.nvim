@@ -1,0 +1,10 @@
+---
+source: engine/src/table.rs
+expression: "table_to_snapshot_str(&table, 40)"
+---
+┌───────┬───────┐
+│ Name  │ Value │
+├───────┼───────┤
+│ Alice │ 100   │
+│ Bob   │ 200   │
+└───────┴───────┘

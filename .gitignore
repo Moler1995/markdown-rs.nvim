@@ -1,0 +1,12 @@
+# Build output. `bin/` is the exception: the cross-compiled executable is
+# committed, because the plugin has no way to build it on the user's machine.
+/target
+**/target
+
+# insta writes `.snap.new` for a snapshot that has not been accepted yet.
+*.snap.new
+
+# Editor and OS noise.
+*.swp
+*.swo
+.DS_Store

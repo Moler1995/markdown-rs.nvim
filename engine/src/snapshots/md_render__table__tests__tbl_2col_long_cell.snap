@@ -1,0 +1,10 @@
+---
+source: engine/src/table.rs
+expression: "table_to_snapshot_str(&table, 50)"
+---
+┌───────┬────────────────────────────────────────┐
+│ Label │ Description                            │
+├───────┼────────────────────────────────────────┤
+│ Item  │ The quick brown fox jumps over the     │
+│       │ lazy dog and then some more words here │
+└───────┴────────────────────────────────────────┘
