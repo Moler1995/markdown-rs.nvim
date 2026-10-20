@@ -1,12 +1,22 @@
 [workspace]
 resolver = "3"
-members = ["engine", "crates/mermaid-text"]
+members = ["engine", "crates/mermaid-text", "crates/ascii-dag"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
 license = "MIT"
+
+# ascii-dag is the layout engine `mermaid-text` builds flowcharts on, and its
+# 0.9.1 release orders a level's subgraph blocks out of a `HashMap` — so the
+# same diagram lays out differently from one process to the next. Upstream
+# fixed it in 0.10.1, but that release also rewrites the renderer and the
+# layout API, which is a much larger change than this one line. The vendored
+# copy in `crates/ascii-dag` is 0.9.1 with that fix backported; the patch
+# section is what makes `mermaid-text`'s `ascii-dag = "0.9.1"` resolve to it.
+[patch.crates-io]
+ascii-dag = { path = "crates/ascii-dag" }
 
 [profile.release]
 # The engine is spawned once per render, so start-up latency is user-visible

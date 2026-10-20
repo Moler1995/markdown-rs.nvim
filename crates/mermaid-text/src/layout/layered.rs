@@ -229,12 +229,14 @@ pub fn layout(graph: &Graph, config: &LayoutConfig) -> LayoutResult {
         order_within_layers_augmented(graph, &layers, &augmented_edges, &dummy_ids);
     // Strip dummies from each layer's bucket before geometry — they were
     // ranking-only, never meant to be drawn.
+    let dummy_set: std::collections::HashSet<&str> =
+        dummy_ids.iter().map(String::as_str).collect();
     let ordered: Vec<Vec<String>> = ordered_with_dummies
         .into_iter()
         .map(|layer| {
             layer
                 .into_iter()
-                .filter(|id| !dummy_ids.contains(id))
+                .filter(|id| !dummy_set.contains(id.as_str()))
                 .collect()
         })
         .collect();
@@ -430,12 +432,18 @@ fn assign_layers(graph: &Graph) -> HashMap<String, usize> {
 ///
 /// Dummy IDs use a sentinel prefix (`__mermaid_text_dummy__`) chosen to be
 /// unlikely to collide with any user-declared node ID.
+///
+/// `dummy_ids` is a `Vec` in creation order, not a set: the order dummies
+/// enter their layer's bucket is what breaks barycenter ties inside it, and a
+/// `HashSet` would hand the sweep hash order — stable within a process, but
+/// different in the next one, so the same diagram would lay out differently on
+/// every render.
 fn augment_long_edges(
     edges: &[(String, String)],
     layers: &mut HashMap<String, usize>,
-) -> (Vec<(String, String)>, std::collections::HashSet<String>) {
+) -> (Vec<(String, String)>, Vec<String>) {
     let mut augmented = Vec::with_capacity(edges.len());
-    let mut dummy_ids = std::collections::HashSet::new();
+    let mut dummy_ids = Vec::new();
     let mut next_dummy = 0usize;
     for (from, to) in edges {
         let from_layer = match layers.get(from) {
@@ -464,7 +472,7 @@ fn augment_long_edges(
             next_dummy += 1;
             layers.insert(dummy_id.clone(), inter_layer);
             augmented.push((prev.clone(), dummy_id.clone()));
-            dummy_ids.insert(dummy_id.clone());
+            dummy_ids.push(dummy_id.clone());
             prev = dummy_id;
         }
         augmented.push((prev, to.clone()));
@@ -480,7 +488,7 @@ fn order_within_layers_augmented(
     graph: &Graph,
     layers: &HashMap<String, usize>,
     edges: &[(String, String)],
-    dummy_ids: &std::collections::HashSet<String>,
+    dummy_ids: &[String],
 ) -> Vec<Vec<String>> {
     let max_layer = layers.values().copied().max().unwrap_or(0);
     let num_layers = max_layer + 1;
@@ -493,6 +501,8 @@ fn order_within_layers_augmented(
     }
     // Then dummies — append at the end of their layer; the barycenter
     // sweeps will move them into position based on their adjacencies.
+    // Creation order, for the same reason the real nodes go in declaration
+    // order: the sweep's ties break on whatever order it was handed.
     for id in dummy_ids {
         if let Some(&l) = layers.get(id) {
             buckets[l].push(id.clone());
@@ -616,10 +626,27 @@ fn order_buckets_inner(
                         *in_degree.entry(edge.to.as_str()).or_default() += 1;
                     }
                 }
-                let mut queue: std::collections::VecDeque<&str> = in_degree
+                // Seed the queue from the subgraph's own declaration order, so
+                // the sort below depends on the source text alone.
+                //
+                // Two other orders were available and both are wrong here.
+                // `in_degree.iter()` yields hash order — stable inside one
+                // process, different in the next — and whichever
+                // zero-in-degree node enters the queue first decides how every
+                // tie resolves, so the same diagram laid its band out
+                // differently on every render. `internal_ids` is the order the
+                // barycenter sweep left the layer in, which is exactly the
+                // order this block exists to override: the sweep sorts for
+                // crossing count, and the comment above `ortho_sets` calls
+                // that "arbitrary" for a band that has to read along its own
+                // axis.
+                let mut queue: std::collections::VecDeque<&str> = set
                     .iter()
-                    .filter(|(_, d)| **d == 0)
-                    .map(|(&n, _)| n)
+                    .map(String::as_str)
+                    .filter(|n| {
+                        internal_set.contains(n)
+                            && in_degree.get(n).copied().unwrap_or(0) == 0
+                    })
                     .collect();
                 let mut topo: Vec<String> = Vec::new();
                 while let Some(node) = queue.pop_front() {
@@ -1678,5 +1705,64 @@ mod tests {
         let improved = transpose_pass(&mut buckets, &edges, &node_layer);
         assert!(!improved, "no swap should be reported when already optimal");
         assert_eq!(buckets[1], vec!["C".to_string(), "D".to_string()]);
+    }
+
+    /// A `direction TB` subgraph inside an `LR` graph — the orthogonal case,
+    /// where the subgraph's nodes are collapsed into a single parent layer and
+    /// then re-sorted by a Kahn topological pass.
+    ///
+    /// Regression test for a hash-order dependency. That pass used to seed its
+    /// queue by iterating an `in_degree` `HashMap`, so the order the band's
+    /// nodes came out in followed the process's hash seed: the same diagram
+    /// laid out differently on every render. A test that lays out twice and
+    /// compares cannot see that — one process has one seed — but pinning the
+    /// expected order can, because hash order matches declaration order only
+    /// by luck.
+    ///
+    /// The band deliberately holds *four* independent chains, not one. Four
+    /// nodes inside it then have in-degree 0, so the queue starts with a
+    /// four-way choice; a single chain leaves every step forced and the
+    /// tie-break unobservable, which is how this defect stayed hidden. With one
+    /// chain the assertion below cannot fail whatever order the queue is seeded
+    /// in; with four it fails in 23 of the 24 possible orderings.
+    #[test]
+    fn a_collapsed_orthogonal_subgraph_lays_out_deterministically() {
+        let graph = crate::parser::flowchart::parse(
+            "flowchart LR\n\
+             subgraph BAND[\"band\"]\n\
+             direction TB\n\
+             A --> B\n\
+             C --> D\n\
+             E --> F\n\
+             G --> H\n\
+             end\n\
+             IN --> A\n\
+             D --> OUT\n",
+        )
+        .expect("the fixture must parse");
+
+        let band: Vec<String> = ["A", "B", "C", "D", "E", "F", "G", "H"]
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        assert_eq!(
+            orthogonal_node_sets(&graph),
+            vec![band.clone()],
+            "the fixture must actually produce one collapsed orthogonal set"
+        );
+
+        let positions = layout(&graph, &LayoutConfig::default()).positions;
+        let mut by_row: Vec<(&str, usize)> = band.iter().map(|id| (id.as_str(), positions[id].1)).collect();
+        by_row.sort_by_key(|(_, row)| *row);
+        // Top to bottom in the band. `A`, `C`, `E` and `G` are the four
+        // in-degree-0 nodes, so they lead in declaration order, each
+        // immediately followed by its own successor — the interleaving is what
+        // a breadth-first Kahn sweep does. Which of the four led is exactly
+        // what the hash seed used to decide.
+        assert_eq!(
+            by_row.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec!["A", "C", "E", "G", "B", "D", "F", "H"],
+            "the band's tie-break must follow declaration order, not hash order"
+        );
     }
 }
