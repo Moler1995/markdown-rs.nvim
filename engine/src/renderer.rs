@@ -16,6 +16,7 @@
 //! origin's image mode existed so the TUI could hand the formula to a graphics
 //! protocol; there is no graphics protocol here.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use pulldown_cmark::{CodeBlockKind, Event, MetadataBlockKind, Options, Parser, Tag, TagEnd};
@@ -59,13 +60,39 @@ fn render_with_options(
     theme: Theme,
     opts: Options,
 ) -> Vec<DocBlock> {
-    let parser = Parser::new_ext(content, opts);
+    // Normalise line endings first, so the parser and the byte-offset table
+    // below are built from the same string.
+    let content = normalise_newlines(content);
+    let parser = Parser::new_ext(&content, opts);
     // Derive tokens from the theme once; the renderer stores them so that
     // `render_code_block` can read from semantic slots (e.g.
     // `tokens.surface.raised`) rather than opaque palette field names.
     let tokens = Tokens::from_theme(theme);
     let renderer = MdRenderer::new(palette, tokens, theme);
-    renderer.render(content, parser)
+    renderer.render(&content, parser)
+}
+
+/// `content` with CRLF line endings collapsed to LF.
+///
+/// pulldown-cmark emits the `\r` and the `\n` of a CRLF ending as two separate
+/// `Text` events. Outside a code block that makes no difference — the two are
+/// concatenated back into one span. Inside one it does: `handle_text` splits
+/// every event on `\n`, so the stray `\r` becomes a line of its own and every
+/// CRLF line of a fenced block is followed by a blank one.
+///
+/// Collapsing here, before anything reads the text, is what keeps the fix
+/// honest: `\r\n` -> `\n` preserves the line count, so the byte offsets
+/// `build_line_boundaries` derives still name the same source lines the editor
+/// reports.
+///
+/// A lone `\r` is left alone. No editor this engine reads from writes one, and
+/// rewriting it would be a guess about what it meant.
+fn normalise_newlines(content: &str) -> Cow<'_, str> {
+    if content.contains("\r\n") {
+        Cow::Owned(content.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(content)
+    }
 }
 
 /// Pre-compute line-start byte offsets for `content`.
@@ -138,6 +165,16 @@ struct MdRenderer {
     /// 0-indexed source line of the most-recently processed event. Updated
     /// before dispatching each `(event, span)` pair.
     current_source_line: u32,
+    /// 0-indexed source line the spans currently sitting in `current_spans`
+    /// were accumulated under.
+    ///
+    /// Usually the same as `current_source_line`, and deliberately separate for
+    /// the one place they differ: `Tag::Item` flushes the parent item's line
+    /// after the stamp has already advanced to the nested item that triggered
+    /// it, so re-reading `current_source_line` there attributes the parent's
+    /// bullet to its child. Recorded when a line's spans begin, not when it is
+    /// flushed.
+    span_source_line: u32,
     /// Parallel to `self.lines` — one entry per rendered line.
     /// Invariant: `current_source_lines.len() == lines.len()` after every
     /// `flush_line` / `push_blank_line` call.
@@ -187,6 +224,7 @@ impl MdRenderer {
             tokens,
             line_boundaries: Vec::new(),
             current_source_line: 0,
+            span_source_line: 0,
             current_source_lines: Vec::new(),
             code_block_start_line: 0,
             code_block_fenced: false,
@@ -292,8 +330,18 @@ impl MdRenderer {
             // the paragraph began. Leaving `current_source_line` at whatever the
             // last inline event (Text / SoftBreak / Code) set it to gives the
             // correct value.
+            // Whether this event starts a fresh line. Read before dispatching,
+            // because the line it may flush is the previous one.
+            let starting_a_line = self.current_spans.is_empty();
+
             if !matches!(event, Event::End(_)) {
                 self.current_source_line = byte_offset_to_line(span.start, &self.line_boundaries);
+            }
+
+            if starting_a_line {
+                // Optimistic: set even for events that push no span, since the
+                // next event to start a line overwrites it before it is read.
+                self.span_source_line = self.current_source_line;
             }
 
             match event {
@@ -501,7 +549,19 @@ impl MdRenderer {
                 // items work because each one IS preceded by the prior sibling's
                 // `TagEnd::Item` flush.
                 if !self.current_spans.is_empty() {
+                    // The spans held here belong to the parent's line, but
+                    // `current_source_line` has already been stamped with this
+                    // nested item's start. Attribute the line to where its spans
+                    // were accumulated, or the parent's bullet claims the
+                    // child's source line and the cursor mapping follows it
+                    // there.
+                    let item_line = self.current_source_line;
+                    self.current_source_line = self.span_source_line;
                     self.flush_line();
+                    // Back to this item's own line, which is what its bullet —
+                    // pushed below — and an item with no content at all are
+                    // attributed to.
+                    self.current_source_line = item_line;
                 }
                 let indent = "  ".repeat(self.list_depth.saturating_sub(1));
                 let bullet = if let Some(counter) = self.list_counters.last_mut() {

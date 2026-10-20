@@ -2,7 +2,7 @@
 source: engine/tests/corpus.rs
 expression: annotate(&doc)
 ---
-width 80: 48 lines, 1 styles
+width 80: 106 lines, 2 styles
 
   0   0 |A flowchart:
   1   0 |
@@ -41,14 +41,72 @@ width 80: 48 lines, 1 styles
  34  30 |
  35  31 |A diagram whose natural layout is wider than the corpus width. The layout
  36  32 |backend treats the width as a hint, not a clamp, so this one comes back 119
- 37  33 |columns wide at any budget and must fall back to its source rather than being
- 38  34 |word-wrapped into confetti:
- 39  34 |
- 40  37 |graph LR
- 41  38 |A_Very_Long_Node_Identifier --> B_Another_Long_Node_Identifier -->
- 42  38 |C_And_A_Third_One --> D_And_A_Fourth
- 43  40 |
- 44  41 |A fence that is not a diagram at all, which must fall back to its source:
- 45  41 |
- 46  44 |this is not a diagram
- 47  45 |
+ 37  33 |columns wide at any budget. It is still drawn, with its right edge clipped
+ 38  34 |rather than word-wrapped into confetti: half a row of a diagram is neither the
+ 39  35 |diagram nor its source, while a clipped row still reads as the shape it came
+ 40  36 |from:
+ 41  36 |
+ 42  38 |┌───────────────────────┐  ┌───────────────────────┐  ┌───────────────────┐  ┌──
+ 43  38 |│ A_Very_Long_Node_Iden │  │ B_Another_Long_Node_I │ ▸│ C_And_A_Third_One │─▸│ D
+ 44  38 |│        tifier         │─▸│       dentifier       │─┘└───────────────────┘  └──
+ 45  38 |└───────────────────────┘  └───────────────────────┘
+ 46  42 |
+ 47  43 |A fence that is not a diagram at all, which must fall back to its source:
+ 48  43 |
+ 49  46 |this is not a diagram
+ 50  48 |
+ 51  49 |Two diagrams that reach a tie in the layout engine's block ordering, and so
+ 52  50 |pin the vendored `ascii-dag` fix (see `crates/ascii-dag/VENDORED.md`). A
+ 53  51 |subgraph's nodes are grouped into blocks, and the blocks are ordered by their
+ 54  52 |members' average position; when two blocks tie, an unfixed engine resolves the
+ 55  53 |tie from `HashMap` iteration and lays the diagram out differently from one
+ 56  54 |process to the next. Both diagrams below tie, so a regression here is a
+ 57  55 |flapping snapshot rather than a stable wrong picture:
+ 58  55 |
+ 59  57 |A flowchart whose subgraph members share a level with an unaffiliated edge
+ 60  58 |dummy, tying the subgraph's block against the unaffiliated one:
+ 61  58 |
+ 62  60 |    ┌────┐   ┌────┐
+ 63  60 |    │ p1 │   │ p2 │
+ 64  60 |    └────┘   └────┘
+ 65  60 |      │ └┐      │
+ 66  60 |      │  │      │
+ 67  60 |      │  │      │
+ 68  60 |      │  │      │
+ 69  60 |      │  │      │
+ 70  60 |      │  │      │
+ 71  60 |╭─A──────────────╮
+ 72  60 |│    ┌┘  │   ┌──┘│
+ 73  60 |│ ┌──▾─┐ │┌──▾─┐ │
+ 74  60 |│ │ a1 │ ││ a2 │ │
+ 75  60 |│ └────┘ │└────┘ │
+ 76  60 |│    │   │   └───┼┐
+ 77  60 |╰────────────────╯│
+ 78  60 |     │   │        │
+ 79  60 |     │   │        │
+ 80  60 |     │   │        │
+ 81  60 |     │   │        │
+ 82  60 |     │   └──────┐ │
+ 83  60 |  ┌──▾─┐      ┌─▾─▾┐
+ 84  60 |  │ q1 │      │ q2 │
+ 85  60 |  └────┘      └────┘
+ 86  72 |
+ 87  73 |A state diagram whose composite state — a subgraph too — ties the same way:
+ 88  73 |
+ 89  75 |                          ╭────╮
+ 90  75 |                        ┌▸│ q1 │
+ 91  75 |                        │ ╰────╯
+ 92  75 |                        │
+ 93  75 |            ╭─A──────────────────╮
+ 94  75 |            │           │        │
+ 95  75 |╭────╮──────┼┐╭────╮────┼┐       │
+ 96  75 |│ p1 │      │▸│ a1 │    ││       │    ▸╭────╮
+ 97  75 |╰────╯─┐    │ ╰────╯────┘│       │    ││ q2 │
+ 98  75 |       └────┼────────────┼───────┼────▸╰────╯
+ 99  75 |            │            │       │    │
+100  75 |            │            ▸╭────╮ │    │
+101  75 |╭────╮      │             │ a2 │─┼────┘
+102  75 |│ p2 │──────┼────────────▸╰────╯ │
+103  75 |╰────╯      │                    │
+104  75 |            ╰────────────────────╯
+105  85 |

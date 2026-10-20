@@ -6,13 +6,14 @@
 //! place that knows the target width, and the only place that turns blocks
 //! into the flat line list the plugin receives.
 //!
-//! Every line leaving this module has passed through [`wrap_spans`] at the
-//! target width, which is what makes the engine's width guarantee hold for
-//! content the block renderers did not measure themselves — notably diagram
-//! artwork, whose layout is a best-effort compaction rather than a hard
-//! constraint.
+//! Every line leaving this module fits the target width, which is what makes
+//! the engine's width guarantee hold for content the block renderers did not
+//! measure themselves. Prose and tables get there by [`wrap_spans`], which
+//! breaks a line into several; diagram artwork gets there by [`clip_to_width`],
+//! which drops the right edge, because half a diagram row is worth less than a
+//! truncated one.
 
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::block::DocBlock;
 use crate::mermaid::{MermaidTextBackend, render_text};
@@ -128,30 +129,28 @@ impl<'a> Layout<'a> {
     /// When the diagram cannot be rendered the source is shown as-is, one
     /// display line per source line, so the reader sees what they wrote and
     /// the cursor lands where they expect.
+    ///
+    /// Artwork wider than the window is clipped rather than wrapped. A soft
+    /// wrap turns one row of a diagram into two half-rows, and half of a
+    /// sequence diagram is neither a diagram nor its source — it is noise.
+    /// Dropping the right edge instead is what a terminal pane too narrow for
+    /// the drawing does anyway, and it keeps every row on its own line, so the
+    /// shape of the diagram survives even when its right-hand side does not.
+    /// Wrapping stays right for the fallback below, which is prose-shaped.
     fn push_mermaid(&mut self, source: &str, source_line: u32) {
         let source_line = source_line.min(self.max_source);
         let art_style = Style::default().fg(self.palette.foreground);
 
         // `max_width` is a hint the layout backend uses to pick an orientation,
         // not a clamp: a diagram can still come back wider than the budget.
-        // `push` would then word-wrap the artwork, shredding it into something
-        // that is neither a diagram nor readable source — so an over-wide
-        // drawing falls back to showing its source, exactly as a failed render
-        // does.
-        let art = render_text(source, Some(self.width as usize), MermaidTextBackend::Auto)
-            .ok()
-            .filter(|art| {
-                art.lines()
-                    .all(|line| UnicodeWidthStr::width(line) <= self.width as usize)
-            });
-
-        match art {
-            Some(art) => {
+        match render_text(source, Some(self.width as usize), MermaidTextBackend::Auto) {
+            Ok(art) => {
                 for line in art.lines() {
+                    let line = clip_to_width(line, self.width as usize);
                     self.push(Some(source_line), &Line::from(Span::styled(line, art_style)));
                 }
             }
-            None => {
+            Err(_) => {
                 for (i, line) in source.lines().enumerate() {
                     let line_source = source_line.saturating_add(1).saturating_add(
                         crate::cast::u32_sat(i),
@@ -161,6 +160,23 @@ impl<'a> Layout<'a> {
             }
         }
     }
+}
+
+/// `line` truncated to at most `max` display columns.
+///
+/// Measured in columns rather than bytes or characters, so a double-width CJK
+/// glyph is never cut down the middle and left as half a character. Diagram
+/// borders are single-width, but a node label is arbitrary text.
+fn clip_to_width(line: &str, max: usize) -> &str {
+    let mut used = 0usize;
+    for (idx, ch) in line.char_indices() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + width > max {
+            return &line[..idx];
+        }
+        used += width;
+    }
+    line
 }
 
 /// The number of source lines `content` occupies.
@@ -194,6 +210,24 @@ mod tests {
         let palette = Palette::default();
         let blocks = render_markdown(content, &palette, Theme::default());
         layout_document(&blocks, width, &palette, source_line_count(content))
+    }
+
+    /// The document's text, one string per display line, joined by newlines.
+    ///
+    /// Joining rather than concatenating keeps line structure visible, which is
+    /// what the tests below care about — a doubled blank line only shows up as
+    /// `\n\n` if the boundaries survive into the string.
+    fn lines_text(doc: &WireDoc) -> String {
+        doc.lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// One display line's text, without its trailing style information.
+    fn line_text(line: &WireLine) -> String {
+        line.spans.iter().map(|s| s.1.as_str()).collect()
     }
 
     #[test]
@@ -336,6 +370,129 @@ mod tests {
         );
     }
 
+    /// A sequence diagram is the case that motivated clipping: the layout
+    /// backend ignores the width hint for them, so anything past a toy example
+    /// comes back wider than a narrow window.
+    const WIDE_SEQUENCE: &str = "```mermaid\nsequenceDiagram\n    participant A as Client\n    participant B as Server\n    A->>B: a long enough request label\n    B-->>A: a long enough response\n```\n";
+
+    #[test]
+    fn an_over_wide_diagram_is_drawn_and_clipped_rather_than_dumped_as_source() {
+        let width = 40u16;
+        let doc = layout(WIDE_SEQUENCE, width);
+
+        let text = lines_text(&doc);
+        assert!(
+            !text.contains("sequenceDiagram") && !text.contains("participant A"),
+            "an over-wide diagram must still be drawn, not dumped as source:\n{text}"
+        );
+        assert!(
+            text.contains('─') || text.contains('│'),
+            "clipped artwork must keep its rules and borders:\n{text}"
+        );
+
+        for line in &doc.lines {
+            assert!(
+                display_width(line) <= width as usize,
+                "clipped artwork must still fit {width} columns, got {}: {line:?}",
+                display_width(line)
+            );
+        }
+    }
+
+    #[test]
+    fn clipping_keeps_one_display_line_per_artwork_row() {
+        let width = 40u16;
+        let source = WIDE_SEQUENCE
+            .trim_start_matches("```mermaid\n")
+            .trim_end_matches("```\n");
+        let art = crate::mermaid::render_text(
+            source,
+            Some(width as usize),
+            crate::mermaid::MermaidTextBackend::Auto,
+        )
+        .expect("the fixture diagram must render");
+        let rows = art.lines().count();
+        assert!(rows > 1, "the fixture must be more than one row tall");
+
+        let doc = layout(WIDE_SEQUENCE, width);
+        // Every artwork row anchors to the fence at source line 0. One display
+        // line per row is the whole point: a soft wrap would have split a
+        // 100-column row into three and left the diagram unrecognisable.
+        let drawn = doc
+            .lines
+            .iter()
+            .filter(|l| l.source == Some(0) && !l.spans.is_empty())
+            .count();
+        assert_eq!(
+            drawn, rows,
+            "artwork must be clipped, not re-wrapped: {rows} rows became {drawn} display lines"
+        );
+    }
+
+    #[test]
+    fn clipping_never_splits_a_double_width_character() {
+        // Each CJK glyph occupies two columns, so clipping to an odd width has
+        // to stop before the glyph that would straddle the edge rather than cut
+        // it into half a character.
+        assert_eq!(clip_to_width("日本語", 5), "日本");
+        assert_eq!(clip_to_width("日本語", 6), "日本語");
+        assert_eq!(clip_to_width("日本語", 1), "");
+        assert_eq!(clip_to_width("日本語", 0), "");
+
+        // Anything that already fits is returned untouched.
+        assert_eq!(clip_to_width("abc", 10), "abc");
+        assert_eq!(clip_to_width("abc", 3), "abc");
+        assert_eq!(clip_to_width("", 3), "");
+    }
+
+    #[test]
+    fn a_crlf_document_renders_the_same_as_its_lf_twin() {
+        let lf = "# Title\n\n```rust\nfn main() {}\nlet x = 1;\n```\n\nlast line\n";
+        let crlf = lf.replace('\n', "\r\n");
+
+        let a = serde_json::to_string(&layout(lf, 80)).expect("serialise");
+        let b = serde_json::to_string(&layout(&crlf, 80)).expect("serialise");
+        assert_eq!(
+            a, b,
+            "CRLF and LF sources must render identically; the endings are not content"
+        );
+
+        // The concrete symptom the normalisation removes: pulldown-cmark splits
+        // a CRLF ending into two text events, and the code-block collector used
+        // to read the stray `\r` as an extra line, putting a blank row between
+        // every pair of code lines.
+        let doc = layout(&crlf, 80);
+        let lines: Vec<String> = doc.lines.iter().map(line_text).collect();
+        let Some(first) = lines.iter().position(|l| l.contains("fn main() {}")) else {
+            panic!("the first code line must be rendered:\n{}", lines.join("\n"));
+        };
+        let Some(second) = lines.iter().position(|l| l.contains("let x = 1;")) else {
+            panic!("the second code line must be rendered:\n{}", lines.join("\n"));
+        };
+        assert_eq!(
+            second,
+            first + 1,
+            "a CRLF code block must not gain blank rows between its lines:\n{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn a_crlf_document_keeps_the_same_line_count_as_its_lf_twin() {
+        // The plugin indexes `source_map` with the editor's line count, so the
+        // normalisation has to be line-count preserving — which collapsing
+        // `\r\n` to `\n` is, and is the reason it is done here rather than by
+        // rewriting the source on the plugin's side.
+        let lf = "# Title\n\n```rust\nlet x = 1;\n```\n";
+        let crlf = lf.replace('\n', "\r\n");
+        assert_eq!(source_line_count(&crlf), source_line_count(lf));
+        assert_eq!(
+            layout(&crlf, 80).source_map.len(),
+            source_line_count(lf),
+            "the wire source map must still cover every source line"
+        );
+    }
+
     #[test]
     fn display_math_renders_as_text_within_the_width() {
         let content = "$$\n\\frac{a}{b} = c\n$$\n";
@@ -365,6 +522,8 @@ mod tests {
             "- one\n- two\n  - nested\n\n> quoted text\n\n---\n",
             "Text with `inline code`, **bold**, *italic* and [a link](https://example.com/very/long/path).\n",
             "$$\nE = mc^2\n$$\n",
+            // The same fence written by an editor on Windows.
+            "```rust\r\nfn main() { println!(\"hello\"); }\r\n```\r\n",
         ];
 
         for content in corpus {

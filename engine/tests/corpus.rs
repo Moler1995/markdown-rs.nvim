@@ -205,3 +205,38 @@ fn block_kind(block: &DocBlock) -> &'static str {
         DocBlock::Table(_) => "table",
     }
 }
+
+/// A list item's line is anchored to the item's own source line, not to the
+/// nested item whose arrival flushed it.
+///
+/// `Tag::Item` flushes the parent's pending line when it meets the child, which
+/// happens after the event loop has already stamped the child's source line. The
+/// line therefore has to be carried rather than re-read. Getting this wrong
+/// attributes a parent bullet to its first child, and a reader who presses `i`
+/// on the parent is dropped a line down.
+#[test]
+fn a_parent_list_item_is_anchored_to_its_own_line() {
+    let doc = render("- parent\n  - child\n- sibling\n", SNAPSHOT_WIDTH);
+    let anchored: Vec<(String, Option<u32>)> = doc
+        .lines
+        .iter()
+        .map(|line| {
+            let text: String = line.spans.iter().map(|span| span.1.as_str()).collect();
+            (text.trim_end().to_string(), line.source)
+        })
+        .collect();
+
+    assert_eq!(
+        anchored,
+        vec![
+            ("• parent".to_string(), Some(0)),
+            ("  ◦ child".to_string(), Some(1)),
+            // The nested list closes with a blank line, which inherits the line
+            // of the list it belongs to.
+            (String::new(), Some(1)),
+            ("• sibling".to_string(), Some(2)),
+            (String::new(), Some(2)),
+        ],
+        "the parent bullet must not inherit its child's source line"
+    );
+}

@@ -5,16 +5,16 @@ expression: annotate(&doc)
 width 80: 30 lines, 3 styles
 
   0   0 |• First bullet
-  1   2 |• Second bullet
+  1   1 |• Second bullet
   2   2 |  ◦ Nested one
-  3   4 |  ◦ Nested two
+  3   3 |  ◦ Nested two
   4   4 |    ▪ Nested deeper
   5   4 |
   6   4 |
   7   5 |• Third bullet
   8   5 |
   9   7 |1. First numbered
- 10   9 |2. Second numbered
+ 10   8 |2. Second numbered
  11   9 |  1. Nested numbered
  12  10 |  2. Another nested numbered
  13  10 |

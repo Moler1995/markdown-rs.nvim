@@ -12,7 +12,7 @@ width 80: 32 lines, 9 styles
   5   3 |│ A quote containing a list:
   6   3 |
   7   5 |│ • first
-  8   7 |│ • second
+  8   6 |│ • second
   9   7 |│   ◦ nested
  10   7 |│
  11   7 |
