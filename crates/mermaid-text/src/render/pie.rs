@@ -7,15 +7,18 @@
 //! ```text
 //! Pet Counts
 //!
-//! Dogs   ████████████████████████████░░░░░░░░░░░░░░░░░░  79.3%  (386)
-//! Cats   ██████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  17.5%  (85)
-//! Rats   █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   3.1%  (15)
+//! Dogs   ████████████████████████████....................  79.3%  (386)
+//! Cats   ██████..........................................  17.5%  (85)
+//! Rats   █................................................   3.1%  (15)
 //! ```
 //!
 //! - Labels are left-padded to the longest label's display width.
 //! - Bar width auto-scales to `max_width` (default 80 columns).
-//! - Filled cells use `█` (U+2588 FULL BLOCK); unfilled use `░`
-//!   (U+2591 LIGHT SHADE) so the row's right edge stays anchored.
+//! - Filled cells use `█` (U+2588 FULL BLOCK); unfilled use `.` so the row's
+//!   right edge stays anchored. The unfilled cell is plain ASCII because it is
+//!   most of the bar: the shade glyph that used to fill it (U+2591 LIGHT SHADE)
+//!   is dithered, and repainting a screen full of them costs far more than
+//!   repainting solid or ASCII glyphs at the same ink coverage.
 //! - Percentages format as `{:>5.1}%` so the column aligns regardless of
 //!   value (`100.0%` and `  3.1%` both fit five cells).
 //! - When `show_data` is set the raw value follows in parentheses.
@@ -39,6 +42,10 @@ const MIN_BAR_WIDTH: usize = 10;
 /// Gap (in spaces) between adjacent text columns: label↔bar, bar↔pct,
 /// pct↔value. Three gaps × 2 spaces = 6 chrome cells.
 const GAP: usize = 2;
+
+/// Cell for the unfilled part of a bar. Plain ASCII rather than the shade
+/// glyph `░` (U+2591) it used to be — see the module docs.
+const UNFILLED: char = '.';
 
 /// ANSI reset sequence — terminates a colored bar run.
 const RESET: &str = "\x1b[0m";
@@ -172,12 +179,12 @@ fn render_inner(chart: &PieChart, max_width: Option<usize>, with_color: bool) ->
             // `fmt::Result` that the trait requires us to handle.
             let _ = write!(out, "\x1b[38;2;{r};{g};{b}m");
             out.push_str(&"█".repeat(filled));
-            // Reset before drawing the unfilled (uncolored) shade cells.
+            // Reset before drawing the unfilled (uncolored) cells.
             out.push_str(RESET);
         } else {
             out.push_str(&"█".repeat(filled));
         }
-        out.push_str(&"░".repeat(unfilled));
+        out.extend(std::iter::repeat_n(UNFILLED, unfilled));
         out.push_str(&" ".repeat(GAP));
 
         // Percentage (right-aligned in 6 cells).
@@ -269,8 +276,33 @@ mod tests {
         let c = parse("pie\n\"A\" : 1\n\"B\" : 1").unwrap();
         // Budget of 20 is impossibly tight; expect MIN_BAR_WIDTH bar.
         let out = render(&c, Some(20));
-        let bar_count = out.chars().filter(|&c| c == '█' || c == '░').count();
-        assert!(bar_count >= MIN_BAR_WIDTH * c.slices.len());
+        // Measure the bar as the longest unbroken run of bar cells on the row.
+        // Counting bar cells across the whole line would not do: the unfilled
+        // cell is `.`, and the percentage column carries a `.` of its own. The
+        // GAP columns keep that one from touching the bar.
+        let bars: Vec<usize> = out
+            .lines()
+            .filter(|l| l.contains('█'))
+            .map(|l| {
+                l.chars()
+                    .fold((0, 0), |(best, run), ch| {
+                        let run = if ch == '█' || ch == UNFILLED {
+                            run + 1
+                        } else {
+                            0
+                        };
+                        (best.max(run), run)
+                    })
+                    .0
+            })
+            .collect();
+        assert_eq!(bars.len(), c.slices.len(), "one bar per slice:\n{out}");
+        for run in bars {
+            assert!(
+                run >= MIN_BAR_WIDTH,
+                "bar clamped below MIN_BAR_WIDTH ({run}):\n{out}"
+            );
+        }
     }
 
     #[test]

@@ -1152,15 +1152,11 @@ pub fn render(diag: &SequenceDiagram) -> String {
     //    (still skipping arrow / junction glyphs to read as "behind"
     //    arrows).
     //
-    //    Interior bounds are collected first; the shade fill is applied in a
-    //    separate pass (step 6) AFTER all borders and labels are committed so
-    //    that inner-frame labels are never overwritten by an outer-frame fill.
+    //    Interiors are left blank — see the note on the retired fill pass below.
     //    Rect blocks skip draw_block_frame entirely and are collected into a
-    //    separate vec for a post-fill pass (step 7).
-    let mut frame_interiors: Vec<(usize, usize, usize, usize)> = Vec::new();
+    //    separate vec for the fill pass (step 6).
     // (top, bottom, left, right, shade_glyph)
     let mut rect_interiors: Vec<(usize, usize, usize, usize, char)> = Vec::new();
-    let mut label_rows: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for (i, b) in diag.blocks.iter().enumerate() {
         // Empty block (no inner messages) — nothing to draw.
         if b.start_message > b.end_message
@@ -1207,13 +1203,6 @@ pub fn render(diag: &SequenceDiagram) -> String {
             .map(|(j, branch)| (branch_divider_rows[i][j], branch.label.as_str()))
             .filter(|(row, _)| *row != 0)
             .collect();
-        // Record every row that carries label text so the fill pass can
-        // skip them and avoid overwriting spaces embedded in labels.
-        label_rows.insert(top);
-        label_rows.insert(bottom);
-        for &(dr, _) in &branches {
-            label_rows.insert(dr);
-        }
         draw_block_frame(
             &mut canvas,
             top,
@@ -1224,40 +1213,27 @@ pub fn render(diag: &SequenceDiagram) -> String {
             opener_label,
             &branches,
         );
-        frame_interiors.push((top, bottom, left, right));
     }
 
-    // 6. Interior fill — applied after ALL block frames and labels are
-    //    committed so that no outer-frame fill can overwrite an inner-frame
-    //    label.  Only plain space cells (`' '`) are replaced; every other
-    //    glyph (arrows, lifelines, activation bars, labels, borders) is
-    //    already non-space and is left untouched.  Rows that carry frame
-    //    labels (top borders and dividers of any frame) are skipped entirely
-    //    so embedded spaces within label text stay as spaces.
-    for (top, bottom, left, right) in frame_interiors {
-        for r in (top + 1)..bottom {
-            if label_rows.contains(&r) {
-                continue;
-            }
-            for c in (left + 1)..right {
-                if canvas.grid[r][c] == ' ' {
-                    canvas.put(r, c, '\u{2591}');
-                }
-            }
-        }
-    }
-
-    // 7. Rect fill — applied after the frame-interior fill so that a rect
-    //    nested inside a loop can overwrite the loop's `░` with a denser
-    //    glyph.  Replace cell when: space, OR existing shade is lighter than
-    //    the rect's shade (░ → ▒/▓, ▒ → ▓).
+    // 6. Rect fill — the only fill pass.  A block frame's interior stays blank;
+    //    it used to be flooded with `░` (U+2591 LIGHT SHADE), which was retired
+    //    because the dithered shade glyphs are disproportionately expensive to
+    //    paint: a full-screen repaint of `░▒▓` costs far more than one of `█`
+    //    or of ASCII at the same ink coverage, so a diagram whose interior was
+    //    all shade made scrolling crawl.  Do not reintroduce them.
+    //
+    //    A rect block is a borderless background highlight, so its fill is the
+    //    whole of it and has to stay.  Replace a cell when it is blank, or when
+    //    it already holds a lighter step of the rect palette, so a rect nested
+    //    inside another rect keeps the denser of the two.
     for (top, bottom, left, right, glyph) in rect_interiors {
         for r in (top + 1)..bottom {
             for c in (left + 1)..right {
                 let cell = canvas.grid[r][c];
                 let should_replace = cell == ' '
-                    || (cell == '\u{2591}' && (glyph == '\u{2592}' || glyph == '\u{2593}'))
-                    || (cell == '\u{2592}' && glyph == '\u{2593}');
+                    || rect_shade_step(cell)
+                        .zip(rect_shade_step(glyph))
+                        .is_some_and(|(existing, new)| new > existing);
                 if should_replace {
                     canvas.put(r, c, glyph);
                 }
@@ -1332,6 +1308,21 @@ fn block_kind_label(kind: BlockKind) -> &'static str {
     }
 }
 
+/// The three steps of the `rect` fill palette, lightest first.
+///
+/// ASCII rather than the Unicode shade blocks `░▒▓` (U+2591-93): those are
+/// dithered patterns, and a full-screen repaint of them costs far more than one
+/// of solid or ASCII glyphs at the same ink coverage — enough to make scrolling
+/// a shade-filled diagram crawl.  The steps keep the same light/medium/dark
+/// reading, and `.`/`:`/`#` are what `to_ascii` maps the shade blocks to anyway.
+const RECT_SHADES: [char; 3] = ['.', ':', '#'];
+
+/// Index of `glyph` in [`RECT_SHADES`], or `None` when it is not a rect fill
+/// glyph — which is what tells a rect apart from a lifeline or a label.
+fn rect_shade_step(glyph: char) -> Option<usize> {
+    RECT_SHADES.iter().position(|&g| g == glyph)
+}
+
 /// Choose the fill glyph for a `rect` block using a luminance-keyed 3-step
 /// palette.  Effective intensity `I = (255 - luminance) * alpha_norm` where
 /// luminance uses the Rec. 601 weights (0.299 R + 0.587 G + 0.114 B).
@@ -1340,13 +1331,14 @@ fn rect_shade_glyph(rgb: Rgb, alpha: Option<u8>) -> char {
     let luminance = 0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b);
     let alpha_norm = alpha.map_or(1.0_f32, |a| f32::from(a) / 255.0);
     let intensity = (255.0 - luminance) * alpha_norm;
-    if intensity < 60.0 {
-        '\u{2591}' // light shade
+    let step = if intensity < 60.0 {
+        0
     } else if intensity < 130.0 {
-        '\u{2592}' // medium shade
+        1
     } else {
-        '\u{2593}' // dark shade
-    }
+        2
+    };
+    RECT_SHADES[step]
 }
 
 /// Draw a `[label]` tag at the given position, inset 2 cells from the

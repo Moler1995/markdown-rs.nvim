@@ -967,7 +967,15 @@ pub fn to_ascii(s: &str) -> String {
             '▴' => '^',
             // ---- Gantt bar characters and annotation glyphs ----
             '\u{2588}' => '#', // █ FULL BLOCK → #
+            // Shade blocks. No renderer emits these any more — the dithered
+            // shade glyphs are disproportionately expensive to paint, so the
+            // gantt bar, the pie bar, the sequence block interiors and the rect
+            // palette all use ASCII directly — but the mapping is kept (and
+            // completed) so this function's all-ASCII guarantee holds for any
+            // input, not just today's renderer output.
             '\u{2591}' => '.', // ░ LIGHT SHADE → .
+            '\u{2592}' => ':', // ▒ MEDIUM SHADE → :
+            '\u{2593}' => '#', // ▓ DARK SHADE → #
             '\u{2192}' => '>', // → RIGHTWARDS ARROW (used in date range "start → end")
             // ---- Endpoint / decorator glyphs ----
             '◇' => '*',

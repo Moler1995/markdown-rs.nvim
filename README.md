@@ -162,11 +162,22 @@ rendered buffer at all, so scrolling sideways cannot recover them: in a narrow
 window the right-hand side of a wide diagram does not exist.
 
 `<CR>` on a ` ```mermaid ` fence or a table opens a centred popup showing that
-block **re-rendered against the popup's own width**, which is what brings the
-clipped columns back. The popup is sized to fit the block and capped at
-`preview.max_width_pct` and `preview.max_height_pct` of the editor. It is an
-ordinary buffer — scroll it, search it, yank from it — but not a modifiable one,
-and it is not listed.
+block **re-rendered at a budget of its own**, which is what brings the clipped
+columns back. The budget depends on what the engine does with a block that does
+not fit:
+
+- A **diagram** is laid out at the largest budget the engine accepts, so nothing
+  is clipped. The engine discards the columns a diagram overflows by, and
+  discarded columns are not in the buffer for scrolling to reach, so any smaller
+  budget could lose the right-hand end of one.
+- A **table** is laid out at the popup's own width, never narrower than the
+  window's. The engine wraps a cell that does not fit rather than dropping it, so
+  a table loses nothing at any budget, and a larger one would only spread its
+  columns out.
+
+The popup is sized to fit the block and capped at `preview.max_width_pct` and
+`preview.max_height_pct` of the editor. It is an ordinary buffer — scroll it,
+search it, yank from it — but not a modifiable one, and it is not listed.
 
 `<CR>`, `q` and `Esc` close it, and the window underneath is left exactly as it
 was. On anything else — prose, a non-diagram fence, a list — `<CR>` does its
@@ -247,9 +258,18 @@ upstream tracking.
 `mermaid-text`'s Sugiyama backend is built on. Both are vendored to be
 patchable, and both carry a fix that could not be taken from a release:
 
-- **`mermaid-text`** — a `direction TB` subgraph inside an `LR` graph had its
-  band ordered by `HashMap` iteration, so the same diagram laid out
-  differently from one process to the next.
+- **`mermaid-text`** — two changes. A `direction TB` subgraph inside an `LR`
+  graph had its band ordered by `HashMap` iteration, so the same diagram laid
+  out differently from one process to the next. And the renderer no longer
+  fills cells with a Unicode shade block (`░▒▓`, U+2591-93): a `rect` block
+  uses the ASCII ladder `.`/`:`/`#`, a gantt bar's empty cells and a pie bar's
+  unfilled cells use `.`, and a sequence block interior is simply left blank.
+  The shade blocks are dithered patterns, and a full-screen repaint of them
+  costs far more than one of solid or ASCII glyphs at the same ink coverage —
+  a diagram whose block interiors were all `░` made scrolling crawl in the
+  editor, while the same cells blank or filled with `.` scroll smoothly. Only
+  the fill changed: for a document that uses no `rect` block the output is
+  byte-identical once the retired fill is mapped back to a space.
 - **`ascii-dag`** — a level's subgraph blocks were ordered the same way, with
   the same result. Upstream fixed it in 0.10.1, but that release also rewrites
   the renderer and the layout API; the one function's fix is backported

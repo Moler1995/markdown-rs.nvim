@@ -15,6 +15,19 @@
 
 use insta::assert_snapshot;
 
+/// The Unicode dithered shade blocks, U+2591-93.
+///
+/// No renderer may emit these. They are dithered patterns, and a full-screen
+/// repaint of them costs far more than one of solid or ASCII glyphs at the same
+/// ink coverage — enough that a diagram filled with them made scrolling crawl
+/// in the editor. Every place that used to produce one now produces ASCII.
+const SHADE_BLOCKS: [char; 3] = ['\u{2591}', '\u{2592}', '\u{2593}'];
+
+/// True when `s` contains one of [`SHADE_BLOCKS`].
+fn contains_shade(s: &str) -> bool {
+    s.chars().any(|c| SHADE_BLOCKS.contains(&c))
+}
+
 // ---------------------------------------------------------------------------
 // 1. Simple left-to-right chain
 // ---------------------------------------------------------------------------
@@ -1637,14 +1650,18 @@ end";
 }
 
 // ---------------------------------------------------------------------------
-// 0.54.0 — block-frame interior fill with `░` (U+2591 LIGHT SHADE)
+// 0.54.0 — block-frame interior fill with `░` (U+2591 LIGHT SHADE),
+// retired: the fill is gone and the frame interior is left blank
 // ---------------------------------------------------------------------------
 
 #[test]
-fn block_frame_interior_is_filled_with_shade() {
+fn block_frame_interior_is_left_blank() {
     // Reuses the same minimal loop fixture as `sequence_with_loop_block`.
-    // The interior must be filled with '░' (U+2591) on formerly-blank cells.
-    // Strong assertions — a no-op or deletion of the fill MUST fail all of them.
+    //
+    // This test used to assert the opposite — that the interior was flooded
+    // with `░`. That fill was retired because the dithered shade glyphs are
+    // disproportionately expensive to paint, so a diagram full of them made
+    // scrolling crawl. The assertions below fail if anyone brings it back.
     let src = "sequenceDiagram
 participant A
 participant B
@@ -1653,29 +1670,14 @@ A->>B: tick
 end";
     let out = mermaid_text::render(src).unwrap();
 
-    // a. At least 6 shade cells must exist (conservative lower bound for a
-    //    3-interior-row loop with padding on both sides of each lifeline).
-    let shade_count = out.chars().filter(|&c| c == '\u{2591}').count();
     assert!(
-        shade_count >= 6,
-        "expected >= 6 '░' cells in loop interior, got {shade_count}:\n{out}"
+        !contains_shade(&out),
+        "a dithered shade glyph is back in the block interior:\n{out}"
     );
 
-    // b. Every '░' glyph must appear on an INTERIOR row of the block frame,
-    //    i.e. NOT on the top border line (contains '╔') or the bottom border
-    //    line (contains '╚'). Collect which lines have shade vs. border corners.
+    // The frame itself must survive — this is asserting the fill went away, not
+    // the block.
     let lines: Vec<&str> = out.lines().collect();
-    for line in &lines {
-        if line.contains('╔') || line.contains('╚') {
-            assert!(
-                !line.contains('\u{2591}'),
-                "shade glyph leaked into border row: {line:?}"
-            );
-        }
-    }
-
-    // c. No shade glyph appears on rows OUTSIDE the block frame entirely
-    //    (rows before the '╔' line or after the '╚' line).
     let top_border_idx = lines
         .iter()
         .position(|l| l.contains('╔'))
@@ -1684,22 +1686,75 @@ end";
         .iter()
         .position(|l| l.contains('╚'))
         .expect("no bot border");
-    for (i, line) in lines.iter().enumerate() {
-        if i < top_border_idx || i > bot_border_idx {
-            assert!(
-                !line.contains('\u{2591}'),
-                "shade glyph outside block frame at line {i}: {line:?}"
-            );
-        }
-    }
-
-    // d. The top-border corners survive — fill must not overwrite them.
     let top_border = lines[top_border_idx];
     assert!(top_border.contains('╔'), "top-left corner '╔' missing");
     assert!(top_border.contains('╗'), "top-right corner '╗' missing");
     let bot_border = lines[bot_border_idx];
     assert!(bot_border.contains('╚'), "bot-left corner '╚' missing");
     assert!(bot_border.contains('╝'), "bot-right corner '╝' missing");
+}
+
+#[test]
+fn no_renderer_emits_dithered_shade() {
+    // One fixture per place that used to carry a shade glyph: the gantt bar's
+    // empty cells, the pie bar's unfilled cells, a sequence block interior, and
+    // every step of the rect palette. Each now uses ASCII, for the reason in
+    // `block_frame_interior_is_left_blank`. This is the crate-wide guard: it
+    // fails wherever a shade glyph is reintroduced, not just where this test
+    // happens to look.
+    let cases = [
+        (
+            "gantt bar",
+            "gantt
+    dateFormat YYYY-MM-DD
+    section S
+      T :2024-01-01, 5d",
+        ),
+        ("pie bar", "pie\n\"A\" : 3\n\"B\" : 1"),
+        (
+            "sequence loop interior",
+            "sequenceDiagram
+participant A
+participant B
+loop forever
+A->>B: tick
+end",
+        ),
+        (
+            "sequence rect, densest palette step",
+            "sequenceDiagram
+participant A
+participant B
+rect rgb(0, 0, 0)
+A->>B: hi
+end",
+        ),
+        (
+            "sequence rect, medium palette step",
+            "sequenceDiagram
+participant A
+participant B
+rect rgb(0, 255, 0)
+A->>B: hi
+end",
+        ),
+        (
+            "sequence rect, lightest palette step",
+            "sequenceDiagram
+participant A
+participant B
+rect rgba(0, 0, 0, 26)
+A->>B: hi
+end",
+        ),
+    ];
+    for (name, src) in cases {
+        let out = mermaid_text::render(src).unwrap();
+        assert!(
+            !contains_shade(&out),
+            "{name} emits a dithered shade glyph:\n{out}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3449,10 +3504,10 @@ end";
         !out.contains("[Rect]") && !out.contains("[rect]"),
         "rect must not produce a [Rect] or [rect] label tag:\n{out}"
     );
-    // Black opaque -> I = 255 -> dark shade glyph.
+    // Black opaque -> I = 255 -> densest palette step.
     assert!(
-        out.chars().filter(|&c| c == '\u{2593}').count() > 0,
-        "rect rgb(0,0,0) must produce at least one dark-shade glyph (\u{2593}):\n{out}"
+        out.chars().filter(|&c| c == '#').count() > 0,
+        "rect rgb(0,0,0) must produce at least one densest-palette glyph ('#'):\n{out}"
     );
     // Message text appears exactly once.
     assert_eq!(
@@ -3485,25 +3540,27 @@ end";
     let opaque = mermaid_text::render(opaque_src).unwrap();
     let alpha = mermaid_text::render(alpha_src).unwrap();
 
-    // Opaque black -> I = 255 -> dark shade only.
-    assert!(
-        opaque.chars().filter(|&c| c == '\u{2593}').count() > 0,
-        "opaque rgb(0,0,0) must contain dark-shade (\u{2593}):\n{opaque}"
-    );
+    // Which palette steps each render actually uses. Compared as a set rather
+    // than by counting glyphs across the whole output: that way a stray `.`
+    // somewhere unrelated in the render would show up as a failure instead of
+    // silently inflating a count.
+    let palette = |s: &str| {
+        let mut steps: Vec<char> = s.chars().filter(|c| ".:#".contains(*c)).collect();
+        steps.sort_unstable();
+        steps.dedup();
+        steps
+    };
+    // Opaque black -> I = 255 -> the densest step, and only that one.
     assert_eq!(
-        opaque.chars().filter(|&c| c == '\u{2591}').count(),
-        0,
-        "opaque rgb(0,0,0) must contain zero light-shade (\u{2591}):\n{opaque}"
+        palette(&opaque),
+        vec!['#'],
+        "opaque rgb(0,0,0) must use the densest palette step and nothing lighter:\n{opaque}"
     );
-    // Black alpha 26/255 ~ 0.1 -> I = 255 * 0.1 = 25.5 -> light shade only.
-    assert!(
-        alpha.chars().filter(|&c| c == '\u{2591}').count() > 0,
-        "rgba(0,0,0,26) must contain light-shade (\u{2591}):\n{alpha}"
-    );
+    // Black alpha 26/255 ~ 0.1 -> I = 255 * 0.1 = 25.5 -> the lightest step only.
     assert_eq!(
-        alpha.chars().filter(|&c| c == '\u{2593}').count(),
-        0,
-        "rgba(0,0,0,26) must contain zero dark-shade (\u{2593}):\n{alpha}"
+        palette(&alpha),
+        vec!['.'],
+        "rgba(0,0,0,26) must use the lightest palette step and nothing denser:\n{alpha}"
     );
     // Both contain the message text.
     assert!(
@@ -3543,18 +3600,18 @@ end";
         out.chars().any(|c| c == '\u{255A}'),
         "outer loop frame must have bottom-left corner (\u{255A}):\n{out}"
     );
-    // Bright green opaque: luminance = 0.587*255 = ~150 -> I = (255-150)*1 = 105 -> medium shade.
-    let medium_count = out.chars().filter(|&c| c == '\u{2592}').count();
+    // Bright green opaque: luminance = 0.587*255 = ~150 -> I = (255-150)*1 = 105 -> medium step.
+    let medium_count = out.chars().filter(|&c| c == ':').count();
     assert!(
         medium_count > 0,
-        "rect rgb(0,255,0) must produce medium-shade (\u{2592}) inside rect span:\n{out}"
+        "rect rgb(0,255,0) must produce the medium palette step (':') inside the rect span:\n{out}"
     );
-    // The outer loop's frame_interiors fill produces light-shade cells OUTSIDE the rect.
-    // Both glyphs must appear: light-shade from loop exterior, medium-shade from rect interior.
-    let light_count = out.chars().filter(|&c| c == '\u{2591}').count();
+    // The loop's own interior is blank, so the rect is the only thing shading
+    // these rows. It used to be filled with a lighter shade, which is exactly
+    // the overlap the rect palette's step comparison existed to resolve.
     assert!(
-        light_count > 0,
-        "outer loop fill must produce light-shade (\u{2591}) outside the rect span:\n{out}"
+        !contains_shade(&out),
+        "a dithered shade glyph survived:\n{out}"
     );
     // No double-bordering: the output must not contain consecutive lines both starting with ╔.
     let lines: Vec<&str> = out.lines().collect();

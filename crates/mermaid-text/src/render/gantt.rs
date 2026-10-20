@@ -7,16 +7,20 @@
 //!
 //!                     Jan 01    Jan 15    Feb 01
 //! Section A
-//!   Design            ████████░░░░░░░░░░░░░░░░  [01-01 → 01-30, 30d]
-//!   Implementation    ░░░░░░░░████░░░░░░░░░░░░  [01-31 → 02-19, 20d]
+//!   Design            ████████................  [01-01 → 01-30, 30d]
+//!   Implementation    ........████............  [01-31 → 02-19, 20d]
 //! Section B
-//!   Testing           ░░░░░░░░░░░░░░░░░░██░░░░  [02-15 → 03-01, 15d]
-//!   Deployment        ░░░░░░░░░░░░░░░░░░░░░█░░  [03-02 → 03-04, 3d]
+//!   Testing           ..................██....  [02-15 → 03-01, 15d]
+//!   Deployment        ....................█...  [03-02 → 03-04, 3d]
 //! ```
 //!
-//! **Bar characters:** `█` (U+2588 FULL BLOCK) for active cells, `░`
-//! (U+2591 LIGHT SHADE) for empty cells. Both are geometric symbols, not
-//! emoji. The `to_ascii` post-pass maps them to `#` and `.` respectively.
+//! **Bar characters:** `█` (U+2588 FULL BLOCK) for active cells, `.` for empty
+//! cells. The `█` is a geometric symbol, not emoji, and the `to_ascii` post-pass
+//! maps it to `#`. Empty cells are plain ASCII because the bar is as wide as the
+//! whole span and so is most of the diagram's area: the shade glyphs that used
+//! to fill them (U+2591 LIGHT SHADE and friends) are dithered, and repainting a
+//! screen full of them costs far more than repainting solid or ASCII glyphs at
+//! the same ink coverage.
 //!
 //! **Scaling.** When `max_width` is `Some(N)`, the bar zone is sized to fit
 //! within the available columns after the name column and the date annotation.
@@ -30,9 +34,10 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::gantt::{GanttDiagram, GanttTask};
 
-// Bar characters — geometric block elements, not emoji.
+// Bar characters — the active cell is a geometric block element, not emoji; the
+// empty cell is ASCII (see the module docs for why it is not a shade glyph).
 const FULL_BLOCK: char = '\u{2588}'; // █
-const LIGHT_SHADE: char = '\u{2591}'; // ░
+const EMPTY_CELL: char = '.';
 
 /// Width of the task-name column (chars). Tasks whose names exceed this are
 /// right-truncated with `…` so the bar chart column aligns.
@@ -199,7 +204,7 @@ fn render_task_row(
 // ---------------------------------------------------------------------------
 
 /// Build a bar string of `bar_zone` cells where cells within [start, end] are
-/// `FULL_BLOCK` and all others are `LIGHT_SHADE`.
+/// `FULL_BLOCK` and all others are `EMPTY_CELL`.
 fn build_bar(
     task: &GanttTask,
     min_date: chrono::NaiveDate,
@@ -218,7 +223,7 @@ fn build_bar(
 
         // Cell is "active" if the task overlaps with this day range.
         let active = (task_end_offset as f64) >= day_lo && (task_start_offset as f64) <= day_hi;
-        bar.push(if active { FULL_BLOCK } else { LIGHT_SHADE });
+        bar.push(if active { FULL_BLOCK } else { EMPTY_CELL });
     }
     bar
 }
@@ -425,17 +430,21 @@ mod tests {
     fn ascii_fallback_substitutes_block_chars() {
         let src = "gantt\n  dateFormat YYYY-MM-DD\n  section S\n  T :2024-01-01, 5d";
         let diag = parse(src).unwrap();
-        let unicode_out = render(&diag, None);
-        // Confirm block chars are present in unicode output.
-        assert!(unicode_out.contains(FULL_BLOCK) || unicode_out.contains(LIGHT_SHADE));
+        // A width, so the bar is scaled wider than the 5-day task and actually
+        // has empty cells in it.
+        let unicode_out = render(&diag, Some(80));
+        // The active cell is the bar's only non-ASCII glyph; the empty cells
+        // are already ASCII and so are untouched by the fallback.
+        assert!(unicode_out.contains(FULL_BLOCK));
+        assert!(unicode_out.contains(EMPTY_CELL));
         // Apply the same to_ascii transform the library uses.
         let ascii_out = crate::to_ascii(&unicode_out);
         assert!(
             ascii_out.is_ascii(),
             "non-ASCII chars remain after to_ascii:\n{ascii_out}"
         );
-        // '#' replaces FULL_BLOCK; '.' replaces LIGHT_SHADE.
-        assert!(ascii_out.contains('#') || ascii_out.contains('.'));
+        // '#' replaces FULL_BLOCK.
+        assert!(ascii_out.contains('#'));
     }
 
     // ---- (5) render empty diagram ------------------------------------------
