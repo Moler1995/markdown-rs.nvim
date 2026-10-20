@@ -15,7 +15,7 @@ D:\projects\rust\markdown-rs.nvim\
   crates/ascii-dag/    vendored layout engine, one fix backported
   lua/md-render/       the plugin
   plugin/md-render.lua entry point
-  bin/md-render.exe    cross-compiled artifact, committed
+  bin/md-render.exe    engine binary, built locally — not in the repository
   docs/                the wire format, and porting notes
 ```
 
@@ -214,24 +214,36 @@ cargo build --release -p md-render
 cargo test
 ```
 
-The committed `bin/md-render.exe` is a Windows build cross-compiled from Linux
-against the `x86_64-pc-windows-gnu` target. See
+`bin/md-render.exe` is not in the repository — it is a build artifact. A clone
+has to produce it once before the plugin will render anything. See
 [`docs/porting.md`](docs/porting.md) for what the plugin does when it is
 missing.
 
-### Rebuilding the committed binary
+### Installing the engine binary
 
-There is no Windows Rust toolchain on the development machine, so the binary is
-built on a Linux host and copied back. From the repository root:
+From the repository root:
 
 ```bash
-cargo build --release --target x86_64-pc-windows-gnu --bin md-render
-cp target/x86_64-pc-windows-gnu/release/md-render.exe bin/md-render.exe
+cargo build --release -p md-render
+cp target/release/md-render.exe bin/md-render.exe
 ```
 
-The copy is the step that matters: `bin/md-render.exe` is what the plugin
-falls back to when `md-render` is not on `PATH`, and a stale copy is a plugin
-that renders with an old engine. Commit the result.
+`bin/md-render.exe` is the first place the plugin looks, after
+`g:md_render_binary`, so the copy is the step that matters. It used to be
+committed, because the plugin cannot build Rust and a Windows user without a
+toolchain had no way to produce it; it is built locally now, which is one
+command and keeps a 4.6 MB artifact out of the history.
+
+The binary was cross-compiled from Linux against `x86_64-pc-windows-gnu` when
+that was the only route. A native GNU toolchain builds it directly — check
+`rustc -vV`'s `host` for `x86_64-pc-windows-gnu` — and the cross-compile is
+only needed from a machine that has no Windows toolchain of its own:
+
+```bash
+rustup target add x86_64-pc-windows-gnu
+cargo build --release --target x86_64-pc-windows-gnu -p md-render
+cp target/x86_64-pc-windows-gnu/release/md-render.exe bin/md-render.exe
+```
 
 ## Provenance
 

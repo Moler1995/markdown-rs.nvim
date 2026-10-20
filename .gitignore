@@ -1,7 +1,15 @@
-# Build output. `bin/` is the exception: the cross-compiled executable is
-# committed, because the plugin has no way to build it on the user's machine.
+# Build output, including the engine binary. `bin/md-render.exe` used to be
+# committed so that a Windows user with no Rust toolchain could run the plugin;
+# it is a build artifact and is not any more. A clone has to be built once
+# (`cargo build --release -p md-render`, then copy the result into `bin/`)
+# before the plugin will render anything.
 /target
 **/target
+/bin
+
+# Screenshots and reports collected while diagnosing a bug. Working notes, not
+# part of the repository.
+/issues
 
 # insta writes `.snap.new` for a snapshot that has not been accepted yet.
 *.snap.new

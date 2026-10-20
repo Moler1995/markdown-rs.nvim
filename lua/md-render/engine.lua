@@ -12,8 +12,9 @@ local unpack = table.unpack or unpack
 --- Resolve the engine binary.
 --
 --- An explicit path in the config wins. Otherwise `md-render` on PATH, and
---- failing that `<repo>/bin/md-render.exe` — the repository is expected to
---- carry a prebuilt binary so a clone works with no PATH edit.
+--- failing that `<repo>/bin/md-render.exe` — a build copied into the repository
+--- so that it works with no PATH edit. That binary is not committed, so a
+--- fresh clone has to build it; see `docs/porting.md`.
 ---
 --- Returns `nil` when neither exists; the caller reports that.
 function M.resolve(explicit)
