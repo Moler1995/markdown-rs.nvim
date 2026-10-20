@@ -98,6 +98,7 @@ toggle is applied at once, so a resize cannot swallow the key that follows it.
 | --- | --- | --- |
 | `<leader>mr` | R and S | swap between the rendered view and the source |
 | `<C-s>` | R and S | write the source buffer |
+| `gf` | R and S | follow the link under the cursor |
 | `<CR>` | R only | preview the block under the cursor, or close the preview |
 | `i` | R only | cross to S and insert before the cursor |
 | `a` | R only | cross to S and insert after the cursor |
@@ -117,6 +118,33 @@ and a view that came back on `Esc` would be a view you could not edit in.
 
 The toggle crosses in normal mode, on the source line the display line came
 from, so the two states read as one document rather than two.
+
+### Following links
+
+`gf` opens whatever is under the cursor. It is the one key besides the toggle
+and the write key that is set in both states, because a link is worth following
+from wherever you are reading:
+
+- a **file** opens in the window, resolved relative to the document holding the
+  link rather than to the working directory;
+- a **URL** goes to `vim.ui.open`, which is the desktop's browser by default;
+- an **anchor** — `#section`, on its own or after a path — scrolls to the
+  heading it names, in this document or in the one just opened.
+
+It reads the source, never the rendered text. The engine drops link targets, so
+in R the display row is first mapped back to the source line it came from —
+the same step the toggle makes — and the link is read from there. That is what
+makes it work from the reading view without crossing to S first.
+
+The forms it resolves are the ones a cursor actually lands on: inline
+`[text](target)` and `![alt](target)`, reference `[text][ref]` with the
+definition anywhere in the buffer, `[text][]` and shortcut `[text]`, autolinks
+`<https://…>`, and bare URLs. A destination's `"title"` and its `<…>` quoting
+are stripped, and a link inside a code span or behind a backslash is text about
+a link rather than a link.
+
+When the cursor is not on a link the key goes back to Vim, so a path written as
+plain text still opens the way `gf` always did.
 
 ### Commands
 
@@ -139,6 +167,7 @@ require('md-render').setup({
     toggle = '<leader>mr',
     write = '<C-s>',
     preview = '<CR>',
+    follow = 'gf',
   },
   preview = {                   -- the popup's caps, as fractions of the editor
     max_width_pct = 0.9,
@@ -152,7 +181,8 @@ require('md-render').setup({
 Every field is optional and the merge is deep, so `setup{ keymaps = { toggle =
 'gm' } }` keeps the write key. A filetype that is not listed is left alone
 entirely: no state, no autocmds, no keymaps. Setting `keymaps.toggle`,
-`keymaps.write` or `keymaps.preview` to `false` leaves that key alone.
+`keymaps.write`, `keymaps.preview` or `keymaps.follow` to `false` leaves that
+key alone.
 
 ### The block preview
 

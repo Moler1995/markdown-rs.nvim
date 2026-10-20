@@ -49,6 +49,7 @@ vim.cmd('source ' .. vim.fn.fnameescape(repo .. '/plugin/md-render.lua'))
 
 local md = require('md-render')
 local config = require('md-render.config')
+local link = require('md-render.link')
 local preview = require('md-render.preview')
 local render = require('md-render.render')
 local state = require('md-render.state')
@@ -56,6 +57,11 @@ local style = require('md-render.style')
 
 local fixture = repo .. '/tests/fixtures/plugin.md'
 local plain = repo .. '/tests/fixtures/plain.txt'
+
+--- A document whose lines are links, one form per line, so that a check can
+--- name the line and the column it means. `links.md` links to `linked.md` and
+--- `other.md`, both of which are in the same directory.
+local links_fixture = repo .. '/tests/fixtures/links.md'
 
 --- A document whose table and diagram are both wider than this runner's 80
 --- columns, which is what the preview checks need: a block that fits the window
@@ -164,6 +170,13 @@ local function reset_to_wide()
   return wait_until(showing_rendered)
 end
 
+--- The same, for the fixture of links.
+local function reset_to_links()
+  vim.cmd('edit! ' .. vim.fn.fnameescape(links_fixture))
+  md.attach(vim.api.nvim_get_current_buf(), vim.api.nvim_get_current_win())
+  return wait_until(showing_rendered)
+end
+
 --------------------------------------------------------------------------------
 -- 8.1 Config and clean startup
 --------------------------------------------------------------------------------
@@ -184,7 +197,7 @@ section('8.1', function()
   expect('8.1 default theme', d.theme, 'catppuccin_mocha')
   eq_table('8.1 default filetypes', d.filetypes, { 'markdown' })
   eq_table('8.1 default keymaps', d.keymaps,
-    { toggle = '<leader>mr', write = '<C-s>', preview = '<CR>' })
+    { toggle = '<leader>mr', write = '<C-s>', preview = '<CR>', follow = 'gf' })
   eq_table('8.1 default preview caps', d.preview,
     { max_width_pct = 0.9, max_height_pct = 0.9 })
   expect('8.1 default resize debounce', d.resize_debounce, 100)
@@ -1385,6 +1398,229 @@ section('11.4', function()
   config.setup({})
   truthy('11.4 and it comes back when the option does', reset_to_wide())
   truthy('11.4 R maps the preview key again', maps_cr(current_state().rendered))
+end)
+
+--------------------------------------------------------------------------------
+-- 12.1 Link resolution
+--------------------------------------------------------------------------------
+
+-- The line numbers here are the fixture's own, counted from zero, and the
+-- columns are 0-based byte columns. A check names the line and the column it
+-- means rather than describing the text, because the point of most of them is
+-- the boundary: one column past a link is not the link.
+
+section('12.1', function()
+  local lines = vim.fn.readfile(links_fixture)
+
+  local function at(lnum, col)
+    return link.at(lines, lnum, col)
+  end
+
+  local function target(lnum, col)
+    local found = at(lnum, col)
+    return found and found.target or nil
+  end
+
+  -- Line 2 is `An inline link to [the target](./linked.md).` — the link's own
+  -- text, either bracket, and the destination all resolve to the same link.
+  expect('12.1 the cursor on the link text', target(2, 25), './linked.md')
+  expect('12.1 the cursor on the opening bracket', target(2, 18), './linked.md')
+  expect('12.1 the cursor on the closing bracket', target(2, 42), './linked.md')
+  expect('12.1 the cursor inside the destination', target(2, 35), './linked.md')
+  expect('12.1 the cursor one column past the link', target(2, 43), nil)
+  expect('12.1 the cursor in the prose before it', target(2, 5), nil)
+
+  -- The image form, which a scan that only looked for `[` would still find but
+  -- a scan that stopped at `]` would not.
+  local image = at(4, 15)
+  truthy('12.1 an image resolves', image ~= nil)
+  expect('12.1 an image is a file link', image and image.kind, 'file')
+  expect('12.1 an image target', image and image.target, './linked.md')
+
+  -- A fragment is split off the destination, and what is left is still a file.
+  local fragment = at(6, 30)
+  truthy('12.1 a fragment link resolves', fragment ~= nil)
+  expect('12.1 a fragment link target', fragment and fragment.target, './linked.md')
+  expect('12.1 a fragment link fragment', fragment and fragment.fragment, 'target-section')
+  expect('12.1 a fragment link is still a file', fragment and fragment.kind, 'file')
+
+  -- A reference link, resolved from a definition further down the buffer, and
+  -- the shortcut form that names a definition without repeating it.
+  expect('12.1 a reference link', target(10, 25), './linked.md')
+  expect('12.1 a shortcut reference', target(12, 26), './linked.md')
+
+  -- A URL is neither a file nor an anchor, and keeps its whole text.
+  local url = at(8, 20)
+  truthy('12.1 a bare URL resolves', url ~= nil)
+  expect('12.1 a bare URL kind', url and url.kind, 'url')
+  expect('12.1 a bare URL target', url and url.raw, 'https://example.com/docs')
+
+  local auto = at(22, 25)
+  truthy('12.1 an autolink resolves', auto ~= nil)
+  expect('12.1 an autolink is a URL', auto and auto.kind, 'url')
+  expect('12.1 an autolink target', auto and auto.raw, 'https://example.com/auto')
+  -- Found once, not twice: the bare-URL pattern also sees the URL inside the
+  -- brackets, and only the bracketed one is the link.
+  expect('12.1 an autolink is one link, not two', #link.links(lines, 22), 1)
+
+  -- `#tail` alone names a heading rather than a file.
+  local anchor = at(24, 30)
+  truthy('12.1 an anchor-only link resolves', anchor ~= nil)
+  expect('12.1 an anchor-only kind', anchor and anchor.kind, 'anchor')
+  expect('12.1 an anchor-only target is empty', anchor and anchor.target, '')
+  expect('12.1 an anchor-only fragment', anchor and anchor.fragment, 'tail')
+
+  -- Two links on one line are two links, and the cursor's column picks one.
+  expect('12.1 the first of two links', target(18, 15), './linked.md')
+  expect('12.1 the second of two links', target(18, 50), './other.md')
+  expect('12.1 between two links', target(18, 34), nil)
+
+  -- Text about a link is not a link.
+  expect('12.1 a link in a code span', target(26, 35), nil)
+  expect('12.1 an escaped bracket', target(28, 35), nil)
+
+  -- A destination's title and its angle-bracket quoting are decoration.
+  expect('12.1 a title is stripped',
+    link.at({ '[a](./b.md "Title")' }, 0, 2).target, './b.md')
+  expect('12.1 angle brackets are stripped',
+    link.at({ '[a](<./b c.md>)' }, 0, 2).target, './b c.md')
+
+  -- The heading an anchor names, and the slug it is matched by.
+  expect('12.1 a slug', link.slug('Target Section'), 'target-section')
+  expect('12.1 punctuation is dropped from a slug', link.slug('A, B!'), 'a-b')
+  expect('12.1 the line of an anchor', link.anchor_line(lines, 'tail'), 30)
+  expect('12.1 an anchor no heading matches', link.anchor_line(lines, 'nope'), nil)
+end)
+
+--------------------------------------------------------------------------------
+-- 12.2 Following a link
+--------------------------------------------------------------------------------
+
+section('12.2', function()
+  local opened = {}
+  local real_ui_open = vim.ui.open
+  -- Stubbed rather than called: a real `vim.ui.open` on a URL would try to
+  -- start a browser, and this runner is not here to start one.
+  vim.ui.open = function(url)
+    opened[#opened + 1] = url
+  end
+
+  local function maps(buf, lhs)
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, 'n')) do
+      if m.lhs == lhs then
+        return true
+      end
+    end
+    return false
+  end
+
+  --- The plugin state of the window, once its source is `name`.
+  local function wait_for_source(name)
+    return wait_until(function()
+      local s = state.windows[vim.api.nvim_get_current_win()]
+      return s ~= nil and s.source ~= nil and vim.api.nvim_buf_is_valid(s.source)
+        and vim.fn.fnamemodify(vim.api.nvim_buf_get_name(s.source), ':t') == name
+    end)
+  end
+
+  --- Put R's cursor on the display row for 0-based source line `src`.
+  local function goto_source(src)
+    local st = current_state()
+    local row = render.row_for_source(st.doc, src)
+    if row == nil then
+      return false
+    end
+    vim.api.nvim_win_set_cursor(st.win, { row + 1, 0 })
+    return true
+  end
+
+  truthy('12.2 in R on the links fixture', reset_to_links())
+  local st = current_state()
+  truthy('12.2 R maps gf', maps(st.rendered, 'gf'))
+  truthy('12.2 S maps gf', maps(st.source, 'gf'))
+
+  -- `keymaps.follow = false` leaves the key alone, as the other keys' `false`
+  -- does. Checked on R, whose buffer is made afresh: a mapping set on a buffer
+  -- survives an `:edit!` of it, so only a new buffer can show the difference.
+  config.setup({ keymaps = { follow = false } })
+  truthy('12.2 in R with the key disabled', reset_to_links())
+  truthy('12.2 keymaps.follow = false leaves gf alone in R',
+    not maps(current_state().rendered, 'gf'))
+  config.setup({})
+  truthy('12.2 and it comes back when the option does', reset_to_links())
+  truthy('12.2 R maps gf again', maps(current_state().rendered, 'gf'))
+
+  -- From R, the display row is mapped back to its source line and the link is
+  -- read there. Source line 2 carries the inline link.
+  truthy('12.2 in R for the inline link', reset_to_links())
+  truthy('12.2 the inline link has a display row', goto_source(2))
+  md.follow()
+  truthy('12.2 following from R opens the linked file', wait_for_source('linked.md'))
+
+  -- A fragment takes the reader to the heading, not to line 1. Source line 6
+  -- carries the link to `linked.md#target-section`.
+  truthy('12.2 in R for the fragment link', reset_to_links())
+  truthy('12.2 the fragment link has a display row', goto_source(6))
+  md.follow()
+  truthy('12.2 following the fragment link opens the file', wait_for_source('linked.md'))
+  truthy('12.2 and the view is in R', wait_until(showing_rendered))
+  -- Also the check that catches a render arriving for a state the window has
+  -- already dropped. This is the second follow in a row to the same file, so a
+  -- request left over from the first one is still in flight; if it were applied
+  -- it would put its own rendered buffer on screen first, and this follow would
+  -- then find the window already showing R and leave the cursor on line 1.
+  local landed = current_state()
+  expect('12.2 and it opens on the heading the fragment names',
+    render.source_line_for(landed.doc, vim.api.nvim_win_get_cursor(landed.win)[1] - 1), 4)
+
+  -- An anchor with no path stays in this document. Source line 16 carries
+  -- `[the tail](#tail)`, and the heading it names is source line 30.
+  truthy('12.2 in R for the anchor', reset_to_links())
+  truthy('12.2 the anchor has a display row', goto_source(16))
+  md.follow()
+  st = current_state()
+  expect('12.2 an anchor moves R to its heading\'s display row',
+    render.source_line_for(st.doc, vim.api.nvim_win_get_cursor(st.win)[1] - 1), 30)
+
+  -- From S the cursor's own column decides, which is the case R cannot resolve:
+  -- a display column has no byte column in the source to be compared against.
+  -- Source line 18 holds two links, to `linked.md` and to `other.md`.
+  truthy('12.2 in R before the two-link line', reset_to_links())
+  md.show_source()
+  truthy('12.2 and in S for the two-link line', wait_until(showing_source))
+  st = current_state()
+  vim.api.nvim_win_set_cursor(st.win, { 19, 50 })
+  md.follow()
+  truthy('12.2 the cursor on the second link follows the second link',
+    wait_for_source('other.md'))
+
+  truthy('12.2 in R before the first link', reset_to_links())
+  md.show_source()
+  truthy('12.2 and in S for the first link', wait_until(showing_source))
+  st = current_state()
+  vim.api.nvim_win_set_cursor(st.win, { 19, 15 })
+  md.follow()
+  truthy('12.2 the cursor on the first link follows the first link',
+    wait_for_source('linked.md'))
+
+  -- And from S an anchor moves the cursor within this document, to source line
+  -- 30 — the `## Tail` heading — with no file opened at all.
+  truthy('12.2 in R before the anchor in S', reset_to_links())
+  md.show_source()
+  truthy('12.2 and in S for the anchor', wait_until(showing_source))
+  st = current_state()
+  vim.api.nvim_win_set_cursor(st.win, { 17, 27 })
+  md.follow()
+  expect('12.2 an anchor in S moves the cursor to its heading',
+    vim.api.nvim_win_get_cursor(st.win)[1], 31)
+
+  -- A URL goes to `vim.ui.open` rather than to a file open.
+  truthy('12.2 in R for the URL', reset_to_links())
+  truthy('12.2 the bare URL has a display row', goto_source(8))
+  md.follow()
+  eq_table('12.2 a URL goes to vim.ui.open', opened, { 'https://example.com/docs' })
+
+  vim.ui.open = real_ui_open
 end)
 
 --------------------------------------------------------------------------------

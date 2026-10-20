@@ -25,10 +25,18 @@ M.defaults = {
   -- belongs to R only, since in S the cursor is already on the block's source.
   -- The insert-entry keys are fixed and are not configurable, because they are
   -- the mode's escape hatch rather than a convenience.
+  --
+  -- `follow` is the one key set in both states, because a link is followed from
+  -- wherever the reader happens to be: in S it resolves the link under the
+  -- cursor, and in R it maps the display row back to its source line first and
+  -- resolves the link there. It shadows `gf` in a managed buffer, and hands the
+  -- key back to Vim when the cursor is not on a link, so a bare path still
+  -- opens the way it always did.
   keymaps = {
     toggle = '<leader>mr',
     write = '<C-s>',
     preview = '<CR>',
+    follow = 'gf',
   },
 
   -- The preview popup's caps, as fractions of the editor's size. The popup is

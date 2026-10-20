@@ -7,10 +7,12 @@
 -- decoration of S, every normal-mode motion, search and yank works on it for
 -- free — and because it is a different buffer with `modifiable` off, no editing
 -- command can reach the source through it. Movement between the two is
--- explicit: a toggle mapping, or one of the six insert-entry keys.
+-- explicit: a toggle mapping, one of the six insert-entry keys, or the key that
+-- follows the link under the cursor.
 
 local config = require('md-render.config')
 local engine = require('md-render.engine')
+local link = require('md-render.link')
 local preview = require('md-render.preview')
 local render = require('md-render.render')
 local state = require('md-render.state')
@@ -227,19 +229,24 @@ end
 --- Bumped per preview request, so an answer to a superseded one is dropped.
 local preview_generation = 0
 
---- Hand the preview key back to Vim.
+--- Put `key` into the typeahead, unremapped.
 ---
---- The `'n'` flag is load-bearing here in a way it is not in `enter_insert`: the
---- preview mapping is buffer-local to R, so a fed key that was subject to
---- remapping would re-enter this same mapping and loop. Unremapped, it performs
---- its ordinary editor action — which for the default `<CR>` is the move to the
---- first non-blank of the next line.
-local function fall_through()
-  local key = config.options.keymaps.preview
+--- The `'n'` flag is load-bearing wherever this hands a key back to Vim: the
+--- mapping that is giving it back is buffer-local, so a fed key that was
+--- subject to remapping would re-enter that same mapping and loop. Unremapped,
+--- the key performs its ordinary editor action — which for the default `<CR>`
+--- is the move to the first non-blank of the next line, and for `gf` is Vim's
+--- own file-under-the-cursor.
+local function feed(key)
   if not key or key == '' or key == false then
     return
   end
   vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(key, true, false, true), 'n', false)
+end
+
+--- Hand the preview key back to Vim.
+local function fall_through()
+  feed(config.options.keymaps.preview)
 end
 
 --- Ask the engine for a document, and show it if R is still what we want.
@@ -274,7 +281,17 @@ local function request(st, opts)
   local content = table.concat(vim.api.nvim_buf_get_lines(source, 0, -1, false), '\n')
 
   engine.render(config.options, content, width, function(err, doc)
-    if st.generation ~= generation or not vim.api.nvim_win_is_valid(st.win) then
+    -- Two answers are stale, and both have to be dropped here rather than
+    -- checked for downstream: one for a state that has asked again, and one for
+    -- a state the window no longer has. The second is the subtle one — a state
+    -- dropped by `state.forget` keeps its `generation`, and a fresh state starts
+    -- counting from zero, so a render left over from a window's *previous*
+    -- document passes the generation check on its own terms and would then swap
+    -- its own rendered buffer into that window, taking the place of the document
+    -- actually being opened and leaving the current state's swap unable to
+    -- recognise the source it was going to cross from.
+    if st.generation ~= generation or not vim.api.nvim_win_is_valid(st.win)
+      or state.windows[st.win] ~= st then
       return
     end
 
@@ -463,6 +480,138 @@ function M.preview(win)
   end)
 end
 
+--- The source lines of `st`'s document, or nil when there are none to read.
+local function source_lines(st)
+  if not st.source or not vim.api.nvim_buf_is_valid(st.source) then
+    return nil
+  end
+  return vim.api.nvim_buf_get_lines(st.source, 0, -1, false)
+end
+
+--- Move the cursor to the heading `fragment` names, in whichever state the
+--- window is in. Returns false when there is no such heading.
+local function jump_anchor(st, fragment)
+  local lines = source_lines(st)
+  local at = lines and link.anchor_line(lines, fragment)
+  if not at then
+    return false
+  end
+
+  local win = st.win
+  if st.doc and vim.api.nvim_win_get_buf(win) == st.rendered then
+    -- In R the heading's source line has to be turned back into a display row.
+    -- A heading the engine drew no line for has none, and there is nowhere to
+    -- put the cursor, so the jump is refused rather than misplaced.
+    local row = render.row_for_source(st.doc, at)
+    if not row then
+      return false
+    end
+    vim.api.nvim_win_set_cursor(win, { row + 1, 0 })
+    st.rendered_anchor = row
+  else
+    vim.api.nvim_win_set_cursor(win, { at + 1, 0 })
+  end
+  return true
+end
+
+--- Open what the link under the cursor points at.
+---
+--- A file opens in the window, a URL opens in whatever the desktop opens URLs
+--- with, and an anchor scrolls to the heading it names — in this document, or
+--- in the one just opened.
+---
+--- In R there is no link to read: the engine drops link targets, so the
+--- rendered text holds the link's text and nothing else. The display row is
+--- therefore mapped back to the source line it came from — the same step the
+--- toggle makes — and the link is read from the source. That is what lets a
+--- reader follow a link without leaving the reading view first.
+---
+--- A source line holding more than one link resolves to the first of them when
+--- it is followed from R, because the rendered line is a layout of the source
+--- rather than a copy of it and a display column has no byte column in the
+--- source to be compared against. From S the cursor's own column decides.
+---
+--- With no link under the cursor the key goes back to Vim, so `gf` keeps its
+--- ordinary meaning on a path written as plain text.
+function M.follow(win)
+  win = win or vim.api.nvim_get_current_win()
+  if not vim.api.nvim_win_is_valid(win) then
+    return
+  end
+  local st = state.get(win)
+  local key = config.options.keymaps.follow
+  local lines = source_lines(st)
+  local buf = vim.api.nvim_win_get_buf(win)
+  if not lines or (buf ~= st.source and buf ~= st.rendered) then
+    return feed(key)
+  end
+
+  local cursor = vim.api.nvim_win_get_cursor(win)
+  local row, col = cursor[1] - 1, cursor[2]
+  local lnum = row
+
+  if buf == st.rendered then
+    lnum = st.doc and render.source_line_for(st.doc, row)
+    if not lnum then
+      return feed(key)
+    end
+    col = nil
+  end
+
+  local found = link.at(lines, lnum, col)
+  if not found then
+    return feed(key)
+  end
+
+  if found.kind == 'url' then
+    vim.ui.open(found.raw)
+    return
+  end
+
+  if found.kind == 'anchor' then
+    if found.fragment and jump_anchor(st, found.fragment) then
+      return
+    end
+    vim.notify('md-render: no heading matches ' .. found.raw, vim.log.levels.WARN)
+    return
+  end
+
+  -- The destination is written relative to the document holding it rather than
+  -- to the working directory, which is what Vim's own `gf` does too.
+  local name = vim.api.nvim_buf_get_name(st.source)
+  local base = name ~= '' and vim.fn.fnamemodify(name, ':h') or vim.fn.getcwd()
+  local path = vim.fn.fnamemodify(base .. '/' .. found.target, ':p')
+  if vim.fn.filereadable(path) == 0 then
+    vim.notify('md-render: no such file: ' .. found.target, vim.log.levels.WARN)
+    return
+  end
+
+  vim.cmd('edit ' .. vim.fn.fnameescape(path))
+
+  -- Placed before the attach rather than after it. The attach renders the new
+  -- document from the source buffer, so moving the cursor now is what makes R
+  -- open on the section instead of on line 1.
+  if found.fragment then
+    local at = link.anchor_line(vim.api.nvim_buf_get_lines(0, 0, -1, false), found.fragment)
+    if at then
+      vim.api.nvim_win_set_cursor(0, { at + 1, 0 })
+    end
+  end
+
+  -- Attached here rather than left to the `FileType` autocmd, because that
+  -- event does not fire for a file that is already loaded: `:edit` on a buffer
+  -- whose filetype is already set raises `BufEnter` and `BufWinEnter` and
+  -- nothing else, so following a second link to the same file would leave it
+  -- on screen as source.
+  --
+  -- Where the event does fire — a file being loaded for the first time — the
+  -- attach it schedules arrives on top of this one. That is harmless: it finds
+  -- the state already in place and asks for the same document again rather than
+  -- starting over, and of the two answers it is the later that lands, the
+  -- earlier being dropped by the generation check.
+  M.attach(vim.api.nvim_get_current_buf(), win)
+end
+
 --- Cross from R into S at the source line under the cursor, then feed `key`.
 ---
 --- The cursor is placed before the key is fed, so that Vim's own `i`, `o` and
@@ -479,10 +628,9 @@ function M.enter_insert(win, key)
 
   -- Fed rather than executed: `i` and `A` are not commands, and letting Vim
   -- interpret the key is what makes each of the six behave exactly as it does
-  -- in any other buffer. `n` keeps it unremapped — the source buffer has no
-  -- such mapping, so there is nothing to recurse into — and leaves the key in
-  -- the typeahead, which Vim reads as soon as this mapping returns.
-  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(key, true, false, true), 'n', false)
+  -- in any other buffer. Unremapped, the key is left in the typeahead, which
+  -- Vim reads as soon as this mapping returns.
+  feed(key)
 end
 
 --- Write the source buffer, from wherever the write was issued.
@@ -533,6 +681,13 @@ function M.set_keymaps(buf, insert_entry)
     -- the rendered one, and its `BufWriteCmd` is what reaches the source.
     vim.cmd('silent write')
   end, 'md-render: write')
+
+  -- The one key besides the toggle and the write key that belongs to both
+  -- states: a link is followed from wherever the reader is, and the rendered
+  -- view is exactly where the links are worth following from.
+  map(options.keymaps.follow, function()
+    M.follow()
+  end, 'md-render: follow the link under the cursor')
 
   if not insert_entry then
     return
