@@ -1153,8 +1153,8 @@ end)
 --------------------------------------------------------------------------------
 
 section('11.3', function()
-  -- 3.3 geometry: the budget floor. `vim.o.columns` is 80 here, so the cap is 72
-  -- and the popup's inner width 70.
+  -- 3.3 geometry: the budget. `vim.o.columns` is 80 here, so the cap is 72 and
+  -- the popup's inner width 70.
   local full = preview.geometry('table', 80)
   expect('11.3 in a window as wide as the cap, the budget is the window\'s',
     full.budget, 80)
@@ -1163,6 +1163,18 @@ section('11.3', function()
     preview.geometry('table', 40).budget, 70)
   expect('11.3 a window narrower still is still floored at the inner width',
     preview.geometry('table', 10).budget, 70)
+
+  -- A diagram is the other half of the same decision: the engine clips what does
+  -- not fit, so no finite budget is safe for one, and the popup lays it out at
+  -- the largest budget the engine takes whatever the window's own budget is.
+  -- The three window budgets below are the table's three cases, and the answer
+  -- has to be the same for all of them.
+  for _, window_budget in ipairs({ 80, 40, 10 }) do
+    expect('11.3 a diagram is not laid out against the window\'s budget (' ..
+      window_budget .. ')', preview.geometry('mermaid', window_budget).budget, 65535)
+  end
+  expect('11.3 and the popup\'s inner width is unchanged by the kind',
+    preview.geometry('mermaid', 80).inner, full.inner)
 
   -- 3.1 open
   truthy('11.3 in R on the wide fixture', reset_to_wide())

@@ -43,6 +43,11 @@ local fixture = repo .. '/tests/fixtures/plugin.md'
 --- diagram the engine has to clip, so a preview has something to recover.
 local wide = repo .. '/tests/fixtures/wide.md'
 
+--- One diagram wider than the popup's own inner width as well as wider than a
+--- narrow window, so that the popup's content says which of the two budgets it
+--- was laid out against (design D3).
+local wide_diagram = repo .. '/tests/fixtures/wide-diagram.md'
+
 --- The directory reports are written to, so the driver can check liveness with
 --- a path it never has to spell out itself.
 M.out = out
@@ -156,23 +161,39 @@ end
 -- The block preview
 --------------------------------------------------------------------------------
 
---- The display width of a buffer's widest line.
+--- The display width of a buffer's widest line, measured in `win`'s context.
 ---
 --- Display columns rather than `#line`: the artwork is box-drawing characters,
---- several bytes each, so a byte count would overstate it. The same measure is
---- used for the popup and for the window underneath, so the two compare.
+--- several bytes each, so a byte count would overstate it.
+---
+--- `win` is not decoration, and the same measure for the popup and for the
+--- window underneath is what makes the two compare. `strdisplaywidth` is not a
+--- property of the string alone: it simulates the line's display in the current
+--- window, so `'wrap'` and `'linebreak'` change it — measured against the same
+--- 358-column artwork, `wrap` on gives 358 and `wrap` off gives 357, because
+--- `'linebreak'` decides whether the space at a break counts. An open popup is
+--- `wrap=false` and takes focus, so measuring its buffer as the current window
+--- would report one or two columns fewer than the window's, for no reason but
+--- the measurement. Naming the window the width is meant *for* removes that.
+---
 --- -1 rather than an error for a buffer that is gone: a report of a state the
 --- checks did not expect is more useful than an exception that leaves no report
 --- at all, and `-1` fails every comparison the checks make.
-local function widest(buf)
+local function widest(buf, win)
   if not buf or not vim.api.nvim_buf_is_valid(buf) then
     return -1
   end
-  local w = 0
-  for _, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
-    w = math.max(w, vim.fn.strdisplaywidth(line))
+  local function measure()
+    local w = 0
+    for _, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
+      w = math.max(w, vim.fn.strdisplaywidth(line))
+    end
+    return w
   end
-  return w
+  if win and vim.api.nvim_win_is_valid(win) then
+    return vim.api.nvim_win_call(win, measure)
+  end
+  return measure()
 end
 
 --- `winsaveview()` of a window that is not the current one.
@@ -184,12 +205,15 @@ end
 ---
 --- `only` first: the checks below split the window, and a split left over from
 --- an earlier one would change the width the next check starts from.
-function M.reset_wide()
+---
+--- `which` names the fixture, because two of them are wide: the one with a table
+--- and a diagram, and the one that is a single diagram wider than the popup.
+function M.reset_wide(which)
   preview.close()
   if #vim.api.nvim_list_wins() > 1 then
     vim.cmd('only')
   end
-  vim.cmd('edit! ' .. vim.fn.fnameescape(wide))
+  vim.cmd('edit! ' .. vim.fn.fnameescape(which or wide))
   md.attach(vim.api.nvim_get_current_buf(), vim.api.nvim_get_current_win())
   vim.wait(8000, function()
     local s = st()
@@ -197,11 +221,18 @@ function M.reset_wide()
   end)
 end
 
+--- The same, for the fixture that is one diagram wider than the popup.
+function M.reset_wide_diagram()
+  M.reset_wide(wide_diagram)
+end
+
 --- Narrow the window showing R to `cols` columns, and wait for the re-render.
 ---
 --- A split is the only way to make a window narrower than the editor, and that
 --- is the arrangement the preview's budget floor exists for: with a single
---- full-width window the popup's budget cannot exceed the window's (design D3).
+--- full-width window a table's budget cannot exceed the window's (design D3).
+--- A diagram's budget does not depend on the window at all, so the split is
+--- needed only to keep the window from being the wider of the two.
 ---
 --- The wait is not for the resize but for what it schedules. The width change
 --- fires `WinResized`, which debounces a re-render; `goto` resolves a source
@@ -254,20 +285,24 @@ function M.preview_report(tag, want_open)
     'state=' .. tostring(s.mode),
     'columns=' .. vim.o.columns,
     'window_width=' .. vim.api.nvim_win_get_width(s.win),
-    'window_widest=' .. widest(s.rendered),
+    'window_widest=' .. widest(s.rendered, s.win),
     'showing_rendered=' .. tostring(vim.api.nvim_win_get_buf(s.win) == s.rendered),
     'buffer=' .. tostring(vim.api.nvim_win_get_buf(s.win)),
     'cursor_line=' .. tostring(cursor[1]),
     'cursor_col=' .. tostring(cursor[2]),
     'cursor_text=' .. vim.json.encode(row or ''),
     'topline=' .. tostring(view.topline),
+    -- The popup's inner width as the plugin computes it, so that a check can say
+    -- what the popup's own budget was without re-deriving the cap. `inner` does
+    -- not depend on the kind; the budget does, and is what 5.4 is about.
+    'popup_inner=' .. tostring(preview.geometry('table', 0).inner),
     'popup_width=0',
     'popup_widest=0',
   }
   if preview.is_open() then
     local p = preview.popup
     lines[#lines] = 'popup_width=' .. vim.api.nvim_win_get_width(p.win)
-    lines[#lines + 1] = 'popup_widest=' .. widest(p.buf)
+    lines[#lines + 1] = 'popup_widest=' .. widest(p.buf, s.win)
     lines[#lines + 1] = 'popup_buf=' .. tostring(p.buf)
       .. ' valid=' .. tostring(vim.api.nvim_buf_is_valid(p.buf))
       .. ' shown=' .. tostring(vim.api.nvim_win_get_buf(p.win))

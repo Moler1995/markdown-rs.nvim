@@ -8,10 +8,10 @@
 -- of a wide diagram does not exist.
 --
 -- That is why the popup is a re-render and not a magnifier. This module finds
--- the block's own source, hands that source back to the engine at the popup's
--- width, and shows the result in a float. The window underneath is never
--- touched — a float is an independent window, so the buffer, the cursor and the
--- view are all still there when it closes, with no bookkeeping.
+-- the block's own source and hands it back to the engine at a width chosen so
+-- that nothing is lost, and shows the result in a float. The window underneath
+-- is never touched — a float is an independent window, so the buffer, the
+-- cursor and the view are all still there when it closes, with no bookkeeping.
 
 local config = require('md-render.config')
 local engine = require('md-render.engine')
@@ -206,20 +206,38 @@ end
 -- The popup
 --------------------------------------------------------------------------------
 
+--- The largest column budget the engine accepts.
+---
+--- `--width` is a `u16` (`engine/src/main.rs`), so this is the top of its range
+--- rather than a tuned number. The point is not the number: it is that no
+--- diagram is this wide, so laying one out at it clips nothing.
+local MAX_BUDGET = 65535
+
 --- The popup's geometry for a block of `kind`: the editor's size, the configured
 --- caps, the popup's own inner width, and the budget the block is laid out at.
 ---
---- `window_budget` is the column budget the window showing R already has. The
---- layout budget is the popup's inner width **floored at it**, and the floor is
---- not a detail: the cap is a fraction of the *editor*, not of the window, so in
---- a full-width window the popup's inner width is the smaller of the two. Without
---- the floor the engine would clip the block harder for the popup than it did for
---- the window, and because that clip happens inside the engine the lost columns
---- would not be in the popup's buffer for scrolling to reach either.
+--- `window_budget` is the column budget the window showing R already has.
 ---
---- So in a full-width window the two budgets are equal and the popup is a
---- scrollable window onto the same layout; in a narrower window — a split — the
---- popup's budget is the larger, which is the point of the feature.
+--- The budget is not the same question for the two kinds, and the difference is
+--- what the engine does with content that does not fit.
+---
+--- A **diagram** is laid out against `MAX_BUDGET`. The engine *clips* artwork
+--- that does not fit — `clip_to_width` drops the right-hand side of the line —
+--- and the dropped columns are not in the buffer, so scrolling cannot reach
+--- them. Any finite budget can therefore lose the end of a wide diagram; the
+--- only budget that loses nothing is one no diagram reaches. The popup's own
+--- inner width is the wrong budget for a diagram precisely because it is finite:
+--- a sequence diagram 358 columns wide laid out at 200 is a diagram with 158
+--- columns missing, and the reader asked to see the block, not a crop of it.
+---
+--- A **table** needs no such thing. The engine wraps a cell that does not fit
+--- rather than dropping it, so a table loses nothing at any budget, and a larger
+--- budget would only make its columns wider and harder to read. It is therefore
+--- laid out at the popup's inner width, **floored at the window's**: the cap is
+--- a fraction of the *editor*, not of the window, so in a full-width window the
+--- popup's inner width is the smaller of the two, and without the floor the
+--- popup would lay the table out at a smaller budget than the window already
+--- used and so show strictly less of it.
 function M.geometry(kind, window_budget)
   local opts = config.options.preview
   local cols = vim.o.columns
@@ -234,7 +252,7 @@ function M.geometry(kind, window_budget)
     max_w = max_w,
     max_h = max_h,
     inner = inner,
-    budget = math.max(inner, window_budget or 0),
+    budget = kind == 'table' and math.max(inner, window_budget or 0) or MAX_BUDGET,
   }
 end
 

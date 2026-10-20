@@ -418,7 +418,8 @@ local function body()
   -- and the columns the window's rendering clipped are recoverable. Both kinds
   -- are checked because the engine lays a table and a diagram out in different
   -- code, and only one of them being recoverable would not show up in a
-  -- single-kind check.
+  -- single-kind check. Which budget each kind gets, and how far above the
+  -- window's it is, is 5.3 and 5.4.
   md_call('reset_wide()')
   md_call('narrow(40)')
   md_call('goto(6)')
@@ -499,6 +500,37 @@ local function body()
     tonumber(full_table.popup_width) < tonumber(full_table.popup_widest),
     string.format('popup window %s, content %s',
       full_table.popup_width, full_table.popup_widest))
+
+  ----------------------------------------------------------------------------
+  -- 5.4, a diagram is not laid out against the popup's own width
+  ----------------------------------------------------------------------------
+
+  -- The other half of the per-kind budget (design D3): a table is laid out at
+  -- the popup's inner width, and a diagram is not, because the engine clips a
+  -- diagram that does not fit and the clipped columns are not in the buffer for
+  -- scrolling to reach. The fixture's sequence diagram is wider than both the
+  -- window and the popup's inner width, which is what makes this observable: any
+  -- budget derived from either is at most the inner width, so content wider than
+  -- the inner width is content the popup did not clip.
+  --
+  -- The window is narrowed to 40 for the same reason 5.1 narrows it — in a
+  -- full-width window a table's budget is already the window's, so the window
+  -- width would not tell the two budgets apart.
+  md_call('reset_wide_diagram()')
+  md_call('narrow(40)')
+  md_call('goto(9)')
+  local wide_diagram = preview_key('wide_diagram', true)
+
+  expect('5.4 the diagram preview opens', wide_diagram.open, 'true')
+  expect('5.4 in the narrow window', wide_diagram.window_width, '40')
+  truthy('5.4 and the popup holds more of it than the popup\'s own width',
+    tonumber(wide_diagram.popup_widest) > tonumber(wide_diagram.popup_inner),
+    string.format('popup content %s, popup inner width %s',
+      wide_diagram.popup_widest, wide_diagram.popup_inner))
+  truthy('5.4 with its window narrower than that content, so the rest scrolls',
+    tonumber(wide_diagram.popup_width) < tonumber(wide_diagram.popup_widest),
+    string.format('popup window %s, content %s',
+      wide_diagram.popup_width, wide_diagram.popup_widest))
 end
 
 local ok, err = pcall(body)
