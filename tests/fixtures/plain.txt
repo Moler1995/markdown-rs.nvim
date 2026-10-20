@@ -1,0 +1,3 @@
+# Not markdown
+
+This file is named .txt, so the plugin has no opinion about it.

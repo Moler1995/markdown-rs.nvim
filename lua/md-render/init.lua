@@ -1,0 +1,657 @@
+-- md-render.nvim: a rendered reading view for markdown, in the same window.
+--
+-- The design in one paragraph. A markdown buffer has two states. S is the
+-- source buffer, exactly as the editor would have opened it, fully editable. R
+-- is a second buffer holding the engine's rendered output, shown in the same
+-- window by `nvim_win_set_buf`. Because R is a real buffer rather than a
+-- decoration of S, every normal-mode motion, search and yank works on it for
+-- free — and because it is a different buffer with `modifiable` off, no editing
+-- command can reach the source through it. Movement between the two is
+-- explicit: a toggle mapping, or one of the six insert-entry keys.
+
+local config = require('md-render.config')
+local engine = require('md-render.engine')
+local preview = require('md-render.preview')
+local render = require('md-render.render')
+local state = require('md-render.state')
+
+local M = {}
+
+--- Exposed so `require('md-render').config.options` is the live table.
+M.config = config
+
+M.augroup = vim.api.nvim_create_augroup('MdRender', { clear = true })
+
+--- The six keys that mean "I want to type here".
+---
+--- They are not configurable and not remappable: they are the way out of a
+--- read-only buffer, so a user who rebinds one should get the rebinding rather
+--- than lose the exit.
+local INSERT_ENTRY = { 'i', 'a', 'I', 'A', 'o', 'O' }
+
+--- Columns available for text in `win`.
+---
+--- `winwidth - textoff` is exactly it, measured rather than assumed: a line of
+--- `winwidth - textoff` columns occupies one screen line, and one column more
+--- occupies two. In particular a vertical split does *not* cost the left window
+--- a column — the separator is not drawn inside either window — and `textoff`
+--- does cover the number, sign and fold columns.
+---
+--- Getting this wrong in the generous direction is the dangerous one: one
+--- column too many and the engine's longest line soft-wraps, which breaks the
+--- one-display-line-per-buffer-line correspondence the cursor mapping rests on.
+local function text_width(win)
+  local info = vim.fn.getwininfo(win)[1]
+  local off = (info and info.textoff) or 0
+  return math.max(1, vim.api.nvim_win_get_width(win) - off)
+end
+
+--- The name to give this window's rendered buffer.
+---
+--- The buffer must be named: `:w` on an unnamed `acwrite` buffer fails with
+--- `E32: No file name` before `BufWriteCmd` is ever consulted, so an unnamed
+--- rendered buffer could not be written through. The window id keeps the name
+--- unique per window, which is what lets two windows render the same document.
+local function rendered_name(win, source)
+  local name = vim.api.nvim_buf_get_name(source)
+  name = name ~= '' and vim.fn.fnamemodify(name, ':t') or '[No Name]'
+  return string.format('md-render://%d/%s', win, name)
+end
+
+--- Create (or recreate) this window's rendered buffer, empty.
+local function new_rendered_buffer(st)
+  local buf = vim.api.nvim_create_buf(false, true)
+
+  -- The name is set before `buftype`, so a failure to set it cannot leave a
+  -- buffer that is `acwrite` and unnamed — the one combination that breaks `:w`.
+  pcall(vim.api.nvim_buf_set_name, buf, rendered_name(st.win, st.source))
+
+  vim.bo[buf].buftype = 'acwrite'
+  vim.bo[buf].bufhidden = 'wipe'
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].buflisted = false
+
+  M.set_keymaps(buf, true)
+
+  -- `acwrite` routes `:w` here instead of to the file, which is what makes a
+  -- write in R a write of the source.
+  vim.api.nvim_create_autocmd('BufWriteCmd', {
+    group = M.augroup,
+    buffer = buf,
+    callback = function()
+      M.write_source(st)
+    end,
+  })
+
+  -- `bufhidden=wipe` discards the buffer when the window leaves it. Keeping the
+  -- map clean is the one thing Vim will not do for us — and so is the mode: a
+  -- wiped buffer cannot be what the window is showing, so the state has to stop
+  -- claiming otherwise.
+  vim.api.nvim_create_autocmd('BufWipeout', {
+    group = M.augroup,
+    buffer = buf,
+    once = true,
+    callback = function()
+      state.by_rendered[buf] = nil
+      if st.rendered == buf then
+        st.rendered = nil
+        st.doc = nil
+        st.mode = 'S'
+      end
+    end,
+  })
+
+  return buf
+end
+
+--- Show `doc` in R in `st`'s window.
+---
+--- The cursor is placed by mapping the source position rather than by
+--- remembering a row: the two views are kept in step by deriving each from the
+--- other at the moment of the swap, so reading in R and then asking to edit
+--- lands on the source line being read.
+local function show_rendered(st, doc)
+  local win = st.win
+  if not vim.api.nvim_win_is_valid(win) then
+    return
+  end
+
+  local buf = st.rendered
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    buf = new_rendered_buffer(st)
+    st.rendered = buf
+    state.by_rendered[buf] = win
+  end
+
+  if st.doc ~= doc then
+    render.apply(buf, doc)
+    st.doc = doc
+  end
+
+  -- Read before the swap, not after. `nvim_win_set_buf` leaves the window
+  -- reporting the *rendered* buffer's own remembered cursor — which, since
+  -- `bufhidden=wipe` discards that buffer on every return to S, is line 1
+  -- rather than wherever the reader actually is. Reading it after the swap
+  -- would map line 1 to source line 1 and drag the cursor there.
+  local crossing = st.source and vim.api.nvim_buf_is_valid(st.source)
+    and vim.api.nvim_win_get_buf(win) == st.source
+  local line
+  if crossing then
+    -- Saved because `nvim_win_set_buf` does not restore it. Measured: it brings
+    -- back the cursor line but leaves the top line at 1, so a scroll position
+    -- survives the round trip only if it is held on to explicitly.
+    st.source_view = vim.fn.winsaveview()
+    line = st.source_view.lnum - 1
+  end
+
+  vim.api.nvim_win_set_buf(win, buf)
+
+  -- Measured on 0.12.6: none of the swap paths re-list an unlisted buffer. The
+  -- option is what keeps R out of `:ls` and `:bnext`, though, so it is cheap
+  -- insurance against a version that does.
+  vim.bo[buf].buflisted = false
+
+  -- Only when crossing. A re-render while R is already on screen leaves the
+  -- cursor where the reader put it; re-placing it from a round trip through
+  -- `source_map` would shift it by a line wherever a construct is synthetic.
+  if line then
+    local row = render.row_for_source(doc, line)
+    if row then
+      vim.api.nvim_win_set_cursor(win, { row + 1, 0 })
+    end
+    -- Where R was entered, so that leaving it again can tell "the reader is
+    -- still where they arrived" from "the reader moved and means it".
+    st.rendered_anchor = vim.api.nvim_win_get_cursor(win)[1] - 1
+  end
+
+  st.mode = 'R'
+end
+
+--- Show the source in `st`'s window, at the line R was showing.
+---
+--- The source's own view is restored from the copy taken when it was left, and
+--- the cursor is placed on the source line the display line came from — but only
+--- when the reader actually moved in R. The two maps are not inverses and cannot
+--- be: `source_map` sends several source lines to one display line wherever a
+--- construct is drawn rather than echoed (a table's delimiter row becomes a
+--- border, so it has no display line of its own). Round-tripping through them
+--- therefore drifts by a line, and toggling would walk the cursor down the
+--- document. Restoring a view the reader never changed has to be exact, so it is
+--- done from the saved view alone; the mapping is for when they did move, and
+--- then it is what they meant.
+local function show_source(st)
+  local win = st.win
+  if not vim.api.nvim_win_is_valid(win) then
+    return
+  end
+  local source = st.source
+  if not source or not vim.api.nvim_buf_is_valid(source) then
+    return
+  end
+
+  local line
+  if st.rendered and vim.api.nvim_buf_is_valid(st.rendered)
+    and vim.api.nvim_win_get_buf(win) == st.rendered and st.doc then
+    st.rendered_view = vim.fn.winsaveview()
+    local row = vim.api.nvim_win_get_cursor(win)[1] - 1
+    if st.rendered_anchor == nil or row ~= st.rendered_anchor then
+      line = render.source_line_for(st.doc, row)
+    end
+  end
+
+  if vim.api.nvim_win_get_buf(win) ~= source then
+    vim.api.nvim_win_set_buf(win, source)
+  end
+
+  if st.source_view then
+    vim.fn.winrestview(st.source_view)
+  end
+  if line then
+    local count = vim.api.nvim_buf_line_count(source)
+    vim.api.nvim_win_set_cursor(win, { math.min(line + 1, count), 0 })
+  end
+
+  st.want = 'S'
+  st.mode = 'S'
+end
+
+--- Report a rendering failure, once per failure rather than once per attempt.
+local function report(st, message)
+  if st.reported ~= message then
+    st.reported = message
+    vim.notify('md-render: ' .. message, vim.log.levels.ERROR)
+  end
+end
+
+--- Bumped per preview request, so an answer to a superseded one is dropped.
+local preview_generation = 0
+
+--- Hand the preview key back to Vim.
+---
+--- The `'n'` flag is load-bearing here in a way it is not in `enter_insert`: the
+--- preview mapping is buffer-local to R, so a fed key that was subject to
+--- remapping would re-enter this same mapping and loop. Unremapped, it performs
+--- its ordinary editor action — which for the default `<CR>` is the move to the
+--- first non-blank of the next line.
+local function fall_through()
+  local key = config.options.keymaps.preview
+  if not key or key == '' or key == false then
+    return
+  end
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(key, true, false, true), 'n', false)
+end
+
+--- Ask the engine for a document, and show it if R is still what we want.
+---
+--- A cache hit short-circuits the process entirely; that is what makes toggling
+--- back and forth free. Otherwise the request is stamped with a generation, and
+--- a callback from an older generation is dropped rather than applied.
+local function request(st, opts)
+  opts = opts or {}
+  local win = st.win
+  local source = st.source
+  if not vim.api.nvim_win_is_valid(win) or not source or not vim.api.nvim_buf_is_valid(source) then
+    return
+  end
+
+  local width = text_width(win)
+  local tick = vim.api.nvim_buf_get_changedtick(source)
+  local theme = config.options.theme
+
+  local cached = state.cached(source, tick, width, theme)
+  if cached then
+    st.reported = nil
+    if st.want == 'R' then
+      show_rendered(st, cached)
+    end
+    return
+  end
+
+  local generation = st.generation + 1
+  st.generation = generation
+
+  local content = table.concat(vim.api.nvim_buf_get_lines(source, 0, -1, false), '\n')
+
+  engine.render(config.options, content, width, function(err, doc)
+    if st.generation ~= generation or not vim.api.nvim_win_is_valid(st.win) then
+      return
+    end
+
+    if err then
+      -- The spec is explicit that a failure leaves the editor in S rather than
+      -- showing a partial view, so this swaps back if R had already been shown.
+      report(st, err)
+      if st.mode == 'R' then
+        show_source(st)
+      end
+      return
+    end
+
+    st.reported = nil
+    state.store(source, tick, width, theme, doc)
+    if st.want == 'R' then
+      show_rendered(st, doc)
+    end
+  end)
+end
+
+--- Bring `st`'s window in line with `st.want`.
+local function sync(st)
+  if st.want == 'R' then
+    request(st)
+  else
+    show_source(st)
+  end
+end
+
+--- Render again in every window that is showing R.
+---
+--- Called only from the debounce below. It is safe to call when nothing has
+--- changed: `request` looks the document up by (buffer, width, theme,
+--- changedtick) first and returns on a hit, so the only windows that reach the
+--- engine are the ones whose width or contents actually moved.
+local function refresh()
+  for _, st in pairs(state.windows) do
+    if st.want == 'R' then
+      request(st)
+    end
+  end
+end
+
+--- The coalescing timer for `refresh`.
+local refresh_timer = vim.uv.new_timer()
+
+--- Ask for a refresh, coalescing bursts into one render.
+---
+--- Two things make R stale, and both arrive in bursts: a drag-resize fires
+--- `WinResized` once per column, and typing fires `TextChanged` once per
+--- keystroke. Neither burst is worth one engine process per event — the render
+--- that answers the last event answers all of them — so the timer collapses the
+--- burst and the work happens once.
+---
+--- A toggle is deliberately *not* routed through here: it calls `sync` directly.
+--- That is the difference between this and the measured precedent in
+--- `render-markdown.nvim`, whose 100 ms gate drops a toggle issued immediately
+--- after a render. Here the debounce only ever coalesces refreshes, so it has no
+--- user action to swallow.
+local function schedule_refresh()
+  local wanted = false
+  for _, st in pairs(state.windows) do
+    if st.want == 'R' then
+      wanted = true
+      break
+    end
+  end
+  if not wanted then
+    -- Nothing on screen is showing R, so there is nothing to refresh and no
+    -- reason to wake the loop for it. The buffer's changedtick has moved, and
+    -- the cache is keyed on it, so the render that does happen will be a fresh
+    -- one anyway.
+    return
+  end
+  refresh_timer:stop()
+  refresh_timer:start(config.options.resize_debounce, 0, vim.schedule_wrap(refresh))
+end
+
+--- Attach to `buf` in `win`: remember it and ask for R.
+---
+--- Called for every window a managed buffer is shown in, so each window gets
+--- its own state and its own rendered buffer.
+function M.attach(buf, win)
+  win = win or vim.api.nvim_get_current_win()
+  if not buf or not vim.api.nvim_buf_is_valid(buf) or not vim.api.nvim_win_is_valid(win) then
+    return
+  end
+  if not config.manages(vim.bo[buf].filetype) then
+    return
+  end
+  local st = state.get(win)
+  if st.source and st.source ~= buf then
+    -- The window has moved to a different document; the old state is not
+    -- reachable from here any more.
+    state.forget(win)
+    st = state.get(win)
+  end
+  st.source = buf
+  st.want = 'R'
+  st.reported = nil
+  M.set_keymaps(buf, false)
+  sync(st)
+end
+
+--- Forget everything about `win`.
+function M.detach(win)
+  state.forget(win)
+end
+
+--- Swap between R and S in `win`.
+function M.toggle(win)
+  win = win or vim.api.nvim_get_current_win()
+  local st = state.get(win)
+  if not st.source then
+    return
+  end
+  st.want = st.want == 'R' and 'S' or 'R'
+  sync(st)
+end
+
+--- Ask for R in `win`, whether or not it is already there.
+function M.show_rendered(win)
+  win = win or vim.api.nvim_get_current_win()
+  local st = state.get(win)
+  if not st.source then
+    return
+  end
+  st.want = 'R'
+  sync(st)
+end
+
+--- Ask for S in `win`, whether or not it is already there.
+function M.show_source(win)
+  win = win or vim.api.nvim_get_current_win()
+  local st = state.get(win)
+  if not st.source then
+    return
+  end
+  show_source(st)
+end
+
+--- Preview the block under the cursor in `win`, or close an open preview.
+---
+--- Where there is no previewable block the key is handed back to Vim rather than
+--- swallowed, so it keeps whatever motion it has everywhere else.
+function M.preview(win)
+  win = win or vim.api.nvim_get_current_win()
+
+  -- The popup has focus while it is open, so a second press is a close.
+  if preview.is_open() then
+    preview.close()
+    return
+  end
+
+  local st = state.get(win)
+  local source = st.source
+  local lines = source and vim.api.nvim_buf_is_valid(source)
+    and vim.api.nvim_buf_get_lines(source, 0, -1, false)
+  local row = vim.api.nvim_win_get_cursor(win)[1] - 1
+  local block = (st.doc and lines) and preview.locate(st.doc, row, lines) or nil
+
+  if not block then
+    fall_through()
+    return
+  end
+
+  -- A preview is a second render of a block, and two can be in flight if the
+  -- key is pressed twice before the first engine answers. The older answer is
+  -- dropped rather than opened over the newer one.
+  preview_generation = preview_generation + 1
+  local generation = preview_generation
+
+  local geometry = preview.geometry(block.kind, text_width(win))
+  preview.render_block(config.options, block, geometry.budget, function(err, doc)
+    if generation ~= preview_generation then
+      return
+    end
+    if err then
+      -- The spec asks for no popup at all rather than an empty one: the popup's
+      -- job is to show the block, and there is no block to show.
+      report(st, err)
+      return
+    end
+    preview.open(doc, geometry)
+  end)
+end
+
+--- Cross from R into S at the source line under the cursor, then feed `key`.
+---
+--- The cursor is placed before the key is fed, so that Vim's own `i`, `o` and
+--- friends act on the source line the display line came from rather than on
+--- whatever line the source buffer happened to be left at.
+function M.enter_insert(win, key)
+  win = win or vim.api.nvim_get_current_win()
+  local st = state.get(win)
+  if not st.source or not st.doc then
+    return
+  end
+
+  show_source(st)
+
+  -- Fed rather than executed: `i` and `A` are not commands, and letting Vim
+  -- interpret the key is what makes each of the six behave exactly as it does
+  -- in any other buffer. `n` keeps it unremapped — the source buffer has no
+  -- such mapping, so there is nothing to recurse into — and leaves the key in
+  -- the typeahead, which Vim reads as soon as this mapping returns.
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(key, true, false, true), 'n', false)
+end
+
+--- Write the source buffer, from wherever the write was issued.
+function M.write_source(st)
+  local source = st.source
+  if not source or not vim.api.nvim_buf_is_valid(source) then
+    vim.notify('md-render: nothing to write', vim.log.levels.WARN)
+    return
+  end
+  if vim.api.nvim_buf_get_name(source) == '' then
+    vim.notify('md-render: the source buffer has no file name', vim.log.levels.WARN)
+    return
+  end
+  vim.api.nvim_buf_call(source, function()
+    vim.cmd('silent write')
+  end)
+end
+
+--- Set up the config and the autocmds. Returns the resolved options.
+function M.setup(opts)
+  local options = config.setup(opts)
+  M.setup_autocmds()
+  return options
+end
+
+--- Install the maps a managed buffer needs, in `buf`.
+---
+--- `insert_entry` is what separates the two states. The toggle and the write
+--- key belong to both, because they are how you leave either one. The six
+--- insert-entry keys belong only to R: mapping them in S would shadow Vim's own
+--- `i`, `a` and the rest, which in the source buffer mean exactly what they
+--- always mean.
+function M.set_keymaps(buf, insert_entry)
+  local options = config.options
+  local function map(lhs, rhs, desc)
+    if lhs and lhs ~= '' and lhs ~= false then
+      vim.keymap.set('n', lhs, rhs, { buffer = buf, desc = desc, nowait = true })
+    end
+  end
+
+  map(options.keymaps.toggle, function()
+    M.toggle()
+  end, 'md-render: toggle rendered view')
+
+  map(options.keymaps.write, function()
+    -- Through `:write` rather than `M.write_source` directly, so that the key
+    -- and `:w` are one route rather than two: in R the buffer in the window is
+    -- the rendered one, and its `BufWriteCmd` is what reaches the source.
+    vim.cmd('silent write')
+  end, 'md-render: write')
+
+  if not insert_entry then
+    return
+  end
+
+  -- The preview belongs to R only. In S the cursor is already on the block's
+  -- source, which is what the preview would be showing, so a second way to look
+  -- at it earns nothing.
+  map(options.keymaps.preview, function()
+    M.preview()
+  end, 'md-render: preview this block')
+
+  for _, key in ipairs(INSERT_ENTRY) do
+    map(key, function()
+      M.enter_insert(nil, key)
+    end, 'md-render: edit at this line')
+  end
+end
+
+--- The autocmds the plugin needs. Called from `plugin/md-render.lua` so that a
+--- user who only wants the Lua API can skip them.
+function M.setup_autocmds()
+  if M.autocmds_ready then
+    return
+  end
+  M.autocmds_ready = true
+  local group = M.augroup
+
+  vim.api.nvim_create_autocmd('FileType', {
+    group = group,
+    callback = function(args)
+      if config.manages(vim.bo[args.buf].filetype) then
+        vim.schedule(function()
+          if vim.api.nvim_buf_is_valid(args.buf) then
+            M.attach(args.buf, vim.api.nvim_get_current_win())
+          end
+        end)
+      end
+    end,
+  })
+
+  vim.api.nvim_create_autocmd({ 'BufWipeout', 'BufDelete' }, {
+    group = group,
+    callback = function(args)
+      state.forget_cache(args.buf)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd('WinClosed', {
+    group = group,
+    callback = function(args)
+      M.detach(tonumber(args.match))
+    end,
+  })
+
+  -- A split of a window showing R puts the same rendered buffer in the new
+  -- window, and that window needs its own state: without one its toggle would do
+  -- nothing, and it would go on showing the other window's rendered buffer,
+  -- which that window's return to S would then have to keep alive.
+  --
+  -- `WinEnter`, not `BufWinEnter`: measured, `:split` fires `WinNew` and
+  -- `WinEnter` and *no* `BufWinEnter` at all, because the buffer was already on
+  -- screen and Vim does not consider it newly shown. At `WinEnter` the new
+  -- window already has the buffer, which is what makes this a lookup rather
+  -- than a guess.
+  vim.api.nvim_create_autocmd('WinEnter', {
+    group = group,
+    callback = function()
+      local win = vim.api.nvim_get_current_win()
+      -- A floating window inherits the buffer of whatever it was opened over,
+      -- and `nvim_open_win` fires `WinEnter` for it *before* swapping its own
+      -- buffer in. Matching here would therefore attach the float as if it were
+      -- a split of R: it would be given a rendered buffer of its own and would
+      -- stop showing what it was opened to show. Floats are never splits of R,
+      -- so they are excluded before the buffer is looked at.
+      local cfg = vim.api.nvim_win_get_config(win)
+      if cfg.relative ~= '' or cfg.external then
+        return
+      end
+      local owner = state.by_rendered[vim.api.nvim_win_get_buf(win)]
+      if not owner then
+        return
+      end
+      local st = state.windows[owner]
+      -- The second condition is what stops this from re-entering itself:
+      -- attaching swaps a rendered buffer into a window, and by the time that
+      -- is done the window has state of its own.
+      if st and st.source and state.windows[win] == nil then
+        M.attach(st.source, win)
+      end
+    end,
+  })
+
+  -- The width changed: R is laid out for a width the window no longer has.
+  -- `VimResized` is here as well as `WinResized` because a terminal resize
+  -- resizes the windows too, and coalescing makes a doubled event free.
+  vim.api.nvim_create_autocmd({ 'WinResized', 'VimResized' }, {
+    group = group,
+    callback = schedule_refresh,
+  })
+
+  -- The source changed: R is stale until it is rendered again, but only where R
+  -- is actually on screen — a re-render for a window showing S would be a
+  -- process spawned for nobody to look at. The render is also deferred to the
+  -- end of the burst rather than run per keystroke.
+  vim.api.nvim_create_autocmd({ 'TextChanged', 'TextChangedI' }, {
+    group = group,
+    callback = function(args)
+      -- Matched against a window showing R rather than merely against a managed
+      -- filetype: `render.apply` sets lines in the rendered buffers, which fires
+      -- this event too, and only the source is worth re-rendering.
+      for _, st in pairs(state.windows) do
+        if st.want == 'R' and st.source == args.buf then
+          schedule_refresh()
+          return
+        end
+      end
+    end,
+  })
+end
+
+return M
