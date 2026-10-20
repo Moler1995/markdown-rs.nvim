@@ -12,6 +12,7 @@ D:\projects\rust\markdown-rs.nvim\
   Cargo.toml           workspace
   engine/              the md-render crate
   crates/mermaid-text/ vendored diagram renderer
+  crates/ascii-dag/    vendored layout engine, one fix backported
   lua/md-render/       the plugin
   plugin/md-render.lua entry point
   bin/md-render.exe    cross-compiled artifact, committed
@@ -42,7 +43,156 @@ plugin a consumer rather than a component.
 
 `lua/md-render/` is a Neovim plugin. It renders through the engine binary,
 shows the result in a read-only buffer in the same window, and toggles back to
-the source on request.
+the source on request. Put the repository on `runtimepath` and markdown files
+open rendered.
+
+### The two states
+
+A managed window is always in one of two states, and each state is a buffer:
+
+```text
+   R - rendered                          S - source
+   +-----------------------------+       +-----------------------------+
+   |  # Heading                  |       |  # Heading                  |
+   |  ----------                 |       |                             |
+   |  prose, laid out to the     |       |  prose, as it is written    |
+   |  window's width             |       |                             |
+   +-----------------------------+       +-----------------------------+
+   | a scratch buffer holding    |       | the file's own buffer       |
+   | what the engine produced    |       |                             |
+   | buftype=acwrite             |       | editable, as usual          |
+   | bufhidden=wipe              |       |                             |
+   | modifiable=false            |       |                             |
+   | buflisted=false             |       |                             |
+   +-----------------------------+       +-----------------------------+
+```
+
+R is a view, not a second document. Its buffer is named after the source so that
+a write can be routed back, unlisted so it stays out of `:ls` and `:bnext`,
+unmodifiable so that an edit command cannot corrupt what is on screen, and wiped
+when hidden so that returning to S leaves nothing behind. The source buffer is
+untouched throughout — it is simply not the buffer in the window.
+
+The state is per window, not per buffer. Two windows on one file each get their
+own rendered buffer, so one window returning to S cannot disturb the other.
+
+### Staying in step
+
+R is remade when the window's width changes and when the source buffer changes,
+and it is remade from the buffer rather than from the file — so an edit made in S
+and not yet written is what the next render shows. Nothing is remade while R is
+off screen, and a render of a document that has not moved is answered from a
+cache keyed on the buffer, its `changedtick`, the width and the theme, which is
+what makes toggling back and forth free.
+
+Both kinds of change arrive in bursts — a drag-resize is one event per column,
+typing is one per keystroke — so the render is deferred by `resize_debounce`
+milliseconds and a burst costs one render. The deferral covers refreshes only: a
+toggle is applied at once, so a resize cannot swallow the key that follows it.
+
+### Keymaps
+
+<!-- keymaps -->
+
+| Key | Where | Does |
+| --- | --- | --- |
+| `<leader>mr` | R and S | swap between the rendered view and the source |
+| `<C-s>` | R and S | write the source buffer |
+| `<CR>` | R only | preview the block under the cursor, or close the preview |
+| `i` | R only | cross to S and insert before the cursor |
+| `a` | R only | cross to S and insert after the cursor |
+| `I` | R only | cross to S and insert at the first non-blank |
+| `A` | R only | cross to S and insert at the end of the line |
+| `o` | R only | cross to S and open a line below |
+| `O` | R only | cross to S and open a line above |
+
+The six insert-entry keys are how R gets out of the way. Each puts the source
+back in the window with the cursor on the source line the display line came
+from, and then hands the key to Vim, so that `A` in R inserts at the end of that
+source line exactly as `A` does in any other buffer. They are not configurable:
+they are the mode's way out, not a convenience.
+
+`Esc` is deliberately not one of them. Leaving insert mode is Vim's business,
+and a view that came back on `Esc` would be a view you could not edit in.
+
+The toggle crosses in normal mode, on the source line the display line came
+from, so the two states read as one document rather than two.
+
+### Commands
+
+| Command | Does |
+| --- | --- |
+| `:MdRenderToggle` | what the toggle mapping does, for when there is no key to press |
+| `:MdRenderShow` | show R |
+| `:MdRenderSource` | show S |
+| `:MdRenderReset` | forget every cached render and highlight group |
+
+### Config
+
+```lua
+require('md-render').setup({
+  engine = nil,                 -- nil resolves to `md-render` on PATH, then
+                                -- <repo>/bin/md-render.exe
+  theme = 'catppuccin_mocha',   -- passed to the engine as --theme
+  filetypes = { 'markdown' },   -- the filetypes that open in R
+  keymaps = {
+    toggle = '<leader>mr',
+    write = '<C-s>',
+    preview = '<CR>',
+  },
+  preview = {                   -- the popup's caps, as fractions of the editor
+    max_width_pct = 0.9,
+    max_height_pct = 0.9,
+  },
+  resize_debounce = 100,        -- milliseconds to coalesce stale-R events:
+                                -- resizes and edits. Toggles are not delayed.
+})
+```
+
+Every field is optional and the merge is deep, so `setup{ keymaps = { toggle =
+'gm' } }` keeps the write key. A filetype that is not listed is left alone
+entirely: no state, no autocmds, no keymaps. Setting `keymaps.toggle`,
+`keymaps.write` or `keymaps.preview` to `false` leaves that key alone.
+
+### The block preview
+
+The engine lays a diagram or a table out against the window's column budget and
+**clips what does not fit**. The characters that clip drops are not in the
+rendered buffer at all, so scrolling sideways cannot recover them: in a narrow
+window the right-hand side of a wide diagram does not exist.
+
+`<CR>` on a ` ```mermaid ` fence or a table opens a centred popup showing that
+block **re-rendered against the popup's own width**, which is what brings the
+clipped columns back. The popup is sized to fit the block and capped at
+`preview.max_width_pct` and `preview.max_height_pct` of the editor. It is an
+ordinary buffer — scroll it, search it, yank from it — but not a modifiable one,
+and it is not listed.
+
+`<CR>`, `q` and `Esc` close it, and the window underneath is left exactly as it
+was. On anything else — prose, a non-diagram fence, a list — `<CR>` does its
+ordinary job, so the key is safe to press anywhere.
+
+The popup is a second reading of the block, not a zoom of the first: because the
+layout follows the budget, it can be *arranged* differently from the window's
+copy. What it guarantees is that the whole block is there.
+
+### Tests
+
+```bash
+MDRN_REPO=$PWD nvim --headless -l tests/headless/run.lua
+nvim -l tests/interactive/run.lua
+```
+
+The headless runner drives the plugin directly, and is where most of it is
+checked. The interactive runner starts a real Neovim, sends keys with
+`--remote-send`, and reads back what that server observed.
+
+Two things can only be checked there, both for the same reason: `nvim -l` never
+runs the main input loop. The six insert-entry keys hand the key back to Vim
+through `nvim_feedkeys`, and only that loop reads a key queued that way. And
+`TextChanged` — the event the plugin re-renders on — is raised from that loop's
+own change handling, so under `nvim -l` no edit route raises it at all, not
+`nvim_buf_set_lines`, not `:normal!`, not `nvim_input`.
 
 ## Building
 
@@ -89,6 +239,27 @@ text and leaves the application behind.
 
 The two copies are not kept in step. The port is a one-time lift; there is no
 upstream tracking.
+
+### The vendored crates
+
+`crates/mermaid-text/` is the published `mermaid-text` 0.57.4, and
+`crates/ascii-dag/` is the published `ascii-dag` 0.9.1 — the layout engine
+`mermaid-text`'s Sugiyama backend is built on. Both are vendored to be
+patchable, and both carry a fix that could not be taken from a release:
+
+- **`mermaid-text`** — a `direction TB` subgraph inside an `LR` graph had its
+  band ordered by `HashMap` iteration, so the same diagram laid out
+  differently from one process to the next.
+- **`ascii-dag`** — a level's subgraph blocks were ordered the same way, with
+  the same result. Upstream fixed it in 0.10.1, but that release also rewrites
+  the renderer and the layout API; the one function's fix is backported
+  instead, with upstream's regression test. See
+  [`crates/ascii-dag/VENDORED.md`](crates/ascii-dag/VENDORED.md).
+
+The engine's spec calls for byte-identical output for identical input, and a
+per-process hash seed defeats a same-process determinism test: two renders
+inside one test binary share a seed and agree. Both defects were found by
+hashing separate runs of the same file.
 
 ### The port-header convention
 
