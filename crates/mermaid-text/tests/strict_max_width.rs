@@ -24,9 +24,16 @@ fn opts(max_width: Option<usize>, strict: bool) -> RenderOptions {
     }
 }
 
-// A sequence diagram: its layout ignores `max_width` entirely, so its natural
-// width is a stable, comfortably-wide value to test the budget against.
-const SEQ: &str = "sequenceDiagram\n    participant Alice\n    participant Bob\n    Alice->>Bob: hello there\n    Bob-->>Alice: hi back\n";
+// A sequence diagram whose every label is a single unbreakable word. Wrapping
+// cannot make one of them narrower — a word wider than the wrap target is left
+// on its own line rather than split — so its natural layout is also its
+// narrowest, and its width is a stable value to test the budget against.
+//
+// This matters for the tests below, which need an over-tight budget to leave
+// the render over-wide. A fixture with breakable labels would instead be
+// compacted to meet the budget, which is a different behaviour and is covered
+// by `strict_flowchart_too_narrow_for_min_layout_returns_too_wide`.
+const SEQ: &str = "sequenceDiagram\n    participant Client\n    participant Server\n    Client->>Server: request\n    Server-->>Client: response\n";
 
 #[test]
 fn strict_over_budget_returns_too_wide_with_exact_values() {
@@ -51,7 +58,7 @@ fn strict_within_budget_returns_ok() {
     // A budget the render already fits within must pass strict mode untouched.
     let out = render_with_options(SEQ, &opts(Some(natural + 20), true)).unwrap();
     assert!(widest(&out) <= natural + 20);
-    assert!(out.contains("Alice") && out.contains("Bob"));
+    assert!(out.contains("Client") && out.contains("Server"));
 }
 
 #[test]
@@ -80,7 +87,7 @@ fn non_strict_over_budget_still_returns_the_wide_string() {
 fn strict_with_no_budget_is_a_noop() {
     // strict = true but max_width = None: nothing to enforce, must be Ok.
     let out = render_with_options(SEQ, &opts(None, true)).expect("no budget → no enforcement");
-    assert!(out.contains("Alice"));
+    assert!(out.contains("Client"));
 }
 
 #[test]

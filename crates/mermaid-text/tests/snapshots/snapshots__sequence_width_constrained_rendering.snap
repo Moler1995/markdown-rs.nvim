@@ -1,0 +1,33 @@
+---
+source: crates/mermaid-text/tests/snapshots.rs
+expression: out
+---
+ ┌───────────────┐              ┌──────────────────┐             ┌─────────────┐
+ │    Client     │              │  Gateway Router  │             │  Response   │
+ │  Application  │              │     Service      │             │  Assembler  │
+ └───────────────┘              └──────────────────┘             └─────────────┘
+         ┆ a long enough                  ┆                             ┆
+         ┆ request label                  ┆                             ┆
+         ┆ to need                        ┆                             ┆
+         ┆ wrapping                       ┆                             ┆
+         ─────────────────────────────────▸                             ┆
+         ┆                                ┆                             ┆
+         ┆                                ┆                             ┆
+         ┆                                ┆                             ┆
+         ┆                                ┆ and a long                  ┆
+         ┆                                ┆ enough                      ┆
+         ┆                                ┆ response to                 ┆
+         ┆                                ┆ need it too                 ┆
+         ┆                                ──────────────────────────────▸
+         ┆                                ┆                             ┆
+         ┆                                ┆                             ┆
+         ┆                                ┆                             ┆
+         ┆                                ┆ rows                        ┆
+         ┆                                ◂┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+         ┆ 200 OK                         ┆                             ┆
+         ◂┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄                             ┆
+         ┆                                ┆                             ┆
+ ┌───────────────┐              ┌──────────────────┐             ┌─────────────┐
+ │    Client     │              │  Gateway Router  │             │  Response   │
+ │  Application  │              │     Service      │             │  Assembler  │
+ └───────────────┘              └──────────────────┘             └─────────────┘

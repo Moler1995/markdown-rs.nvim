@@ -1650,6 +1650,58 @@ end";
 }
 
 // ---------------------------------------------------------------------------
+// Sequence compaction — a sequence diagram laid out at a budget below its
+// natural width. Unlike the flowcharts above, a sequence diagram has no
+// Sugiyama layout to re-tune; its width is nothing but its labels, so the
+// renderer compacts it by wrapping those and stepping the wrap target down
+// until the layout fits. This snapshot pins where the wraps land, how tall
+// the participant boxes grow to hold them, and that the row cursor keeps each
+// message label clear of the arrow above it.
+// ---------------------------------------------------------------------------
+#[test]
+fn sequence_width_constrained_rendering() {
+    let src = "sequenceDiagram
+participant U as Client Application
+participant API as Gateway Router Service
+participant DB as Response Assembler
+U->>API: a long enough request label to need wrapping
+API->>DB: and a long enough response to need it too
+DB-->>API: rows
+API-->>U: 200 OK";
+    let natural = mermaid_text::render(src).unwrap();
+    // 80 columns is well below the natural layout and well above the floor the
+    // boxes themselves impose, so the ladder has somewhere to land.
+    let budget = 80;
+    assert!(
+        natural.lines().map(|l| l.chars().count()).max().unwrap_or(0) > budget,
+        "the fixture must start out wider than {budget}"
+    );
+
+    let out = mermaid_text::render_with_width(src, Some(budget)).unwrap();
+
+    assert!(
+        out.lines().map(|l| l.chars().count()).max().unwrap_or(0) <= budget,
+        "the compacted layout must fit {budget} columns:\n{out}"
+    );
+    // Compacting must wrap, not drop: every word of every label survives.
+    for word in [
+        "Client",
+        "Application",
+        "Gateway",
+        "Router",
+        "Service",
+        "Response",
+        "Assembler",
+    ] {
+        assert!(
+            out.contains(word),
+            "participant word {word} went missing while compacting:\n{out}"
+        );
+    }
+    assert_snapshot!("sequence_width_constrained_rendering", out);
+}
+
+// ---------------------------------------------------------------------------
 // 0.54.0 — block-frame interior fill with `░` (U+2591 LIGHT SHADE),
 // retired: the fill is gone and the frame interior is left blank
 // ---------------------------------------------------------------------------

@@ -340,7 +340,7 @@ fn unknown_public_messages_do_not_shift_valid_activation_indices_or_drop_notes()
         activation.start_message += 1;
         activation.end_message += 1;
     }
-    let out = mermaid_text::render::sequence::render(&diagram);
+    let out = mermaid_text::render::sequence::render(&diagram, None);
     let b = center(&out, "B");
     assert_lanes(&out, '█', &[(b, 3, 6)]);
     diagram.notes.push(mermaid_text::sequence::NoteEvent {
@@ -348,7 +348,7 @@ fn unknown_public_messages_do_not_shift_valid_activation_indices_or_drop_notes()
         text: "boundary note".into(),
         after_message: 1,
     });
-    let out = mermaid_text::render::sequence::render(&diagram);
+    let out = mermaid_text::render::sequence::render(&diagram, None);
     exact_note(&out, false, 4, 0, 17, "boundary note");
 }
 

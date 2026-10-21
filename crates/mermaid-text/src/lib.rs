@@ -254,10 +254,11 @@ pub fn render(input: &str) -> Result<String, Error> {
 /// optionally compacting the output to fit within a column budget.
 ///
 /// When `max_width` is `Some(n)`, the renderer tries progressively smaller
-/// gap configurations — from the default down to the minimum — and returns
-/// the first result whose longest line is ≤ `n` columns. If no configuration
-/// fits, the most compact result is returned anyway (the caller can truncate
-/// or scroll as they see fit).
+/// gap configurations — from the default down to the minimum — and returns a
+/// result whose longest line is ≤ `n` columns (sequence diagrams scan the wrap
+/// targets and take the shortest such result). If no configuration fits, the
+/// most compact result is returned anyway (the caller can truncate or scroll as
+/// they see fit).
 ///
 /// When `max_width` is `None` the default gap configuration is used and no
 /// compaction is attempted.
@@ -286,9 +287,11 @@ pub fn render_with_width(input: &str, max_width: Option<usize>) -> Result<String
 
     let graph = match kind {
         DiagramKind::Sequence => {
-            // Sequence diagrams have a fixed layout; no compaction pass.
+            // Sequence diagrams have no Sugiyama layout to re-tune, so they
+            // skip the gap configs below. Their width is nothing but their
+            // labels, so `render` compacts them by wrapping those instead.
             let diag = parser::sequence::parse(input)?;
-            return Ok(render::sequence::render(&diag));
+            return Ok(render::sequence::render(&diag, max_width));
         }
         DiagramKind::Pie => {
             // Pie charts render as a horizontal bar chart — fixed layout,
@@ -618,10 +621,10 @@ pub fn render_with_options(input: &str, opts: &RenderOptions) -> Result<String, 
 
     let unicode = match kind {
         DiagramKind::Sequence => {
-            // Sequence diagrams ignore color and width opts (no compaction
-            // pipeline, no style directives wired up yet).
+            // Sequence diagrams ignore the color opt (no style directives
+            // wired up yet) but honour `max_width` by wrapping labels.
             let diag = parser::sequence::parse(input)?;
-            render::sequence::render(&diag)
+            render::sequence::render(&diag, opts.max_width)
         }
         DiagramKind::Pie => {
             // Pie charts honour both `max_width` (bar columns scale to fit)

@@ -5,9 +5,16 @@
 //!
 //! - Participant boxes are drawn across the top in declaration order.
 //! - A vertical dashed lifeline `┆` runs below each box.
-//! - Each message occupies one body row; its label appears on the row above.
-//! - Rows are spaced 2 apart (message row + one blank) for readability.
+//! - Each message occupies an arrow row; its label appears on the rows above.
+//! - Labels that are too wide for the budget wrap rather than being clipped, so
+//!   a label can be several rows tall and the layout grows to hold it.
 //! - Solid arrows use `─` and `▸`/`◂`; dashed arrows use `┄` and `▸`/`◂`.
+//!
+//! `render` takes an optional column budget. Given one, it wraps participant
+//! and message labels until the layout fits, stepping the wrap target down a
+//! bounded number of times; if nothing fits it returns the narrowest layout it
+//! reached rather than clipping anything. Given `None` it lays the diagram out
+//! at its natural width.
 //!
 //! # Examples
 //!
@@ -16,7 +23,7 @@
 //! use mermaid_text::render::sequence::render;
 //!
 //! let diag = parse("sequenceDiagram\nA->>B: hello").unwrap();
-//! let out = render(&diag);
+//! let out = render(&diag, None);
 //! assert!(out.contains('A'));
 //! assert!(out.contains('B'));
 //! assert!(out.contains('┆'));
@@ -39,8 +46,16 @@ use crate::types::Rgb;
 /// Horizontal padding cells added inside each participant box on each side.
 const BOX_PAD: usize = 2;
 
-/// Height of the participant box in rows (top border + label + bottom border).
-const BOX_HEIGHT: usize = 3;
+/// Height of a participant box in rows: top border, the label's rows, bottom
+/// border. Three rows for a one-line label, which is the unwrapped case.
+///
+/// The height is a function rather than a constant because a label too wide for
+/// the budget is wrapped rather than clipped, and a wrapped label needs rows to
+/// live in. Every box on a diagram shares one height — see `box_h` in `render`
+/// — so the header and footer still read as a bracket.
+fn box_height(label_lines: usize) -> usize {
+    label_lines.max(1) + 2
+}
 
 /// Minimum gap between two adjacent participant *centre* columns.
 /// Minimum clearance (in cells) between the inner edges of two adjacent
@@ -53,14 +68,18 @@ const MIN_GAP: usize = 2;
 /// of the label and one at the right of the arrow tip.
 const LABEL_PADDING: usize = 2;
 
-/// Rows consumed per regular (non-self) message event (label row + arrow row).
-const EVENT_ROW_H: usize = 2;
+/// Rows a regular (non-self) message event consumes: its label's rows, then the
+/// arrow row. Two rows for a one-line label.
+fn message_height(label_lines: usize) -> usize {
+    label_lines.max(1) + 1
+}
 
-/// Rows consumed per self-message event. Self-messages render as a three-row
-/// U-shape (top leg / label+right-wall / bottom-leg-with-arrowhead). Advancing
-/// by 4 leaves one blank row below the bottom leg before the next message's
-/// label row, matching the spacing used for regular two-row messages.
-const SELF_MSG_ROW_H: usize = 4;
+/// Rows a self-message event consumes: its top leg, the label's rows, its
+/// bottom leg, then one blank row — matching the spacing a regular message
+/// leaves before the next label. Four rows for a one-line label.
+fn self_message_height(label_lines: usize) -> usize {
+    label_lines.max(1) + 3
+}
 
 /// Right-pointing solid arrowhead.
 const ARROW_RIGHT: char = '▸';
@@ -265,6 +284,7 @@ struct ParticipantLayout {
 fn compute_layout(
     diag: &SequenceDiagram,
     lane_widths: &[usize],
+    participant_labels: &[Cow<'_, str>],
     labels: &[Cow<'_, str>],
 ) -> Vec<ParticipantLayout> {
     let n = diag.participants.len();
@@ -272,12 +292,14 @@ fn compute_layout(
         return Vec::new();
     }
 
-    // Minimum box width = label display width + 2 * BOX_PAD + 2 (borders).
-    let box_widths: Vec<usize> = diag
-        .participants
+    // Minimum box width = widest line of the label + 2 * BOX_PAD + 2 (borders).
+    // A wrapped label is measured by its widest line, not its whole text: the
+    // box is as wide as it needs to be and no wider, which is what lets a
+    // wrapped diagram actually come out narrower.
+    let box_widths: Vec<usize> = participant_labels
         .iter()
-        .map(|p| {
-            let label_w = p.label.width();
+        .map(|label| {
+            let label_w = max_line_width(label);
             // Ensure the box is at least wide enough for its label.
             (label_w + 2 * BOX_PAD + 2).max(8)
         })
@@ -301,8 +323,10 @@ fn compute_layout(
         let hi = si.max(ti);
         let spans = hi - lo;
         // Label needs `label_width + LABEL_PADDING` cells of clearance along
-        // its arrow; divide across the spans the arrow crosses.
-        let label_need = label.width() + LABEL_PADDING;
+        // its arrow; divide across the spans the arrow crosses. A wrapped
+        // label needs only its widest line's worth of clearance, because the
+        // rest of it sits on the rows above.
+        let label_need = max_line_width(label) + LABEL_PADDING;
         // With active lanes, keep a label in the first gap so an intervening
         // participant's continuous bar cannot overwrite it.
         let per_gap = if diag.activations.is_empty() {
@@ -346,24 +370,110 @@ fn compute_layout(
     layouts
 }
 
+/// Re-wrap each message label to the room it has in `layouts`.
+///
+/// The first pass wraps every label to one diagram-wide target, which is what
+/// sizes the gaps — but the gap a label ends up in is usually decided by some
+/// *other* label, or by the boxes either side of it. Wrapping to the target
+/// anyway crushes a label that has room for two rows into six, and the diagram
+/// gets taller for nothing. This pass gives each label back the room it
+/// actually has.
+///
+/// The room is read off the layout rather than recomputed from the target: the
+/// clearance between two adjacent participants is exactly what
+/// [`compute_layout`] allocated to the labels spanning it, and a label spanning
+/// several gaps is divided across all of them, so the narrowest gap it spans —
+/// times the number of gaps — is the bound the next layout has to reproduce.
+/// Wrapping to that means the widest line plus `LABEL_PADDING` is at most
+/// `narrowest * spans`, so `div_ceil(spans)` lands back inside every gap the
+/// label crosses and `gap_mins` comes out unchanged. Widening a label therefore
+/// cannot widen the diagram.
+///
+/// Self-message labels are left exactly as the first pass wrapped them. A
+/// self-message's loop is sized from its own label
+/// ([`draw_self_message`]'s `loop_w`), so it has no room to fill: wrapping it
+/// wider would widen the loop by the same amount.
+///
+/// `wrapped` is the first pass's output, used for every label this pass leaves
+/// alone. The labels it *does* fill are re-wrapped from the diagram's own text,
+/// not from `wrapped`: [`wrap_note_text`] keeps existing newlines, so feeding it
+/// an already-wrapped label would preserve the breaks this pass exists to undo.
+fn fill_message_labels<'a>(
+    diag: &'a SequenceDiagram,
+    wrapped: &[Cow<'a, str>],
+    layouts: &[ParticipantLayout],
+    lane_widths: &[usize],
+) -> Vec<Cow<'a, str>> {
+    // The clearance between participants i and i+1, read back out of the
+    // centres. `compute_layout` places a centre as
+    // `prev + bw[i]/2 + gap + bw[i+1]/2 + lane[i]`, so this inverts it exactly.
+    let clearances: Vec<usize> = (1..layouts.len())
+        .map(|i| {
+            layouts[i]
+                .center
+                .saturating_sub(layouts[i - 1].center)
+                .saturating_sub(layouts[i - 1].box_width / 2)
+                .saturating_sub(layouts[i].box_width / 2)
+                .saturating_sub(lane_widths[i - 1])
+        })
+        .collect();
+
+    message_labels(diag)
+        .into_iter()
+        .zip(diag.messages.iter())
+        .zip(wrapped)
+        .map(|((label, msg), wrapped_label)| {
+            let (Some(si), Some(ti)) = (
+                diag.participant_index(&msg.from),
+                diag.participant_index(&msg.to),
+            ) else {
+                return wrapped_label.clone();
+            };
+            if si == ti {
+                return wrapped_label.clone();
+            }
+            let (lo, hi) = (si.min(ti), si.max(ti));
+            let spans = hi - lo;
+            let room = if diag.activations.is_empty() {
+                // Divided across the gaps the arrow crosses, so the narrowest of
+                // them times `spans` is what every gap has to hold.
+                clearances[lo..hi].iter().copied().min().unwrap_or(0) * spans
+            } else {
+                // With active lanes the label is kept whole in the first gap.
+                clearances[lo]
+            };
+            match room.checked_sub(LABEL_PADDING) {
+                Some(width) if width > 0 => Cow::Owned(wrap_note_text(&label, width)),
+                _ => wrapped_label.clone(),
+            }
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Drawing helpers
 // ---------------------------------------------------------------------------
 
-/// Draw a single-line participant box centered on `cx`, with the top
-/// border on `top_row`. The box occupies three consecutive rows:
-/// `top_row` (top border), `top_row + 1` (label), `top_row + 2`
-/// (bottom border).
+/// Draw a participant box centered on `cx`, with the top border on `top_row`.
+/// The box occupies [`box_height`] rows: the top border, one row per line of
+/// `label`, then the bottom border.
 ///
 /// ```text
-/// ┌──────┐
-/// │ Alice│
-/// └──────┘
+/// ┌──────────┐
+/// │ Steering │
+/// │ Service  │
+/// └──────────┘
 /// ```
 ///
-/// Used twice per render: once at `top_row = 0` for the header and
-/// once at `top_row = canvas.height - BOX_HEIGHT` for the mirrored
-/// footer (matches Mermaid's convention of bracketing lifelines).
+/// Each label line is centred on its own row, so a wrapped label reads as a
+/// centred block rather than a ragged one. `label` must have no more lines than
+/// the caller sized the box for — `render` sizes every box from the widest
+/// wrapped label on the diagram, and the two must agree or the bottom border
+/// lands on a label row.
+///
+/// Used twice per render: once at `top_row = 0` for the header and once at
+/// `top_row = canvas.height - box_height` for the mirrored footer (matches
+/// Mermaid's convention of bracketing lifelines).
 fn draw_participant_box(
     canvas: &mut Canvas,
     cx: usize,
@@ -373,8 +483,9 @@ fn draw_participant_box(
 ) {
     let left = cx.saturating_sub(box_width / 2);
     let right = left + box_width - 1; // inclusive column of right border
-    let label_row = top_row + 1;
-    let bottom_row = top_row + 2;
+    let lines: Vec<&str> = label.lines().collect();
+    let lines = if lines.is_empty() { vec![""] } else { lines };
+    let bottom_row = top_row + box_height(lines.len()) - 1;
 
     // Top border
     canvas.put(top_row, left, '┌');
@@ -383,13 +494,15 @@ fn draw_participant_box(
     }
     canvas.put(top_row, right, '┐');
 
-    // Label row — center the label inside the box.
-    let label_w = label.width();
+    // Label rows — each line centred inside the box.
     let inner_w = box_width.saturating_sub(2); // space between borders
-    let label_start = left + 1 + (inner_w.saturating_sub(label_w)) / 2;
-    canvas.put(label_row, left, '│');
-    canvas.put_str(label_row, label_start, label);
-    canvas.put(label_row, right, '│');
+    for (i, line) in lines.iter().enumerate() {
+        let row = top_row + 1 + i;
+        let label_start = left + 1 + (inner_w.saturating_sub(line.width())) / 2;
+        canvas.put(row, left, '│');
+        canvas.put_str(row, label_start, line);
+        canvas.put(row, right, '│');
+    }
 
     // Bottom border
     canvas.put(bottom_row, left, '└');
@@ -648,17 +761,27 @@ fn draw_message(
     }
 
     // Label above the arrow (termaid convention).
+    //
+    // A wrapped label stacks upwards from the arrow: its last line sits
+    // directly on `row - 1` and earlier lines above that, so the label always
+    // ends next to the arrow it names. The caller advances `row` by
+    // [`message_height`] for this label's line count, which is what reserves
+    // the rows this draws into.
     if !text.is_empty() && row > 0 {
         // Place label starting 2 columns right of the leftmost column so it
         // sits clearly over the arrow shaft.
         let label_col = left + 2;
-        canvas.put_str(row - 1, label_col, text);
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let label_row = row - (lines.len() - i);
+            canvas.put_str(label_row, label_col, line);
+        }
     }
 }
 
 /// Draw a self-message U-shape loop to the right of the lifeline column.
 ///
-/// Three-row layout (occupies rows `row`, `row+1`, `row+2`):
+/// Layout for a one-line label, occupying rows `row`, `row+1`, `row+2`:
 ///
 /// ```text
 /// ├──────┐
@@ -666,15 +789,23 @@ fn draw_message(
 /// ├◂─────┘
 /// ```
 ///
+/// A wrapped label widens the U into as many rows as it has lines: the top leg
+/// stays at `row`, the label occupies `row+1` onwards, and the bottom leg sits
+/// on the last of them. The caller advances `row` by [`self_message_height`]
+/// for this label's line count.
+///
 /// The right vertical bar makes the label's left neighbour a `│`, satisfying
 /// the requirement that the label not float in blank space.
 fn draw_self_message(canvas: &mut Canvas, cx: usize, row: usize, text: &str, style: MessageStyle) {
     let h_char = if style.is_dashed() { H_DASH } else { H_SOLID };
-    // Width of the horizontal legs: wide enough to fit the label plus 2
-    // cells of padding (one between the lifeline junction and the label,
-    // one between the label and the right corner).
-    let loop_w = text.width().max(4) + 3;
+    let lines: Vec<&str> = text.lines().collect();
+    let lines = if lines.is_empty() { vec![""] } else { lines };
+    // Width of the horizontal legs: wide enough for the widest line of the
+    // label plus 2 cells of padding (one between the lifeline junction and the
+    // label, one between the label and the right corner).
+    let loop_w = max_line_width(text).max(4) + 3;
     let right = cx + loop_w;
+    let bottom_row = row + self_message_height(lines.len()) - 2;
 
     // Top leg: `├──────┐`.
     canvas.put(row, cx, '├');
@@ -683,24 +814,27 @@ fn draw_self_message(canvas: &mut Canvas, cx: usize, row: usize, text: &str, sty
     }
     canvas.put(row, right, '┐');
 
-    // Middle row: right wall with label inside the U.
-    // `│` at the right edge; label starts one cell after the lifeline junction.
-    canvas.put(row + 1, right, '│');
-    if !text.is_empty() {
-        canvas.put_str(row + 1, cx + 1, text);
+    // Label rows: right wall with the label inside the U. `│` at the right
+    // edge; each line starts one cell after the lifeline junction.
+    for (i, line) in lines.iter().enumerate() {
+        let label_row = row + 1 + i;
+        canvas.put(label_row, right, '│');
+        if !line.is_empty() {
+            canvas.put_str(label_row, cx + 1, line);
+        }
     }
 
     // Bottom leg: `├◂─────┘`.
-    canvas.put(row + 2, cx, '├');
+    canvas.put(bottom_row, cx, '├');
     if style.has_arrow() {
-        canvas.put(row + 2, cx + 1, ARROW_LEFT);
+        canvas.put(bottom_row, cx + 1, ARROW_LEFT);
     } else {
-        canvas.put(row + 2, cx + 1, h_char);
+        canvas.put(bottom_row, cx + 1, h_char);
     }
     for c in (cx + 2)..right {
-        canvas.put(row + 2, c, h_char);
+        canvas.put(bottom_row, c, h_char);
     }
-    canvas.put(row + 2, right, '┘');
+    canvas.put(bottom_row, right, '┘');
 }
 
 /// Draw a participant group frame: a top-border line at `top_row` and a
@@ -763,6 +897,26 @@ fn draw_participant_group_frame(
 ///
 /// Returns an empty string if the diagram has no participants.
 ///
+/// `max_width` is a column budget. With `None`, or with a budget the natural
+/// layout already meets, the diagram is laid out at its natural width and
+/// nothing about it changes. With a budget it does not meet, the diagram is
+/// re-laid out with its participant and message labels wrapped — which narrows
+/// the boxes and the gaps between them, since a sequence diagram's width is
+/// nothing but its labels — and among the layouts that fit, the shortest one is
+/// returned.
+///
+/// Shortest, not narrowest: the budget is a ceiling, so once a layout fits,
+/// narrowing it further buys the reader nothing and every extra row costs a
+/// scroll. Ties in row count go to the narrower layout — free at the same
+/// height, and it is what the caller sizes a popup from — and the target breaks
+/// any tie left, so repeated renders agree.
+///
+/// The result may still exceed the budget: there is a floor below which
+/// wrapping cannot go, because every participant keeps a box and every box
+/// keeps a border. The caller decides what to do about that; this function's
+/// job is to get as close as it can without dropping anything, so with no
+/// fitting layout it emits the narrowest one it found.
+///
 /// # Examples
 ///
 /// ```
@@ -770,12 +924,110 @@ fn draw_participant_group_frame(
 /// use mermaid_text::render::sequence::render;
 ///
 /// let diag = parse("sequenceDiagram\nA->>B: hello\nB-->>A: world").unwrap();
-/// let out = render(&diag);
+/// let out = render(&diag, None);
 /// assert!(out.contains("hello"));
 /// assert!(out.contains("world"));
 /// assert!(out.contains('┆'));
 /// ```
-pub fn render(diag: &SequenceDiagram) -> String {
+pub fn render(diag: &SequenceDiagram, max_width: Option<usize>) -> String {
+    let natural = render_wrapped(diag, None);
+    let Some(budget) = max_width else {
+        return natural;
+    };
+    if max_line_width(&natural) <= budget {
+        return natural;
+    }
+
+    // The natural layout is too wide, so wrap the labels and try again. The
+    // top of the range is the proportional estimate the flowchart pipeline
+    // uses — scaling the widest label by how far over budget the diagram is —
+    // and the bottom is the floor: a label of one column still needs a box
+    // around it.
+    let widest_label = diag
+        .participants
+        .iter()
+        .map(|p| p.label.width())
+        .chain(message_labels(diag).iter().map(|l| l.width()))
+        .max()
+        .unwrap_or(0);
+    if widest_label == 0 {
+        return natural;
+    }
+
+    const MIN_LABEL: usize = 6;
+    let actual = max_line_width(&natural);
+    let estimate = ((widest_label * budget) / actual).max(MIN_LABEL);
+
+    // Layout width is not monotone in the target: a different wrap point
+    // changes box widths, so a smaller target can produce a wider diagram, and
+    // nothing here can binary-search the shortest fitting layout. Every target
+    // in the range is therefore rendered and measured.
+    let domain = estimate - MIN_LABEL + 1;
+    let stride = domain.div_ceil(MAX_PROBES).max(1);
+
+    // Best fitting layout: fewest rows, then narrowest, then largest target.
+    // Rows come first because they are what the reader scrolls; width breaks
+    // the tie because at the same height the smaller diagram is free — and the
+    // wire reports this width, which is what a popup sizes itself to. The
+    // target is the last tie-break, only so that two renders always agree.
+    let mut best_fit: Option<(usize, usize, usize, String)> = None; // (rows, width, target, text)
+
+    // Narrowest layout seen, for the case where nothing fits at all. A wrapping
+    // pass can make a diagram wider rather than narrower — a box is sized by
+    // its widest line, and splitting a label can leave a long word alone on a
+    // row — so this is a comparison, not an assumption.
+    let mut narrowest = natural;
+    let mut narrowest_w = actual;
+
+    let mut target = estimate;
+    loop {
+        let candidate = render_wrapped(diag, Some(target));
+        let candidate_width = max_line_width(&candidate);
+        if candidate_width <= budget {
+            let rows = candidate.lines().count();
+            let better = match &best_fit {
+                None => true,
+                Some((best_rows, best_width, best_target, _)) => {
+                    rows < *best_rows
+                        || (rows == *best_rows && candidate_width < *best_width)
+                        || (rows == *best_rows
+                            && candidate_width == *best_width
+                            && target > *best_target)
+                }
+            };
+            if better {
+                best_fit = Some((rows, candidate_width, target, candidate));
+            }
+        } else if candidate_width < narrowest_w {
+            narrowest = candidate;
+            narrowest_w = candidate_width;
+        }
+        if target == MIN_LABEL {
+            break;
+        }
+        // Both ends of the range are always probed: the stride may skip
+        // targets in between, but never the estimate or the floor.
+        target = target.saturating_sub(stride).max(MIN_LABEL);
+    }
+
+    match best_fit {
+        Some((_, _, _, text)) => text,
+        None => narrowest,
+    }
+}
+
+/// How many wrapping targets [`render`] may try in one call.
+///
+/// The scan runs over `MIN_LABEL..=estimate`, and the estimate is at most the
+/// widest label's width, so this only binds for a label wider than roughly 260
+/// columns. When it binds, the scan is strided — still probing both ends, and
+/// still returning a layout that fits, just not provably the shortest one.
+const MAX_PROBES: usize = 256;
+
+/// Lay the diagram out, optionally wrapping every label to `wrap` columns.
+///
+/// `None` is the natural layout: labels are drawn exactly as written.
+fn render_wrapped(diag: &SequenceDiagram, wrap: Option<usize>) -> String {
     let n = diag.participants.len();
     if n == 0 {
         return String::new();
@@ -788,28 +1040,89 @@ pub fn render(diag: &SequenceDiagram) -> String {
         .collect();
     let lane_widths = activation_widths(diag, &depths);
     let active_lanes = active_lane_index(diag, &depths);
-    let labels = message_labels(diag);
-    let layouts = compute_layout(diag, &lane_widths, &labels);
+
+    // Wrapping happens once, here, and everything downstream reads the result:
+    // box widths, gap minimums, heights and the drawing passes all have to
+    // agree on the label or a wrapped diagram is drawn into rows sized for an
+    // unwrapped one.
+    let participant_labels: Vec<Cow<'_, str>> = diag
+        .participants
+        .iter()
+        .map(|p| match wrap {
+            Some(budget) => Cow::Owned(wrap_note_text(&p.label, budget)),
+            None => Cow::Borrowed(p.label.as_str()),
+        })
+        .collect();
+    let labels: Vec<Cow<'_, str>> = message_labels(diag)
+        .into_iter()
+        .map(|label| match wrap {
+            Some(budget) => Cow::Owned(wrap_note_text(&label, budget)),
+            None => label,
+        })
+        .collect();
+    let mut layouts = compute_layout(diag, &lane_widths, &participant_labels, &labels);
+    // A label's room is only knowable once the gaps exist, so filling them is a
+    // second pass over the same labels rather than part of the first. It cannot
+    // widen the layout — see `fill_message_labels` — and re-laying out is what
+    // makes that a computed fact rather than a claim.
+    let labels = match wrap {
+        Some(_) => {
+            let filled = fill_message_labels(diag, &labels, &layouts, &lane_widths);
+            layouts = compute_layout(diag, &lane_widths, &participant_labels, &filled);
+            filled
+        }
+        None => labels,
+    };
+
+    // Every participant box shares one height, taken from the tallest wrapped
+    // label, so the header and footer still line up as a bracket.
+    let box_h = box_height(
+        participant_labels
+            .iter()
+            .map(|l| l.lines().count())
+            .max()
+            .unwrap_or(1),
+    );
 
     // Determine canvas dimensions.
-    // Header: rows 0-2 (BOX_HEIGHT = 3).
-    // Body: one row per message slot, each slot is EVENT_ROW_H rows.
-    // We need an extra leading row per message for the label above the arrow
-    // so the body starts at row BOX_HEIGHT + 1 (the +1 is the label row for
-    // the first message).
+    // Header: `box_h` rows for the participant boxes.
+    // Body: one slot per message, sized by that message's own label.
+    // We need an extra leading row per message for the label above the arrow,
+    // so the body starts at row `box_h + 1` (the +1 is the label row for the
+    // first message).
     let num_messages = diag.messages.len();
 
-    // Total body rows: each message needs EVENT_ROW_H rows, but we also need
-    // a label row *above* the first arrow, so:
-    //   body_rows = 1 (initial spacer/label row) + num_messages * EVENT_ROW_H
+    // The rows each message's label needs, computed once here because three
+    // places depend on it: the canvas height, the drawing loop's row cursor,
+    // and the label drawing itself. They must agree exactly.
+    let message_lines: Vec<usize> = labels.iter().map(|l| l.lines().count().max(1)).collect();
+    let message_rows: Vec<usize> = diag
+        .messages
+        .iter()
+        .zip(&message_lines)
+        .map(|(msg, &lines)| {
+            if msg.from == msg.to {
+                self_message_height(lines)
+            } else {
+                message_height(lines)
+            }
+        })
+        .collect();
+
+    // Total body rows. A regular message's label sits *above* its arrow, so
+    // the row cursor has to reserve the next label's rows before moving on —
+    // which means every message but the last pays for the label that follows
+    // it, not just for its own. `message_rows` already counts each message's
+    // label rows once, so the reservation adds them a second time for all but
+    // the last; the trailing `1` is the blank row under the final arrow.
+    //
+    // For one-line labels this collapses to `1 + sum(message_rows)`, which is
+    // what the layout used before labels could wrap.
     let body_rows = if num_messages == 0 {
         2 // just lifeline + blank
     } else {
-        // Budget one row per message slot; self-messages need an extra
-        // row each for their loop's second leg.
-        let self_msg_count = diag.messages.iter().filter(|m| m.from == m.to).count();
-        let regular_count = num_messages - self_msg_count;
-        1 + regular_count * EVENT_ROW_H + self_msg_count * SELF_MSG_ROW_H
+        let reserved: usize = message_lines.iter().take(num_messages - 1).sum();
+        1 + message_rows.iter().sum::<usize>() + reserved - (num_messages - 1)
     };
 
     // Pre-compute wrapped note text for every note. Two-pass approach:
@@ -838,11 +1151,40 @@ pub fn render(diag: &SequenceDiagram) -> String {
     // the glyph itself + 1 spacer below) so adjacent message labels
     // don't land on the same row as a border. Total per block:
     //   2 (top) + 2 (bottom) + 2 * (extra branches).
+    //
+    // A border sits directly above the label of the message that starts at its
+    // boundary, and a wrapped label is several rows deep. The one spacer row
+    // covers a single-line label; every further row has to be reserved as well,
+    // or the label's upper rows land on the border. That reservation belongs to
+    // the *boundary*, not to the block: several borders can meet there and they
+    // share one label, so it is summed once per boundary below.
     let block_rows: usize = diag
         .blocks
         .iter()
         .map(|b| 4 + 2 * b.branches.len().saturating_sub(1))
-        .sum();
+        .sum::<usize>()
+        + {
+            let mut boundaries = vec![false; num_messages + 1];
+            for b in &diag.blocks {
+                if b.start_message < num_messages {
+                    boundaries[b.start_message] = true;
+                }
+                if b.end_message + 1 < num_messages {
+                    boundaries[b.end_message + 1] = true;
+                }
+                for branch in b.branches.iter().skip(1) {
+                    if branch.start_message < num_messages {
+                        boundaries[branch.start_message] = true;
+                    }
+                }
+            }
+            boundaries
+                .iter()
+                .enumerate()
+                .filter(|(_, placed)| **placed)
+                .map(|(pos, _)| message_lines[pos].saturating_sub(1))
+                .sum::<usize>()
+        };
 
     // Mirror the header participant boxes at the bottom of the canvas
     // (Mermaid convention — lifelines are bracketed top *and* bottom).
@@ -855,11 +1197,11 @@ pub fn render(diag: &SequenceDiagram) -> String {
         1
     };
     let height = group_frame_rows
-        + BOX_HEIGHT
+        + box_h
         + body_rows
         + note_rows
         + block_rows
-        + BOX_HEIGHT
+        + box_h
         + group_frame_rows;
 
     // Canvas width: rightmost participant box right edge + 1 margin.
@@ -873,7 +1215,7 @@ pub fn render(diag: &SequenceDiagram) -> String {
             diag.participant_index(&m.from) == diag.participant_index(&m.to)
                 && diag.participant_index(&m.from) == Some(n - 1)
         })
-        .map(|(_, label)| label.width() + 6)
+        .map(|(_, label)| max_line_width(label) + 6)
         .max()
         .unwrap_or(0);
     let participant_width =
@@ -905,21 +1247,21 @@ pub fn render(diag: &SequenceDiagram) -> String {
     //    When participant groups exist, boxes are shifted down by group_frame_rows
     //    so there is room for the group top-border row above them.
     let header_top = group_frame_rows;
-    let footer_top = height - BOX_HEIGHT - group_frame_rows;
-    for (i, p) in diag.participants.iter().enumerate() {
+    let footer_top = height - box_h - group_frame_rows;
+    for (i, label) in participant_labels.iter().enumerate() {
         let cx = layouts[i].center;
         let w = layouts[i].box_width;
-        draw_participant_box(&mut canvas, cx, w, &p.label, header_top);
-        draw_participant_box(&mut canvas, cx, w, &p.label, footer_top);
+        draw_participant_box(&mut canvas, cx, w, label, header_top);
+        draw_participant_box(&mut canvas, cx, w, label, footer_top);
     }
 
     // 1a. Draw participant group frames above the header boxes and below the
     //     footer boxes. Each group gets a top-border row at `header_top - 1`
     //     (i.e. row 0 when group_frame_rows == 1) and a bottom-border row at
-    //     `footer_top + BOX_HEIGHT` (the row right after the footer boxes).
+    //     `footer_top + box_h` (the row right after the footer boxes).
     if group_frame_rows > 0 {
         let group_top_row = 0usize;
-        let group_bottom_row = footer_top + BOX_HEIGHT;
+        let group_bottom_row = footer_top + box_h;
         for grp in &diag.participant_groups {
             draw_participant_group_frame(
                 &mut canvas,
@@ -935,7 +1277,7 @@ pub fn render(diag: &SequenceDiagram) -> String {
     //    must terminate one row above the footer's top border so the
     //    box outline reads as a clean bracket (lifeline glyphs would
     //    otherwise punch through the `┌────┐`).
-    let lifeline_start = header_top + BOX_HEIGHT; // row right below the header
+    let lifeline_start = header_top + box_h; // row right below the header
     let lifeline_end = footer_top.saturating_sub(1);
     for layout in &layouts {
         draw_lifeline(&mut canvas, layout.center, lifeline_start, lifeline_end);
@@ -943,12 +1285,14 @@ pub fn render(diag: &SequenceDiagram) -> String {
 
     // 3. Draw messages.
     //
-    // Each non-self message consumes `EVENT_ROW_H` rows (label row + arrow
-    // row + 1 blank spacer, with EVENT_ROW_H=2 accounting for label+arrow).
-    // Self-messages span `SELF_MSG_ROW_H` rows because their loop draws a
-    // top leg and a bottom leg — placing the next message's label on
-    // `row+1` would overlap the self-loop's bottom leg.
-    let mut arrow_row = header_top + BOX_HEIGHT + 1;
+    // `arrow_row` is the row the *next* message's arrow lands on. A regular
+    // message's label occupies the rows immediately above it, so the cursor
+    // starts far enough down to clear the first label and each advance pays
+    // for the following label rather than the current one. For one-line labels
+    // both rules reduce to the old fixed `+1` and `+2`, so a diagram that
+    // never wraps lays out exactly as it did before.
+    let mut arrow_row =
+        header_top + box_h + message_lines.first().copied().unwrap_or(1);
 
     // Captured arrow row for each message, indexed by message position.
     // Used by the activation-bar overlay pass to translate
@@ -979,11 +1323,15 @@ pub fn render(diag: &SequenceDiagram) -> String {
     // collide). The border row is the *first* of the two; the spacer
     // is implicitly the second. Inner blocks close before outer blocks
     // at the same position, and outer blocks open before inner blocks.
+    // After the events at `pos`, the remaining rows of that message's label
+    // are reserved — see the `placed` tail below and the height budget at
+    // `block_rows`.
     let apply_block_events = |arrow_row: &mut usize,
                               pos: usize,
                               top_rows: &mut [usize],
                               bottom_rows: &mut [usize],
                               dividers: &mut [Vec<usize>]| {
+        let mut placed = false;
         // Bottom borders first (innermost first = forward order in
         // diag.blocks since LIFO close order means innermost has
         // lower idx).
@@ -991,6 +1339,7 @@ pub fn render(diag: &SequenceDiagram) -> String {
             if pos > 0 && b.end_message + 1 == pos {
                 bottom_rows[i] = *arrow_row;
                 *arrow_row += 2;
+                placed = true;
             }
         }
         // Top borders next, outermost first (outer block has higher
@@ -999,6 +1348,7 @@ pub fn render(diag: &SequenceDiagram) -> String {
             if b.start_message == pos {
                 top_rows[i] = *arrow_row;
                 *arrow_row += 2;
+                placed = true;
             }
         }
         // Branch dividers (continuation rows). Order doesn't matter
@@ -1008,8 +1358,16 @@ pub fn render(diag: &SequenceDiagram) -> String {
                 if branch.start_message == pos {
                     dividers[i][j] = *arrow_row;
                     *arrow_row += 2;
+                    placed = true;
                 }
             }
+        }
+        // Whatever was drawn here sits above the label of the message at
+        // `pos`, and only the first of that label's rows was reserved above.
+        // Reserve the rest, or the upper rows of a wrapped label land on the
+        // border. Once per boundary: several borders can share one label.
+        if placed && pos < num_messages {
+            *arrow_row += message_lines[pos].saturating_sub(1);
         }
     };
 
@@ -1075,11 +1433,16 @@ pub fn render(diag: &SequenceDiagram) -> String {
         // Capture the arrow row for this message before advancing.
         message_arrow_rows[msg_idx] = Some(arrow_row);
 
+        // Rows the *following* message needs above its own arrow: its label's
+        // rows. The last message has none to reserve, so it keeps the single
+        // blank row that has always trailed the body.
+        let next_lines = message_lines.get(msg_idx + 1).copied().unwrap_or(1);
+
         if si == ti {
             let anchor =
                 message_anchor(&layouts[si], active_width(&active_lanes[si], msg_idx), true);
             draw_self_message(&mut canvas, anchor, arrow_row, label, msg.style);
-            arrow_row += SELF_MSG_ROW_H;
+            arrow_row += message_rows[msg_idx] - 1 + next_lines;
         } else {
             draw_message(
                 &mut canvas,
@@ -1097,7 +1460,7 @@ pub fn render(diag: &SequenceDiagram) -> String {
                 label,
                 msg.style,
             );
-            arrow_row += EVENT_ROW_H;
+            arrow_row += message_rows[msg_idx] - 1 + next_lines;
         }
 
         // Render notes positioned AFTER this message (those whose
@@ -1539,7 +1902,7 @@ mod tests {
     #[test]
     fn render_produces_participant_boxes() {
         let diag = parse("sequenceDiagram\nparticipant A as Alice\nparticipant B as Bob").unwrap();
-        let out = render(&diag);
+        let out = render(&diag, None);
         assert!(out.contains("Alice"), "missing Alice in:\n{out}");
         assert!(out.contains("Bob"), "missing Bob in:\n{out}");
         // Boxes use corner characters.
@@ -1549,35 +1912,35 @@ mod tests {
     #[test]
     fn render_draws_lifelines() {
         let diag = parse("sequenceDiagram\nA->>B: hi").unwrap();
-        let out = render(&diag);
+        let out = render(&diag, None);
         assert!(out.contains(LIFELINE), "no lifeline char in:\n{out}");
     }
 
     #[test]
     fn render_solid_arrow() {
         let diag = parse("sequenceDiagram\nA->>B: go").unwrap();
-        let out = render(&diag);
+        let out = render(&diag, None);
         assert!(out.contains(ARROW_RIGHT), "no solid arrowhead in:\n{out}");
     }
 
     #[test]
     fn render_dashed_arrow() {
         let diag = parse("sequenceDiagram\nA-->>B: back").unwrap();
-        let out = render(&diag);
+        let out = render(&diag, None);
         assert!(out.contains(H_DASH), "no dashed glyph in:\n{out}");
     }
 
     #[test]
     fn render_message_text_appears() {
         let diag = parse("sequenceDiagram\nA->>B: Hello Bob").unwrap();
-        let out = render(&diag);
+        let out = render(&diag, None);
         assert!(out.contains("Hello Bob"), "missing message text in:\n{out}");
     }
 
     #[test]
     fn render_message_order_top_to_bottom() {
         let diag = parse("sequenceDiagram\nA->>B: first\nB->>A: second").unwrap();
-        let out = render(&diag);
+        let out = render(&diag, None);
         let first_row = out
             .lines()
             .position(|l| l.contains("first"))
@@ -1595,6 +1958,333 @@ mod tests {
     #[test]
     fn render_empty_diagram_is_empty_string() {
         let diag = crate::sequence::SequenceDiagram::default();
-        assert_eq!(render(&diag), "");
+        assert_eq!(render(&diag, None), "");
     }
+
+    // -----------------------------------------------------------------------
+    // Width-aware layout
+    // -----------------------------------------------------------------------
+
+    /// The row index of the box's bottom border for the participant whose label
+    /// is `label`, or `None` if the label is not on the canvas.
+    fn box_rows(out: &str, label: &str) -> (usize, usize) {
+        let lines: Vec<&str> = out.lines().collect();
+        let first = lines
+            .iter()
+            .position(|l| l.contains(label))
+            .unwrap_or_else(|| panic!("{label} is not on the canvas:\n{out}"));
+        // Walk out to the box's top and bottom borders.
+        let top = (0..=first)
+            .rev()
+            .find(|&r| lines[r].contains('┌'))
+            .expect("a box top border above the label");
+        let bottom = (first..lines.len())
+            .find(|&r| lines[r].contains('└'))
+            .expect("a box bottom border below the label");
+        (top, bottom)
+    }
+
+    #[test]
+    fn a_wrapped_participant_label_makes_its_box_taller() {
+        let diag = parse("sequenceDiagram\nparticipant A as Steering Service\nA->>A: ping").unwrap();
+
+        let natural = render(&diag, None);
+        let (natural_top, natural_bottom) = box_rows(&natural, "Steering Service");
+        assert_eq!(
+            natural_bottom - natural_top + 1,
+            box_height(1),
+            "an unwrapped label gets a one-line box:\n{natural}"
+        );
+
+        // A budget too small for the label forces it onto two rows, and the box
+        // grows a row to hold them rather than clipping the label.
+        let wrapped = render(&diag, Some(9));
+        assert!(
+            wrapped.contains("Steering") && wrapped.contains("Service"),
+            "a wrapped label keeps every word:\n{wrapped}"
+        );
+        let (top, bottom) = box_rows(&wrapped, "Steering");
+        assert_eq!(
+            bottom - top + 1,
+            box_height(2),
+            "a two-line label gets a two-line box:\n{wrapped}"
+        );
+        assert_eq!(
+            bottom - top + 1,
+            natural_bottom - natural_top + 1 + 1,
+            "and exactly one row taller than the unwrapped box"
+        );
+    }
+
+    #[test]
+    fn a_diagram_that_fits_its_budget_is_laid_out_exactly_as_without_one() {
+        let diag = parse("sequenceDiagram\nA->>B: hello there\nB-->>A: hi back").unwrap();
+        let natural = render(&diag, None);
+
+        let roomy = render(&diag, Some(max_line_width(&natural) + 40));
+        assert_eq!(
+            roomy, natural,
+            "a budget the natural layout already meets must change nothing"
+        );
+
+        let exact = render(&diag, Some(max_line_width(&natural)));
+        assert_eq!(exact, natural, "a budget met exactly must change nothing");
+    }
+
+    #[test]
+    fn an_over_wide_diagram_is_wrapped_until_it_fits() {
+        // Every participant and every message label is long enough that the
+        // natural layout is far wider than the budget.
+        let diag = parse(
+            "sequenceDiagram\n\
+             participant A as Client Application\n\
+             participant B as Gateway Router Service\n\
+             participant C as Response Assembler\n\
+             A->>B: a long enough request label to need wrapping\n\
+             B->>C: and a long enough response to need it too",
+        )
+        .unwrap();
+
+        let natural = render(&diag, None);
+        let natural_width = max_line_width(&natural);
+        // The floor is the three boxes side by side: `Application` and
+        // `Assembler` are single words that word-wrapping cannot split, so the
+        // boxes stay 17 and 15 columns wide however narrow the budget is. A
+        // budget below that floor is `compacting_stops_at_the_floor_...`'s
+        // subject; this test needs one that wrapping can actually reach.
+        let budget = 80;
+        assert!(
+            natural_width > budget,
+            "the fixture must start out wider than {budget}, got {natural_width}"
+        );
+        assert!(
+            max_line_width(&render(&diag, Some(1))) < budget,
+            "the fixture must be compactable to {budget}, but its floor is already \
+             at or above it"
+        );
+
+        let compacted = render(&diag, Some(budget));
+        let width = max_line_width(&compacted);
+        assert!(
+            width <= budget,
+            "wrapping must bring {natural_width} columns within {budget}, got {width}:\n{compacted}"
+        );
+
+        // Nothing may be dropped on the way: every participant is still drawn,
+        // and every word of every label survives somewhere on the canvas.
+        for participant in ["Client Application", "Gateway Router Service", "Response Assembler"] {
+            for word in participant.split_whitespace() {
+                assert!(
+                    compacted.contains(word),
+                    "{word} went missing while compacting:\n{compacted}"
+                );
+            }
+        }
+        for word in "a long enough request label to need wrapping".split_whitespace() {
+            assert!(
+                compacted.contains(word),
+                "message word {word} went missing while compacting:\n{compacted}"
+            );
+        }
+    }
+
+    #[test]
+    fn compacting_stops_at_the_floor_rather_than_dropping_content() {
+        // Three participants keep three boxes and their borders whatever the
+        // budget, so there is a width below which wrapping cannot go.
+        let diag = parse("sequenceDiagram\nA->>B: one\nB->>C: two").unwrap();
+
+        let out = render(&diag, Some(1));
+        assert!(!out.is_empty(), "a tiny budget must still produce a diagram");
+        for name in ["A", "B", "C"] {
+            assert!(out.contains(name), "participant {name} was dropped:\n{out}");
+        }
+        assert!(out.contains("one") && out.contains("two"), "messages dropped:\n{out}");
+    }
+
+    #[test]
+    fn compaction_is_deterministic() {
+        let src = "sequenceDiagram\nparticipant A as Client Application\nparticipant B as Server\nautonumber\nA->>B: a request long enough to wrap";
+        let diag = parse(src).unwrap();
+        let first = render(&diag, Some(40));
+        let second = render(&diag, Some(40));
+        assert_eq!(first, second, "the same budget must give the same layout");
+    }
+
+    /// With several arrangements inside the budget, the one emitted is the
+    /// shortest — not the first the search reaches and not the narrowest.
+    #[test]
+    fn the_shortest_fitting_arrangement_is_emitted() {
+        let src = "sequenceDiagram\n\
+                   participant Alice as Alice Cooper\n\
+                   participant Bob as Bob Dylan\n\
+                   participant Carol as Carol King\n\
+                   Alice->>Bob: the quick brown fox jumps over the lazy dog\n\
+                   Bob->>Carol: a much shorter reply\n\
+                   Carol-->>Alice: second message with several words in it\n\
+                   Alice->>Carol: ok";
+        let diag = parse(src).unwrap();
+        let natural = render_wrapped(&diag, None);
+        let natural_width = max_line_width(&natural);
+        let budget = natural_width * 2 / 3;
+
+        let out = render(&diag, Some(budget));
+        let out_rows = out.lines().count();
+        assert!(
+            max_line_width(&out) <= budget,
+            "the emitted arrangement must fit {budget}:\n{out}"
+        );
+
+        let mut fitting = 0;
+        for target in 6..=natural_width {
+            let candidate = render_wrapped(&diag, Some(target));
+            if max_line_width(&candidate) <= budget {
+                fitting += 1;
+                let rows = candidate.lines().count();
+                assert!(
+                    rows >= out_rows,
+                    "target {target} fits {budget} in {rows} rows, fewer than the \
+                     {out_rows} emitted:\n{candidate}\n--- emitted ---\n{out}"
+                );
+            }
+        }
+        assert!(
+            fitting > 1,
+            "the fixture needs several fitting arrangements to prove anything"
+        );
+    }
+
+    /// With nothing inside the budget, the narrowest arrangement is the one to
+    /// emit: height buys the reader nothing when they are scrolling sideways
+    /// anyway.
+    #[test]
+    fn with_no_fitting_arrangement_the_narrowest_is_emitted() {
+        let src = "sequenceDiagram\n\
+                   participant Alice as Alice Cooper\n\
+                   participant Bob as Bob Dylan\n\
+                   Alice->>Bob: the quick brown fox jumps over the lazy dog\n\
+                   Bob-->>Alice: a much shorter reply\n\
+                   Alice->>Bob: second message with several words in it";
+        let diag = parse(src).unwrap();
+        let natural = render_wrapped(&diag, None);
+        let natural_width = max_line_width(&natural);
+
+        let mut narrowest = natural_width;
+        for target in 6..=natural_width {
+            narrowest = narrowest.min(max_line_width(&render_wrapped(&diag, Some(target))));
+        }
+
+        let out = render(&diag, Some(1));
+        assert_eq!(
+            max_line_width(&out),
+            narrowest,
+            "a budget no arrangement fits must still yield the narrowest:\n{out}"
+        );
+    }
+
+    /// A message label that shares its gap with an unbreakable token has room
+    /// the first pass never gives it. Here the token pins the gap at 36 columns,
+    /// so wrapping the other label to the target of 6 crushes it into four rows
+    /// in a space that holds it in one.
+    #[test]
+    fn a_message_label_fills_the_gap_it_sits_in() {
+        let src = "sequenceDiagram\nparticipant A\nparticipant B\n\
+                   A->>B: a_very_long_unbreakable_token_here\n\
+                   A->>B: one two three four";
+        let diag = parse(src).unwrap();
+        let tight = render_wrapped(&diag, Some(6));
+        // The token decides the width, not the target, so filling the labels
+        // must land on the same diagram a target as wide as the gap produces.
+        let wide = render_wrapped(&diag, Some(40));
+        assert_eq!(
+            max_line_width(&tight),
+            max_line_width(&wide),
+            "filling a label must not widen the diagram:\n{tight}"
+        );
+        assert_eq!(
+            tight.lines().count(),
+            wide.lines().count(),
+            "a label with room for one row must not take four:\n{tight}"
+        );
+        assert!(
+            tight.contains("one two three four"),
+            "the label should fill its gap:\n{tight}"
+        );
+    }
+
+    /// A self-message's loop is sized from its own label, so it has no room to
+    /// fill and is left at the target the first pass chose.
+    #[test]
+    fn a_self_message_label_is_left_at_the_target() {
+        let src = "sequenceDiagram\nparticipant A\nA->>A: one two three four";
+        let diag = parse(src).unwrap();
+        let out = render_wrapped(&diag, Some(6));
+        assert!(
+            !out.contains("one two three four"),
+            "a self-message has no gap to fill, so it stays wrapped:\n{out}"
+        );
+    }
+
+    /// Compaction re-wraps labels; it must not drop one. Every word of every
+    /// participant, message, note and block label has to reach the canvas, and
+    /// every frame still has to be drawn.
+    #[test]
+    fn compaction_keeps_every_label_and_every_frame() {
+        let src = "sequenceDiagram\n\
+                   participant Client as Client Application\n\
+                   participant Server as Application Server\n\
+                   participant Store as Session Store\n\
+                   Note over Client,Server: authentication begins here\n\
+                   alt credentials valid\n\
+                   Client->>Server: POST credentials payload\n\
+                   Server->>Store: lookup session record\n\
+                   Store-->>Server: session record found\n\
+                   else credentials invalid\n\
+                   Server-->>Client: reject request politely\n\
+                   end\n\
+                   loop retry policy\n\
+                   Client->>Server: retry the request\n\
+                   end";
+        let diag = parse(src).unwrap();
+
+        // Derived from the diagram rather than from the rendered output, so a
+        // label missing from *both* would still fail here.
+        let mut expected: Vec<String> = Vec::new();
+        expected.extend(diag.participants.iter().map(|p| p.label.clone()));
+        expected.extend(diag.messages.iter().map(|m| m.text.clone()));
+        expected.extend(diag.notes.iter().map(|n| n.text.clone()));
+        for block in &diag.blocks {
+            expected.push(block_kind_label(block.kind.clone()).to_string());
+            expected.extend(block.branches.iter().map(|b| b.label.clone()));
+        }
+
+        for target in [6, 12, 20] {
+            let out = render_wrapped(&diag, Some(target));
+            for text in &expected {
+                for word in text.split_ascii_whitespace() {
+                    assert!(
+                        out.contains(word),
+                        "target {target} lost {word:?} from {text:?}:\n{out}"
+                    );
+                }
+            }
+            // Every block frame still has a double-line top-left corner and
+            // every note box a rounded one; participant boxes are `┌`.
+            assert!(
+                out.matches('╔').count() >= diag.blocks.len(),
+                "target {target} lost a block frame:\n{out}"
+            );
+            assert!(
+                out.matches('╭').count() >= diag.notes.len(),
+                "target {target} lost a note frame:\n{out}"
+            );
+            assert!(
+                out.matches('┌').count() >= diag.participants.len() * 2,
+                "target {target} lost a participant box:\n{out}"
+            );
+        }
+    }
+
+
+
 }
