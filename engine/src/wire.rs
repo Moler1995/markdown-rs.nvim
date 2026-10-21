@@ -129,6 +129,18 @@ pub struct WireDoc {
     /// The width the engine laid out to, echoed back so the plugin can discard
     /// a result that arrived after the window changed size.
     pub width: u16,
+    /// The widest display line the engine laid the document out at, measured in
+    /// display columns *before* any truncation.
+    ///
+    /// Diagram artwork that does not fit is truncated rather than wrapped, and
+    /// the dropped columns are not in `lines`, so a reader cannot tell a
+    /// diagram that fits from one that was cut down by looking at the output.
+    /// This is what it can tell them by: the document was truncated exactly
+    /// when `layout_width > width`.
+    ///
+    /// It covers the whole document rather than diagrams alone, so a caller
+    /// does not have to know which block was truncated to find out that one was.
+    pub layout_width: u16,
     pub styles: Vec<WireStyle>,
     pub lines: Vec<WireLine>,
     /// One entry per source line: the index of the first display line at or

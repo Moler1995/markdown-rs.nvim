@@ -20,6 +20,7 @@ Rendering `# Hi\n\nplain **bold** text\n` at width 40:
 {
   "version": 1,
   "width": 40,
+  "layout_width": 15,
   "styles": [
     { "fg": "cyan", "bg": null, "bold": true, "underline": true },
     { "fg": "#dcdcdc", "bg": null },
@@ -49,6 +50,29 @@ producing a wrong picture.
 The column width the engine laid out to, echoed back. A reader that knows the
 window has since changed size can compare against this and discard a result
 that arrived late.
+
+### `layout_width`
+
+The widest display line the engine laid the document out at, in display
+columns, measured *before* any truncation. It is at most `width` for a document
+that fits, and above `width` for one that does not.
+
+This field exists because truncation is otherwise invisible. Diagram artwork
+wider than the requested width is truncated rather than wrapped — the right-hand
+columns are dropped, and dropped columns are not in `lines`, so no reader can
+see them and no amount of scrolling can reach them. Prose, tables, code and
+formulas wrap instead, so they never contribute a value above `width`.
+
+The rule is exact: **the engine truncated the document if and only if
+`layout_width > width`.** A reader that needs to know whether it is looking at
+a whole document — or whether asking for a narrower layout might bring more of
+it into view — compares the two rather than measuring the lines itself, which
+it cannot do, because the missing columns are exactly what it does not have.
+
+It covers the whole document, not diagrams alone, so a reader does not have to
+know which block was truncated to find out that one was. Note that it is a
+property of the *document*, not of any one line: a document with one truncated
+diagram and a hundred narrow prose lines still reports the diagram's width.
 
 ### `styles`
 

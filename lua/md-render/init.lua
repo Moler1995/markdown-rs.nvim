@@ -476,7 +476,7 @@ function M.preview(win)
       report(st, err)
       return
     end
-    preview.open(doc, geometry)
+    preview.open(doc, geometry, block)
   end)
 end
 

@@ -213,6 +213,69 @@ end
 --- diagram is this wide, so laying one out at it clips nothing.
 local MAX_BUDGET = 65535
 
+--- How many zooms have been asked for.
+---
+--- A zoom is up to two engine round trips deep, so a second keypress can start
+--- before the first has landed. Each chain carries the number it started with
+--- and abandons itself once a newer one exists.
+local zoom_generation = 0
+
+--- The widest line `doc` was laid out at, or nil when the engine did not say.
+---
+--- Measured before the engine clips, so `width > budget` is exactly the
+--- condition under which columns were discarded. `nil` is not zero and not
+--- "fits": an engine older than the field may have dropped columns, and a reader
+--- that takes a missing number for a small one would adopt a crop believing it
+--- whole.
+local function doc_layout_width(doc)
+  local width = doc.layout_width
+  if type(width) ~= 'number' then
+    return nil
+  end
+  return width
+end
+
+--- What the popup calls itself: the block's kind, plus — once a diagram has been
+--- zoomed out — the width it is laid out at and the width it opened with.
+---
+--- A zoomed diagram and a naturally narrow one look alike, and the difference
+--- matters: one of them can be zoomed back in. These two numbers are what makes
+--- the difference legible, and they are the numbers a reader could measure.
+local function popup_label(popup)
+  local natural, current = popup.natural_width, popup.layout_width
+  if popup.kind ~= 'mermaid' or natural == nil or current == nil or current >= natural then
+    return popup.kind
+  end
+  return string.format('%s %d/%d', popup.kind, current, natural)
+end
+
+--- The popup buffer's name, carrying the same label as the title.
+---
+--- Naming the buffer is not needed to find it — the popup holds the handle — but
+--- it puts the zoom state where a reader can reach it without the frame: `:ls`,
+--- `<C-g>`, and any statusline that shows the buffer name. The scheme keeps the
+--- name from reading as a path relative to the editor's directory.
+local function popup_buffer_name(popup)
+  return string.format('md-render-preview://%d/%s', popup.win or 0, popup_label(popup))
+end
+
+--- How far one horizontal scroll keypress moves the popup's view, in display
+--- columns.
+---
+--- Taken from the reader's own `'mousescroll'` — `hor:6` by default — so that the
+--- keys move the view by what a horizontal wheel notch moves it by. A reader
+--- with a tilt wheel and one without see the same block move the same distance,
+--- and a reader who has tuned the option gets what they tuned. The fallback is
+--- for a `'mousescroll'` that leaves the horizontal step out or at zero, which
+--- would otherwise leave the keys silently doing nothing.
+local function scroll_step()
+  local step = tonumber(vim.o.mousescroll:match('hor%a*:(%d+)'))
+  if not step or step < 1 then
+    return 6
+  end
+  return step
+end
+
 --- The popup's geometry for a block of `kind`: the editor's size, the configured
 --- caps, the popup's own inner width, and the budget the block is laid out at.
 ---
@@ -224,11 +287,23 @@ local MAX_BUDGET = 65535
 --- A **diagram** is laid out against `MAX_BUDGET`. The engine *clips* artwork
 --- that does not fit — `clip_to_width` drops the right-hand side of the line —
 --- and the dropped columns are not in the buffer, so scrolling cannot reach
---- them. Any finite budget can therefore lose the end of a wide diagram; the
---- only budget that loses nothing is one no diagram reaches. The popup's own
---- inner width is the wrong budget for a diagram precisely because it is finite:
---- a sequence diagram 358 columns wide laid out at 200 is a diagram with 158
---- columns missing, and the reader asked to see the block, not a crop of it.
+--- them. Opening a diagram at the popup's own inner width would therefore show
+--- the reader a crop of it, and the reader asked to see the block.
+---
+--- The figures are measured from the sequence diagram in
+--- `Wind.Traefik.LLM.Routing/docs/architecture.md` §2, named so that a later
+--- reader can re-measure rather than wonder where they came from: 357 display
+--- columns naturally, and 358 by `strdisplaywidth` in a window with `wrap` on.
+--- That diagram at a budget of 200 is a diagram with 158 columns missing.
+---
+--- What has changed since those numbers were taken is that a finite budget no
+--- longer *always* loses a sequence diagram's columns: the engine re-lays a
+--- diagram out to fit before it clips (`render_with_width`, and the compaction
+--- pass in `render/sequence.rs`). It still cannot promise not to — the layout is
+--- clipped whenever the diagram's narrowest whole layout is wider than the
+--- budget, which for that same diagram is 214 columns. So the popup opens at
+--- `MAX_BUDGET`, where nothing can be lost, and a smaller budget is asked for
+--- only deliberately, by the zoom key. See `M.zoom`.
 ---
 --- A **table** needs no such thing. The engine wraps a cell that does not fit
 --- rather than dropping it, so a table loses nothing at any budget, and a larger
@@ -295,9 +370,13 @@ end
 
 --- Open the popup showing `doc`, sized from `geometry`.
 ---
+--- `block` is the source block `doc` was laid out from. The popup keeps it, and
+--- the budget it was laid out at, so that `M.zoom` can lay the same block out
+--- again without going back to the window for its source.
+---
 --- Sized to content and only then clamped, so a small diagram gets a small popup
 --- rather than a large empty frame. Returns the window.
-function M.open(doc, geometry)
+function M.open(doc, geometry, block)
   M.close()
 
   -- Measured in display columns rather than bytes: the artwork is box-drawing
@@ -321,6 +400,28 @@ function M.open(doc, geometry)
   vim.bo[buf].buflisted = false
   render.apply(buf, doc)
 
+  -- What the popup is showing, and what it was laid out at. Neither can be
+  -- recovered from the buffer once the clip has run — the buffer holds the
+  -- layout, not the block it came from — and both are what a zoom needs.
+  --
+  -- `natural_width` is the width of the layout the popup opens with. The popup
+  -- lays a diagram out at the largest budget the engine takes, so nothing was
+  -- clipped at it and its `layout_width` *is* the diagram's natural width.
+  --
+  -- `rung` is which of the three budgets this layout sits on, and it is what
+  -- lets a zoom key tell that it has nothing left to ask for. See `M.adopt`.
+  local popup = {
+    win = nil,
+    buf = buf,
+    kind = geometry.kind,
+    geometry = geometry,
+    block = block,
+    budget = geometry.budget,
+    layout_width = doc_layout_width(doc),
+    natural_width = doc_layout_width(doc),
+    rung = 'natural',
+  }
+
   local function close()
     M.close()
   end
@@ -328,6 +429,45 @@ function M.open(doc, geometry)
     if key and key ~= '' and key ~= false then
       vim.keymap.set('n', key, close,
         { buffer = buf, desc = 'md-render: close the preview', nowait = true })
+    end
+  end
+
+  -- The zoom keys are bound here rather than in R or S because they act on the
+  -- block the popup is showing, and the popup is where the reader presses them.
+  -- They are bound for a table's popup too, where they do nothing: leaving them
+  -- unbound would let them fall through to the line motions, which is a
+  -- different behaviour for the same key depending on what the block happens to
+  -- be. See `M.zoom`.
+  for _, entry in ipairs({
+    { config.options.keymaps.zoom_in, 'in', 'md-render: zoom the diagram in' },
+    { config.options.keymaps.zoom_out, 'out', 'md-render: zoom the diagram out' },
+  }) do
+    local key, direction, desc = entry[1], entry[2], entry[3]
+    if key and key ~= '' and key ~= false then
+      vim.keymap.set('n', key, function()
+        M.zoom(direction)
+      end, { buffer = buf, desc = desc, nowait = true })
+    end
+  end
+
+  -- Sideways scrolling, on one key each. `zh` and `zl` are two keystrokes, so a
+  -- reader who wants to cross a block wider than the popup has to alternate `z`
+  -- and `l` — there is no key to hold down. Bound as a single key each, holding
+  -- one repeats and the view keeps moving. The step is the reader's own
+  -- horizontal wheel step, so the two ways of scrolling agree.
+  --
+  -- These are bound for a table's popup as well, and they do something there:
+  -- a table is laid out at the popup's inner width floored at the window's, so
+  -- it can be wider than the popup too, and its columns past the edge are
+  -- reached the same way a diagram's are.
+  for _, entry in ipairs({
+    { config.options.keymaps.scroll_left, 'zh', 'md-render: scroll the block left' },
+    { config.options.keymaps.scroll_right, 'zl', 'md-render: scroll the block right' },
+  }) do
+    local key, motion, desc = entry[1], entry[2], entry[3]
+    if key and key ~= '' and key ~= false then
+      vim.keymap.set('n', key, scroll_step() .. motion,
+        { buffer = buf, desc = desc, nowait = true })
     end
   end
 
@@ -339,7 +479,7 @@ function M.open(doc, geometry)
     height = height,
     style = 'minimal',
     border = 'rounded',
-    title = ' ' .. geometry.kind .. ' ',
+    title = ' ' .. popup_label(popup) .. ' ',
     title_pos = 'center',
   })
 
@@ -350,7 +490,11 @@ function M.open(doc, geometry)
   -- rather than a side effect of the style, so it is stated.
   vim.wo[win].wrap = false
 
-  M.popup = { win = win, buf = buf }
+  popup.win = win
+  -- Guarded: the name is a convenience, and a failure to set it must not cost
+  -- the reader the popup.
+  pcall(vim.api.nvim_buf_set_name, buf, popup_buffer_name(popup))
+  M.popup = popup
 
   -- A close by any other route — `:close`, a mouse click elsewhere — leaves the
   -- bookkeeping behind rather than the window. The buffer goes with the window
@@ -367,6 +511,176 @@ function M.open(doc, geometry)
   })
 
   return win
+end
+
+--- Lay the open popup's block out at `budget`, leaving the buffer alone.
+---
+--- `cb(err, doc)` is called with the result. The popup is captured now, and the
+--- answer is dropped if it is no longer the popup on screen: a close, or a newer
+--- preview, while the engine ran would otherwise write into a buffer nobody is
+--- looking at.
+---
+--- Rendering and adopting are separate because a zoom has to *measure* a
+--- candidate before it can decide whether to show it, and a layout it rejects
+--- must leave the popup exactly as it was.
+function M.render_at(budget, cb)
+  local popup = M.popup
+  if not popup or not popup.block then
+    return
+  end
+
+  M.render_block(config.options, popup.block, budget, function(err, doc)
+    if M.popup ~= popup then
+      return
+    end
+    cb(err, doc)
+  end)
+end
+
+--- Put `doc` in the popup's buffer, recorded as laid out at `budget` and sitting
+--- on `rung`.
+---
+--- `rung` is one of `'natural'` (the layout the popup opened with, at
+--- `MAX_BUDGET`), `'fits'` (the popup's inner width) or `'floor'` (the engine's
+--- own narrowest whole layout). The caller knows which one it is asking for, and
+--- saying so is what keeps `M.zoom` from having to infer it back out of
+--- `budget` — an inference that would hold only as long as no two rungs happened
+--- to be the same number, which is not a property this code can promise.
+---
+--- This is the only place the popup's content is replaced after it opens, and
+--- the window is not touched: it keeps its size and its position, and only the
+--- buffer behind it changes. That is deliberate rather than incidental — the
+--- popup's inner width is the input to the next zoom decision, so a window that
+--- resized with each zoom would make the ladder depend on its own output, and a
+--- frame that moved under the reader's hands is worse than the dead space to
+--- the right of a narrow layout.
+---
+--- It is also the only place that has to keep the buffer's name and the
+--- window's title in step with what is on screen, since both report the zoom.
+function M.adopt(doc, budget, rung)
+  local popup = M.popup
+  if not popup then
+    return
+  end
+
+  -- Recorded together with the content, so they always describe the buffer.
+  popup.budget = budget
+  popup.layout_width = doc_layout_width(doc)
+  popup.rung = rung
+  render.apply(popup.buf, doc)
+
+  local name = popup_buffer_name(popup)
+  if vim.api.nvim_buf_is_valid(popup.buf)
+    and vim.api.nvim_buf_get_name(popup.buf) ~= name then
+    pcall(vim.api.nvim_buf_set_name, popup.buf, name)
+  end
+  if popup.win and vim.api.nvim_win_is_valid(popup.win) then
+    pcall(vim.api.nvim_win_set_config, popup.win, { title = ' ' .. popup_label(popup) .. ' ' })
+  end
+end
+
+--- Zoom the open popup's diagram. `direction` is `'in'` or `'out'`.
+---
+--- Both directions are the same shape: ask the engine for a layout at a budget,
+--- check the answer, and adopt it or not. What differs is the budget and the
+--- checking.
+---
+--- There are three budgets and no fourth, so one of the two keys is always spent
+--- once the popup leaves the natural width, and the other is spent while it is
+--- still there. Either key pressed with nothing to ask for returns without
+--- reaching the engine, so holding it down costs nothing.
+function M.zoom(direction)
+  local popup = M.popup
+  -- A table's popup binds these keys and does nothing with them. The engine
+  -- wraps a cell that does not fit rather than discarding it, so a table has no
+  -- clipped state to escape and a smaller budget only makes it harder to read.
+  if not popup or popup.kind ~= 'mermaid' or not popup.block then
+    return
+  end
+
+  -- The two ends of the ladder. Zooming in restores the layout the popup opened
+  -- with, so while the popup is still on `'natural'` there is nothing to
+  -- restore; zooming out lands on the popup's inner width or on the floor, and
+  -- once it is on either there is no narrower whole layout left to ask for. Both
+  -- keys are therefore spent after one effective press — the check is here
+  -- rather than left to the engine so that a spent keypress is a no-op rather
+  -- than a round trip that comes back with the layout already on screen.
+  if direction == 'in' then
+    if popup.rung == 'natural' then
+      return
+    end
+  elseif popup.rung ~= 'natural' then
+    return
+  end
+
+  -- A zoom is up to two engine round trips deep, so a second keypress can start
+  -- before the first has landed. The older chain is abandoned rather than
+  -- racing the newer one into the buffer.
+  zoom_generation = zoom_generation + 1
+  local generation = zoom_generation
+  local function live()
+    return generation == zoom_generation and M.popup == popup
+  end
+
+  -- Zooming in asks for the largest budget the engine takes. That is the layout
+  -- the popup opened with, and nothing is clipped at that budget, so there is
+  -- nothing to verify before showing it.
+  if direction == 'in' then
+    M.render_at(MAX_BUDGET, function(err, doc)
+      if err or not live() then
+        return
+      end
+      M.adopt(doc, MAX_BUDGET, 'natural')
+    end)
+    return
+  end
+
+  -- Zooming out asks first for the popup's own inner width: the most permissive
+  -- budget that puts the whole diagram on screen at once, and the only one worth
+  -- asking for, since a smaller budget is strictly harder to fit.
+  local inner = popup.geometry.inner
+  M.render_at(inner, function(err, doc)
+    if err or not live() then
+      return
+    end
+
+    local width = doc_layout_width(doc)
+    -- An engine that does not report the field may have clipped this layout and
+    -- there is no way to tell. Unknown is not "fits": the popup keeps what it
+    -- has rather than adopt a crop it cannot recognise as one.
+    if width == nil or popup.layout_width == nil then
+      return
+    end
+
+    if width <= inner then
+      -- Whole within the popup, which is what was asked for. The width check
+      -- keeps a zoom *out* from ever landing on a wider layout than the one on
+      -- screen, whatever the engine does at a budget it has not seen before.
+      if width <= popup.layout_width then
+        M.adopt(doc, inner, 'fits')
+      end
+      return
+    end
+
+    -- The engine cannot lay the diagram out whole within the popup. Its own
+    -- report of the widest line it laid out is then a budget at which its layout
+    -- is whole by construction, so asking for exactly that lands on the floor:
+    -- the narrowest whole layout there is, and still narrower than the natural
+    -- one for any diagram that reaches this branch.
+    M.render_at(width, function(err2, doc2)
+      if err2 or not live() then
+        return
+      end
+      local floor = doc_layout_width(doc2)
+      -- Only a whole layout is ever adopted. A `floor` above `width` would mean
+      -- the second render clipped too, and one no narrower than what is already
+      -- on screen is not worth the redraw.
+      if floor == nil or floor > width or floor >= popup.layout_width then
+        return
+      end
+      M.adopt(doc2, width, 'floor')
+    end)
+  end)
 end
 
 return M

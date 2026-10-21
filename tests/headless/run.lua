@@ -197,7 +197,8 @@ section('8.1', function()
   expect('8.1 default theme', d.theme, 'catppuccin_mocha')
   eq_table('8.1 default filetypes', d.filetypes, { 'markdown' })
   eq_table('8.1 default keymaps', d.keymaps,
-    { toggle = '<leader>mr', write = '<C-s>', preview = '<CR>', follow = 'gf' })
+    { toggle = '<leader>mr', write = '<C-s>', preview = '<CR>', follow = 'gf',
+      zoom_in = '+', zoom_out = '-', scroll_left = '<C-h>', scroll_right = '<C-l>' })
   eq_table('8.1 default preview caps', d.preview,
     { max_width_pct = 0.9, max_height_pct = 0.9 })
   expect('8.1 default resize debounce', d.resize_debounce, 100)
@@ -1621,6 +1622,582 @@ section('12.2', function()
   eq_table('12.2 a URL goes to vim.ui.open', opened, { 'https://example.com/docs' })
 
   vim.ui.open = real_ui_open
+end)
+
+--------------------------------------------------------------------------------
+-- 13. Zoom
+--------------------------------------------------------------------------------
+
+--- The fixture whose diagram is wider than the popup's inner width and *can* be
+--- laid out whole inside it: 166 columns naturally, 69 at a 70-column budget.
+local zoom_diagram = repo .. '/tests/fixtures/zoom-diagram.md'
+
+--- The fixture whose diagram is wider than the popup and *cannot* be laid out
+--- whole inside it: 113 columns naturally, and no narrower than 108 at any
+--- budget. This is the case the floor fallback exists for.
+local floor_diagram = repo .. '/tests/fixtures/wide-diagram.md'
+
+--- Load `path` and wait for R.
+local function reset_to(path)
+  vim.cmd('edit! ' .. vim.fn.fnameescape(path))
+  md.attach(vim.api.nvim_get_current_buf(), vim.api.nvim_get_current_win())
+  return wait_until(showing_rendered)
+end
+
+--- The 0-based source line of the first `mermaid` fence in `st`'s document.
+---
+--- Scanned rather than hardcoded: a fixture's line numbers move whenever its
+--- prose does, and a check that names the wrong line fails for the wrong reason.
+local function fence_line(st)
+  for i, line in ipairs(vim.api.nvim_buf_get_lines(st.source, 0, -1, false)) do
+    if line:match('^%s*```mermaid%s*$') then
+      return i - 1
+    end
+  end
+  return nil
+end
+
+--- Open the preview on `path`'s first diagram, and return the popup.
+local function open_diagram(path, tag)
+  preview.close()
+  truthy(tag .. ' reset to ' .. vim.fn.fnamemodify(path, ':t'), reset_to(path))
+  local st = current_state()
+  local source = fence_line(st)
+  truthy(tag .. ' the fixture has a diagram', source ~= nil)
+  local row = source and render.row_for_source(st.doc, source)
+  truthy(tag .. ' the diagram has a display row', row ~= nil)
+  vim.api.nvim_win_set_cursor(st.win, { (row or 0) + 1, 0 })
+  feed(config.options.keymaps.preview)
+  truthy(tag .. ' the preview key opens a popup', wait_until(preview.is_open))
+  return preview.popup
+end
+
+--- The popup buffer's text, so that "the content did not change" is a comparison
+--- of the whole block rather than of one line of it.
+local function popup_text()
+  local popup = preview.popup
+  return popup and table.concat(vim.api.nvim_buf_get_lines(popup.buf, 0, -1, false), '\n')
+end
+
+--- The mapping for `key` in the current buffer, as `maparg`'s dictionary.
+local function mapping(key)
+  return vim.fn.maparg(key, 'n', false, true)
+end
+
+--- A window's title, with its chunks concatenated.
+local function window_title(win)
+  local cfg = vim.api.nvim_win_get_config(win)
+  if type(cfg.title) == 'string' then
+    return cfg.title
+  end
+  local text = ''
+  if type(cfg.title) == 'table' then
+    for _, chunk in ipairs(cfg.title) do
+      text = text .. (type(chunk) == 'table' and chunk[1] or tostring(chunk))
+    end
+  end
+  return text
+end
+
+--- A popup window's frame, for comparing it across a zoom.
+local function frame(win)
+  local cfg = vim.api.nvim_win_get_config(win)
+  return { width = cfg.width, height = cfg.height, row = cfg.row, col = cfg.col }
+end
+
+local function eq_frame(name, got, want)
+  check(name, vim.deep_equal(got, want),
+    string.format('got %s, want %s', vim.inspect(got), vim.inspect(want)))
+end
+
+--- How far `win`'s view is scrolled to the right, in display columns.
+local function leftcol(win)
+  return vim.api.nvim_win_call(win, function()
+    return vim.fn.winsaveview().leftcol
+  end)
+end
+
+section('13.1', function()
+  -- 3.2 the popup's state, and the re-render path
+  pcall(vim.cmd, 'only')
+
+  local popup = open_diagram(zoom_diagram, '13.1')
+  truthy('13.1 a diagram popup is open', popup ~= nil)
+  if not popup then
+    return
+  end
+
+  -- The popup keeps the block it is showing and the budget it was laid out at.
+  -- Neither can be read back out of the buffer once the engine has clipped: the
+  -- buffer holds the layout, not the block it came from.
+  truthy('13.1 the popup holds the block it is showing',
+    popup.block ~= nil and popup.block.kind == 'mermaid')
+  expect('13.1 and the budget it was laid out at', popup.budget, 65535)
+  expect('13.1 and the width the engine laid it out at', popup.layout_width, 166)
+  expect('13.1 and that width as the diagram\'s natural width', popup.natural_width, 166)
+
+  local before_frame = frame(popup.win)
+  local before_text = popup_text()
+
+  -- A re-render at another budget replaces the buffer's content in place. The
+  -- window is the thing that must not move: it keeps its id, its size and its
+  -- position, so the popup's inner width stays a constant for the life of the
+  -- popup and the next zoom decision cannot depend on the last one's output.
+  local done = false
+  preview.render_at(70, function(err, doc)
+    truthy('13.1 rendering at another budget succeeds', err == nil, err)
+    if doc then
+      preview.adopt(doc, 70, 'fits')
+    end
+    done = true
+  end)
+  truthy('13.1 the re-render lands', wait_until(function() return done end))
+
+  expect('13.1 the popup records the budget it was re-rendered at', popup.budget, 70)
+  truthy('13.1 and the content changed', popup_text() ~= before_text)
+  truthy('13.1 and the buffer still holds the same buffer',
+    vim.api.nvim_win_get_buf(popup.win) == popup.buf)
+  eq_frame('13.1 the window keeps its size and position across the re-render',
+    frame(popup.win), before_frame)
+
+  preview.close()
+end)
+
+section('13.2', function()
+  -- 3.3 the zoom keys
+  local popup = open_diagram(zoom_diagram, '13.2')
+  truthy('13.2 a diagram popup is open', popup ~= nil)
+  if not popup then
+    return
+  end
+
+  -- Both keys are bound in the popup's own buffer, alongside the close keys:
+  -- they act on the block the popup is showing, and the popup is where the
+  -- reader presses them.
+  local zoom_in = mapping(config.options.keymaps.zoom_in)
+  local zoom_out = mapping(config.options.keymaps.zoom_out)
+  truthy('13.2 the zoom-in key is bound in the popup', next(zoom_in) ~= nil)
+  truthy('13.2 the zoom-out key is bound in the popup', next(zoom_out) ~= nil)
+  expect('13.2 and it is a buffer-local mapping', zoom_out.buffer, 1)
+  truthy('13.2 and it is described as the zoom',
+    (zoom_out.desc or ''):find('zoom', 1, true) ~= nil, zoom_out.desc)
+
+  local opened = popup_text()
+  feed(config.options.keymaps.zoom_out)
+  truthy('13.2 the zoom-out key re-renders the diagram',
+    wait_until(function() return popup_text() ~= opened end))
+
+  -- A table's popup binds the same keys and does nothing with them. The engine
+  -- wraps a cell that does not fit rather than discarding it, so a table has no
+  -- clipped state to escape and a smaller budget only makes it harder to read.
+  preview.close()
+  truthy('13.2 reset to the wide fixture for the table', reset_to_wide())
+  local tst = current_state()
+  vim.api.nvim_win_set_cursor(tst.win, { render.row_for_source(tst.doc, 6) + 1, 0 })
+  feed(config.options.keymaps.preview)
+  truthy('13.2 the preview key opens a popup on a table', wait_until(preview.is_open))
+
+  local table_popup = preview.popup
+  local table_text = popup_text()
+  local table_frame = frame(table_popup.win)
+  truthy('13.2 the zoom-out key is bound in a table\'s popup too',
+    next(mapping(config.options.keymaps.zoom_out)) ~= nil)
+
+  -- Waited out rather than merely fed: a zoom that wrongly fired would answer
+  -- from the engine a few milliseconds later, and the check has to outlive it.
+  feed(config.options.keymaps.zoom_out)
+  vim.wait(400)
+  expect('13.2 zooming a table leaves its content unchanged', popup_text(), table_text)
+  expect('13.2 and leaves it laid out at its own budget',
+    table_popup.budget, table_popup.geometry.budget)
+  eq_frame('13.2 and leaves its window where it was', frame(table_popup.win), table_frame)
+  truthy('13.2 and leaves the popup open', preview.is_open())
+  preview.close()
+
+  -- 3.3 the keys are configurable, and the default stops working when they are.
+  local defaults = {
+    zoom_in = config.options.keymaps.zoom_in,
+    zoom_out = config.options.keymaps.zoom_out,
+  }
+  config.options.keymaps.zoom_in = '<C-p>'
+  config.options.keymaps.zoom_out = '<C-n>'
+
+  local rebound = open_diagram(zoom_diagram, '13.2')
+  truthy('13.2 a popup is open on the rebound keys', rebound ~= nil)
+  truthy('13.2 the configured zoom-out key is bound', next(mapping('<C-n>')) ~= nil)
+  truthy('13.2 and the default zoom-out key is not', next(mapping('-')) == nil)
+
+  local rebound_before = popup_text()
+  feed('<C-n>')
+  truthy('13.2 the configured key zooms out',
+    wait_until(function() return popup_text() ~= rebound_before end))
+  truthy('13.2 and the default key no longer does',
+    (function()
+      local at = popup_text()
+      feed(defaults.zoom_out)
+      vim.wait(400)
+      return popup_text() == at
+    end)())
+
+  preview.close()
+  config.options.keymaps.zoom_in = defaults.zoom_in
+  config.options.keymaps.zoom_out = defaults.zoom_out
+end)
+
+section('13.3', function()
+  -- 3.4 the zoom-out decision, against a diagram the engine can fit
+  local popup = open_diagram(zoom_diagram, '13.3')
+  truthy('13.3 a diagram popup is open', popup ~= nil)
+  if not popup then
+    return
+  end
+
+  local natural = popup.layout_width
+  local opened = popup_text()
+  local opened_frame = frame(popup.win)
+  truthy('13.3 the diagram opens wider than the popup\'s inner width',
+    natural > popup.geometry.inner, string.format('%d vs %d', natural, popup.geometry.inner))
+
+  feed(config.options.keymaps.zoom_out)
+  truthy('13.3 zooming out re-renders the diagram',
+    wait_until(function() return popup_text() ~= opened end))
+
+  -- The whole diagram, on screen at once: the popup asked for its own inner
+  -- width and the engine met it, so the content is now narrower than the frame
+  -- and no sideways scrolling is needed. The engine lands below the budget it
+  -- was asked for rather than on it — it sizes the wrap target proportionally —
+  -- so what "laid out within the popup" means is the budget it was given and a
+  -- width no greater than that.
+  expect('13.3 the diagram is laid out against the popup\'s inner width',
+    popup.budget, popup.geometry.inner)
+  truthy('13.3 and is whole within it',
+    popup.layout_width <= popup.geometry.inner,
+    string.format('%d vs %d', popup.layout_width, popup.geometry.inner))
+  truthy('13.3 which is narrower than it opened',
+    popup.layout_width < natural, string.format('%d vs %d', popup.layout_width, natural))
+  truthy('13.3 and the content fits the window it is in',
+    widest_buffer(popup.buf) <= opened_frame.width,
+    string.format('%d vs %d', widest_buffer(popup.buf), opened_frame.width))
+  eq_frame('13.3 and the window has not moved', frame(popup.win), opened_frame)
+  local zoomed_width = popup.layout_width
+
+  -- No participant is missing: the zoom narrowed the layout, it did not crop it.
+  local zoomed_text = popup_text()
+  for _, name in ipairs({ 'Client', 'Application', 'Gateway', 'Router', 'Response', 'Assembler' }) do
+    truthy('13.3 ' .. name .. ' survives the zoom',
+      zoomed_text:find(name, 1, true) ~= nil, zoomed_text)
+  end
+
+  -- Already within the popup, so asking again changes nothing.
+  feed(config.options.keymaps.zoom_out)
+  vim.wait(400)
+  expect('13.3 zooming out a diagram that already fits leaves the content alone',
+    popup_text(), zoomed_text)
+  expect('13.3 and leaves the recorded width alone', popup.layout_width, zoomed_width)
+
+  -- Zooming back in asks for the engine's largest budget, which is the layout
+  -- the popup opened with.
+  feed(config.options.keymaps.zoom_in)
+  truthy('13.3 zooming in restores the layout the popup opened with',
+    wait_until(function() return popup_text() == opened end))
+  expect('13.3 and records the largest budget again', popup.budget, 65535)
+  expect('13.3 and the natural width again', popup.layout_width, natural)
+  preview.close()
+
+  -- A diagram whose narrowest whole layout is still wider than the popup. The
+  -- floor is measured: `wide-diagram.md` is 113 columns naturally and 108 is the
+  -- narrowest budget at which the engine lays it out whole (107 clips it). The
+  -- assertions around the number are the spec's claims; the number itself is
+  -- what makes "narrowest whole layout" checkable, so it is pinned here and has
+  -- to be re-measured if the engine's compaction changes.
+  local floor_popup = open_diagram(floor_diagram, '13.3')
+  truthy('13.3 the floor fixture opened', floor_popup ~= nil)
+  if not floor_popup then
+    return
+  end
+
+  local floor_natural = floor_popup.layout_width
+  local floor_opened = popup_text()
+  expect('13.3 the floor fixture opens at its natural width', floor_natural, 113)
+
+  feed(config.options.keymaps.zoom_out)
+  truthy('13.3 zooming out the floor diagram re-renders it',
+    wait_until(function() return popup_text() ~= floor_opened end))
+
+  expect('13.3 the fallback lands on the narrowest whole layout',
+    floor_popup.layout_width, 108)
+  truthy('13.3 which is narrower than it opened',
+    floor_popup.layout_width < floor_natural)
+  truthy('13.3 and still wider than the popup\'s inner width',
+    floor_popup.layout_width > floor_popup.geometry.inner,
+    string.format('%d vs %d', floor_popup.layout_width, floor_popup.geometry.inner))
+
+  -- Whole rather than cropped, which is the one thing the fallback must not get
+  -- wrong: the engine measures `layout_width` before it clips, so a layout no
+  -- wider than the budget it was asked for is a layout nothing was dropped from.
+  truthy('13.3 the layout it lands on is whole',
+    floor_popup.layout_width <= floor_popup.budget,
+    string.format('%d vs %d', floor_popup.layout_width, floor_popup.budget))
+
+  local floor_text = popup_text()
+  for _, name in ipairs({ 'Client', 'Gateway', 'Steering', 'Backend' }) do
+    truthy('13.3 ' .. name .. ' survives the floor fallback',
+      floor_text:find(name, 1, true) ~= nil, floor_text)
+  end
+
+  -- At the floor, another zoom-out changes nothing: the diagram is already at
+  -- the narrowest whole layout there is.
+  feed(config.options.keymaps.zoom_out)
+  vim.wait(400)
+  expect('13.3 zooming out at the floor leaves the content byte-identical',
+    popup_text(), floor_text)
+  expect('13.3 and leaves the recorded width alone', floor_popup.layout_width, 108)
+
+  feed(config.options.keymaps.zoom_in)
+  truthy('13.3 and zooming in from the floor restores the opening layout',
+    wait_until(function() return popup_text() == floor_opened end))
+  preview.close()
+end)
+
+section('13.4', function()
+  -- 3.5 an engine that does not report `layout_width`
+  local popup = open_diagram(zoom_diagram, '13.4')
+  truthy('13.4 a diagram popup is open', popup ~= nil)
+  if not popup then
+    return
+  end
+
+  local before = popup_text()
+  local before_frame = frame(popup.win)
+
+  -- An engine older than the field: it answers, but it does not say how wide it
+  -- laid the document out. The popup cannot tell whether that answer is whole,
+  -- and unknown is not "fits" — a missing number read as a small one would adopt
+  -- a crop believing it whole.
+  local real = preview.render_block
+  preview.render_block = function(_, _, _, cb)
+    cb(nil, { lines = { { spans = {} } }, styles = {}, source_map = {} })
+  end
+
+  feed(config.options.keymaps.zoom_out)
+  vim.wait(400)
+  preview.render_block = real
+
+  expect('13.4 a zoom-out against an engine with no layout_width changes nothing',
+    popup_text(), before)
+  expect('13.4 and leaves the recorded width alone', popup.layout_width, 166)
+  expect('13.4 and leaves the budget alone', popup.budget, 65535)
+  eq_frame('13.4 and leaves the window alone', frame(popup.win), before_frame)
+  truthy('13.4 and leaves the popup open', preview.is_open())
+  preview.close()
+end)
+
+section('13.5', function()
+  -- 3.6 the zoom state is visible
+  local popup = open_diagram(floor_diagram, '13.5')
+  truthy('13.5 a diagram popup is open', popup ~= nil)
+  if not popup then
+    return
+  end
+
+  local unzoomed_name = vim.api.nvim_buf_get_name(popup.buf)
+  local unzoomed_title = window_title(popup.win)
+  truthy('13.5 the buffer is named after the popup', unzoomed_name ~= '', unzoomed_name)
+  truthy('13.5 an unzoomed popup names the block kind',
+    unzoomed_title:find('mermaid', 1, true) ~= nil, unzoomed_title)
+  truthy('13.5 and reports no width, because none has changed',
+    unzoomed_title:find('%d') == nil, unzoomed_title)
+
+  feed(config.options.keymaps.zoom_out)
+  truthy('13.5 zooming out re-renders the diagram',
+    wait_until(function()
+      return vim.api.nvim_buf_get_name(popup.buf) ~= unzoomed_name
+    end))
+
+  local zoomed_name = vim.api.nvim_buf_get_name(popup.buf)
+  local zoomed_title = window_title(popup.win)
+  truthy('13.5 the buffer name changes when the diagram is zoomed',
+    zoomed_name ~= unzoomed_name, zoomed_name)
+  truthy('13.5 and carries the width it is laid out at',
+    zoomed_name:find('108', 1, true) ~= nil, zoomed_name)
+  truthy('13.5 and the width it opened with',
+    zoomed_name:find('113', 1, true) ~= nil, zoomed_name)
+  truthy('13.5 the title carries both numbers too',
+    zoomed_title:find('108', 1, true) ~= nil and zoomed_title:find('113', 1, true) ~= nil,
+    zoomed_title)
+  truthy('13.5 and still names the block kind',
+    zoomed_title:find('mermaid', 1, true) ~= nil, zoomed_title)
+
+  -- Zooming back in takes the label back to the plain one: a diagram that is
+  -- simply that wide must not be described as zoomed.
+  feed(config.options.keymaps.zoom_in)
+  truthy('13.5 zooming in takes the name back',
+    wait_until(function()
+      return vim.api.nvim_buf_get_name(popup.buf) == unzoomed_name
+    end))
+  expect('13.5 and the title back', window_title(popup.win), unzoomed_title)
+  preview.close()
+end)
+
+section('13.6', function()
+  -- A zoom key with nothing left to ask for does not reach the engine.
+  --
+  -- The popup has three budgets and no fourth, so one effective press spends one
+  -- of the two keys and leaves the other live. The spent one must cost nothing:
+  -- a reader holding it down is asking the same question over and over, and an
+  -- engine round trip that comes back with the layout already on screen is a
+  -- process spawned to answer it.
+  local popup = open_diagram(floor_diagram, '13.6')
+  truthy('13.6 a diagram popup is open', popup ~= nil)
+  if not popup then
+    return
+  end
+
+  -- The floor rung: the first press lands on the narrowest whole layout, and
+  -- there is no narrower one to ask for.
+  local opened = popup_text()
+  feed(config.options.keymaps.zoom_out)
+  truthy('13.6 the first zoom-out re-renders the diagram',
+    wait_until(function() return popup_text() ~= opened end))
+
+  local floor_text = popup_text()
+  local before = engine_calls
+  feed(config.options.keymaps.zoom_out)
+  vim.wait(400)
+  expect('13.6 a second zoom-out spawns no engine', engine_calls, before)
+  expect('13.6 and leaves the content alone', popup_text(), floor_text)
+
+  -- Zooming in is the live key now, and it is spent in turn.
+  feed(config.options.keymaps.zoom_in)
+  truthy('13.6 zooming in restores the opening layout',
+    wait_until(function() return popup_text() == opened end))
+
+  before = engine_calls
+  feed(config.options.keymaps.zoom_in)
+  vim.wait(400)
+  expect('13.6 a second zoom-in spawns no engine', engine_calls, before)
+  expect('13.6 and leaves the content alone', popup_text(), opened)
+  preview.close()
+
+  -- The same at the other rung, where the engine met the popup's inner width
+  -- rather than falling back to its floor.
+  local fitting = open_diagram(zoom_diagram, '13.6')
+  truthy('13.6 the fitting fixture opened', fitting ~= nil)
+  if not fitting then
+    return
+  end
+
+  local fitting_opened = popup_text()
+  feed(config.options.keymaps.zoom_out)
+  truthy('13.6 zooming the fitting diagram out re-renders it',
+    wait_until(function() return popup_text() ~= fitting_opened end))
+
+  local fitting_zoomed = popup_text()
+  before = engine_calls
+  feed(config.options.keymaps.zoom_out)
+  vim.wait(400)
+  expect('13.6 zooming out at the popup\'s own width spawns no engine',
+    engine_calls, before)
+  expect('13.6 and leaves the content alone', popup_text(), fitting_zoomed)
+  preview.close()
+end)
+
+section('13.7', function()
+  -- 3.11 the scroll keys
+  local popup = open_diagram(floor_diagram, '13.7')
+  truthy('13.7 a diagram popup is open', popup ~= nil)
+  if not popup then
+    return
+  end
+
+  local scroll_left = mapping(config.options.keymaps.scroll_left)
+  local scroll_right = mapping(config.options.keymaps.scroll_right)
+  truthy('13.7 the scroll-left key is bound in the popup', next(scroll_left) ~= nil)
+  truthy('13.7 the scroll-right key is bound in the popup', next(scroll_right) ~= nil)
+  expect('13.7 and it is a buffer-local mapping', scroll_right.buffer, 1)
+  truthy('13.7 and it is described as scrolling',
+    (scroll_right.desc or ''):find('scroll', 1, true) ~= nil, scroll_right.desc)
+
+  -- The step is the reader's own horizontal wheel step, so that the key and a
+  -- tilt wheel move the view by the same amount.
+  local step = tonumber(vim.o.mousescroll:match('hor%a*:(%d+)')) or 6
+  truthy('13.7 the fixture\'s diagram is wider than the popup',
+    widest_buffer(popup.buf) > frame(popup.win).width,
+    string.format('%d vs %d', widest_buffer(popup.buf), frame(popup.win).width))
+  expect('13.7 the popup opens at its left edge', leftcol(popup.win), 0)
+
+  local opened = popup_text()
+  local opened_frame = frame(popup.win)
+  local before = engine_calls
+
+  feed(config.options.keymaps.scroll_right)
+  expect('13.7 the scroll-right key moves the view by the wheel step',
+    leftcol(popup.win), step)
+
+  -- Held down, the key repeats, and each repeat is one more step: this is what
+  -- the two-key `zl` cannot do, since there is no single key to hold.
+  feed(config.options.keymaps.scroll_right)
+  expect('13.7 and repeated presses accumulate', leftcol(popup.win), step * 2)
+
+  feed(config.options.keymaps.scroll_left)
+  expect('13.7 the scroll-left key moves it back', leftcol(popup.win), step)
+
+  feed(config.options.keymaps.scroll_left)
+  feed(config.options.keymaps.scroll_left)
+  expect('13.7 and stops at the left edge', leftcol(popup.win), 0)
+
+  -- Scrolling is not a re-render: the block is the one the popup already held,
+  -- moved under the window rather than laid out again.
+  expect('13.7 scrolling leaves the content alone', popup_text(), opened)
+  expect('13.7 and spawns no engine', engine_calls, before)
+  eq_frame('13.7 and leaves the window where it was', frame(popup.win), opened_frame)
+  preview.close()
+
+  -- Bound in a table's popup as well, and not inert there: a table is laid out
+  -- at a budget floored at the window's, so it can be wider than the popup too.
+  truthy('13.7 reset to the wide fixture for the table', reset_to_wide())
+  local tst = current_state()
+  vim.api.nvim_win_set_cursor(tst.win, { render.row_for_source(tst.doc, 6) + 1, 0 })
+  feed(config.options.keymaps.preview)
+  truthy('13.7 the preview key opens a popup on a table', wait_until(preview.is_open))
+
+  local table_popup = preview.popup
+  truthy('13.7 the scroll keys are bound in a table\'s popup too',
+    next(mapping(config.options.keymaps.scroll_right)) ~= nil)
+  truthy('13.7 and that table is wider than its popup',
+    widest_buffer(table_popup.buf) > frame(table_popup.win).width,
+    string.format('%d vs %d',
+      widest_buffer(table_popup.buf), frame(table_popup.win).width))
+  feed(config.options.keymaps.scroll_right)
+  expect('13.7 so the key scrolls a table\'s popup too', leftcol(table_popup.win), step)
+  preview.close()
+
+  -- 3.11 the keys are configurable, and the default stops working when they are.
+  local defaults = {
+    scroll_left = config.options.keymaps.scroll_left,
+    scroll_right = config.options.keymaps.scroll_right,
+  }
+  config.options.keymaps.scroll_left = '<C-b>'
+  config.options.keymaps.scroll_right = '<C-f>'
+
+  local rebound = open_diagram(floor_diagram, '13.7')
+  truthy('13.7 a popup is open on the rebound scroll keys', rebound ~= nil)
+  truthy('13.7 the configured scroll-right key is bound', next(mapping('<C-f>')) ~= nil)
+
+  feed('<C-f>')
+  expect('13.7 the configured key scrolls', leftcol(rebound.win), step)
+
+  -- The default key has to be checked by what it does rather than by `maparg`:
+  -- Neovim maps `<C-l>` globally to `nohlsearch` and a redraw, so it is never
+  -- absent. What the rebinding takes away is the scrolling, and that is what is
+  -- asserted — the popup keeps the position the configured key left it at.
+  local scrolled_to = leftcol(rebound.win)
+  feed(defaults.scroll_right)
+  expect('13.7 and the default key no longer scrolls', leftcol(rebound.win), scrolled_to)
+  preview.close()
+
+  config.options.keymaps.scroll_left = defaults.scroll_left
+  config.options.keymaps.scroll_right = defaults.scroll_right
 end)
 
 --------------------------------------------------------------------------------

@@ -168,6 +168,10 @@ require('md-render').setup({
     write = '<C-s>',
     preview = '<CR>',
     follow = 'gf',
+    zoom_in = '+',                -- in the preview popup, on a diagram
+    zoom_out = '-',
+    scroll_left = '<C-h>',        -- in the preview popup, on any block
+    scroll_right = '<C-l>',
   },
   preview = {                   -- the popup's caps, as fractions of the editor
     max_width_pct = 0.9,
@@ -182,7 +186,13 @@ Every field is optional and the merge is deep, so `setup{ keymaps = { toggle =
 'gm' } }` keeps the write key. A filetype that is not listed is left alone
 entirely: no state, no autocmds, no keymaps. Setting `keymaps.toggle`,
 `keymaps.write`, `keymaps.preview` or `keymaps.follow` to `false` leaves that
-key alone.
+key alone, and so do `keymaps.zoom_in`, `keymaps.zoom_out`, `keymaps.scroll_left`
+and `keymaps.scroll_right`.
+
+The four preview keys are set in the popup's own buffer rather than in R or S,
+because they act on the block the popup is showing. They are deliberately not in
+the keymap table above: that table describes R and S, and these keys belong to
+neither.
 
 ### The block preview
 
@@ -205,16 +215,65 @@ not fit:
   a table loses nothing at any budget, and a larger one would only spread its
   columns out.
 
+A diagram's width is not a fact about it, though. The engine re-lays one out
+against the budget it is given — narrowing the gaps, and wrapping node and
+message labels — and only clips what is still too wide after that. So asking for
+a smaller budget buys a narrower diagram, at the price of a taller one.
+
+`+` and `-` in the popup make that choice. They re-lay the diagram out at
+another budget and replace the popup's content in place; the window does not
+move, so the diagram on screen never shifts under the cursor.
+
+- `-` asks for the popup's own inner width, which is the most the popup can show
+  at once.
+- `+` asks for the largest budget again, restoring the layout the popup opened
+  with.
+
+Neither key ever shows a diagram with columns missing. Where the engine cannot
+lay one out whole within the popup it lays it out at the narrowest budget at
+which it *can* lay it whole, so a diagram still too wide to fit without
+scrolling is nonetheless narrower than it opened, and whole.
+
+That is the whole ladder — the natural width, the popup's inner width, and that
+narrowest whole layout — so one press spends one of the two keys and leaves the
+other. Where the diagram is already at the narrowest layout, or already fits, `-`
+does nothing; once it is zoomed out, `+` is the live key. A key with nothing to
+ask for returns without reaching the engine, so holding it down costs nothing.
+Once the diagram is narrower than it opened, the popup's title says by how much —
+the width it is laid out at, then the width it opened with.
+
+In a table's popup the keys are bound and do nothing: the engine wraps a table's
+cells rather than discarding them, so a table has nothing to zoom away from, and
+a smaller budget would only make it harder to read.
+
+`<C-l>` and `<C-h>` scroll the popup sideways, a step per press, and can be held
+down. Vim's own sideways scrolling is `zl` and `zh` — two keystrokes each, so
+there is no key to hold, and crossing a block wider than the popup means
+alternating `z` and `l` by hand. These are one key each, so holding one keeps the
+view moving. The step is the horizontal step of your own `'mousescroll'` (6
+columns by default), so the keys and a tilt wheel move the view by the same
+amount.
+
+Unlike the zoom keys, these do something in a table's popup too: a table is laid
+out at the popup's inner width floored at the window's, so it can be wider than
+the popup as well, and its columns past the edge are reached the same way.
+
+`<C-l>` is one of Neovim's own mappings — `nohlsearch`, then a redraw — and in
+the popup it is taken for scrolling. The mapping is buffer-local, so R and S keep
+theirs, and `:nohlsearch` still works from the command line.
+
 The popup is sized to fit the block and capped at `preview.max_width_pct` and
 `preview.max_height_pct` of the editor. It is an ordinary buffer — scroll it,
-search it, yank from it — but not a modifiable one, and it is not listed.
+search it, yank from it — but not a modifiable one, and it is not listed. Zooming
+changes its content, never its frame, which is why a zoomed-out diagram has dead
+space to its right.
 
 `<CR>`, `q` and `Esc` close it, and the window underneath is left exactly as it
 was. On anything else — prose, a non-diagram fence, a list — `<CR>` does its
 ordinary job, so the key is safe to press anywhere.
 
-The popup is a second reading of the block, not a zoom of the first: because the
-layout follows the budget, it can be *arranged* differently from the window's
+The popup is a second reading of the block, not a magnifier of the first: because
+the layout follows the budget, it can be *arranged* differently from the window's
 copy. What it guarantees is that the whole block is there.
 
 ### Tests

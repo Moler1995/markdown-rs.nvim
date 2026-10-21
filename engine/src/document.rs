@@ -75,6 +75,7 @@ pub fn layout_document(
     WireDoc {
         version: WIRE_VERSION,
         width,
+        layout_width: crate::cast::u16_sat(layout.layout_width),
         styles: layout.styles.into_styles(),
         lines,
         source_map,
@@ -92,6 +93,16 @@ struct Layout<'a> {
     max_source: u32,
     styles: StyleTable,
     lines: Vec<WireLine>,
+    /// The widest display line laid out so far, measured before any clipping.
+    ///
+    /// Every path but the diagram one wraps to the target width, so the lines
+    /// `push` receives are already the laid-out lines and this is simply the
+    /// widest of them. The diagram path truncates instead, so it records the
+    /// width of the artwork line it is about to cut down — otherwise the one
+    /// truncation in the engine would be the one thing this could not see, and
+    /// a caller comparing it against `width` would be told the document fits
+    /// while columns were missing.
+    layout_width: usize,
 }
 
 impl<'a> Layout<'a> {
@@ -102,7 +113,13 @@ impl<'a> Layout<'a> {
             max_source: crate::cast::u32_sat(source_line_count.saturating_sub(1)),
             styles: StyleTable::new(),
             lines: Vec::new(),
+            layout_width: 0,
         }
+    }
+
+    /// Record that a line this wide was laid out.
+    fn note_width(&mut self, width: usize) {
+        self.layout_width = self.layout_width.max(width);
     }
 
     /// Wrap `line` to the target width and append the result.
@@ -113,6 +130,7 @@ impl<'a> Layout<'a> {
         let source = source.map(|s| s.min(self.max_source));
         for wrapped in wrap_spans(&line.spans, self.width) {
             let line = wrapped.to_line();
+            self.note_width(line.width());
             self.lines.push(self.styles.line(source, &line));
         }
     }
@@ -146,6 +164,10 @@ impl<'a> Layout<'a> {
         match render_text(source, Some(self.width as usize), MermaidTextBackend::Auto) {
             Ok(art) => {
                 for line in art.lines() {
+                    // Measured before the clip, so a caller can tell that this
+                    // line was cut down. `push` then measures the clipped line
+                    // too, which can only be narrower.
+                    self.note_width(line.width());
                     let line = clip_to_width(line, self.width as usize);
                     self.push(Some(source_line), &Line::from(Span::styled(line, art_style)));
                 }
@@ -370,14 +392,27 @@ mod tests {
         );
     }
 
-    /// A sequence diagram is the case that motivated clipping: the layout
-    /// backend ignores the width hint for them, so anything past a toy example
-    /// comes back wider than a narrow window.
+    /// A sequence diagram for the clipping tests below.
+    ///
+    /// A sequence diagram is the case that motivated clipping, and it is also
+    /// the case that now usually avoids it: the renderer wraps its labels and
+    /// scans the wrap targets for the shortest layout that fits, so a budget it
+    /// can meet leaves nothing to truncate. These tests use `TRUNCATING_WIDTH`,
+    /// below the narrowest layout it can be compacted to.
     const WIDE_SEQUENCE: &str = "```mermaid\nsequenceDiagram\n    participant A as Client\n    participant B as Server\n    A->>B: a long enough request label\n    B-->>A: a long enough response\n```\n";
+
+    /// A budget below the narrowest layout `WIDE_SEQUENCE` can be compacted to
+    /// (35 columns, re-measured after the compaction change and unchanged —
+    /// neither label has an unbreakable token, so there is no gap for the
+    /// second wrapping pass to fill), which is what it takes to leave a diagram
+    /// with something truncated: at any budget the diagram can meet, the engine
+    /// re-lays it out to fit and there is no excess for `layout_width` to
+    /// report.
+    const TRUNCATING_WIDTH: u16 = 30;
 
     #[test]
     fn an_over_wide_diagram_is_drawn_and_clipped_rather_than_dumped_as_source() {
-        let width = 40u16;
+        let width = TRUNCATING_WIDTH;
         let doc = layout(WIDE_SEQUENCE, width);
 
         let text = lines_text(&doc);
@@ -400,8 +435,56 @@ mod tests {
     }
 
     #[test]
+    fn layout_width_is_the_widest_line_when_nothing_is_truncated() {
+        let doc = layout("# Hi\n\nplain **bold** text\n", 40);
+
+        assert_eq!(doc.layout_width, 15, "`plain bold text` is the widest line");
+        assert!(doc.layout_width <= doc.width);
+        assert_eq!(
+            doc.layout_width as usize,
+            doc.lines.iter().map(display_width).max().unwrap_or(0),
+            "with nothing truncated, the reported width is the widest line emitted"
+        );
+    }
+
+    #[test]
+    fn layout_width_is_taken_before_truncation() {
+        let width = TRUNCATING_WIDTH;
+        let doc = layout(WIDE_SEQUENCE, width);
+
+        assert!(
+            doc.layout_width > width,
+            "the sequence diagram is wider than {width}, so the reported layout \
+             width must say so, got {}",
+            doc.layout_width
+        );
+        for line in &doc.lines {
+            assert!(
+                display_width(line) <= width as usize,
+                "the emitted lines still fit {width}, so the excess exists only \
+                 in the reported width"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapping_never_reports_a_width_above_the_budget() {
+        // Prose wraps rather than truncating, so a paragraph far wider than the
+        // budget must not push `layout_width` above it — otherwise a reader
+        // would read a wrapped document as a truncated one.
+        let doc = layout(&"word ".repeat(200), 40);
+
+        assert!(
+            doc.layout_width <= doc.width,
+            "wrapped prose reports {} against a budget of {}",
+            doc.layout_width,
+            doc.width
+        );
+    }
+
+    #[test]
     fn clipping_keeps_one_display_line_per_artwork_row() {
-        let width = 40u16;
+        let width = TRUNCATING_WIDTH;
         let source = WIDE_SEQUENCE
             .trim_start_matches("```mermaid\n")
             .trim_end_matches("```\n");

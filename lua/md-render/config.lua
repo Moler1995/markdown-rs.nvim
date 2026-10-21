@@ -32,11 +32,26 @@ M.defaults = {
   -- resolves the link there. It shadows `gf` in a managed buffer, and hands the
   -- key back to Vim when the cursor is not on a link, so a bare path still
   -- opens the way it always did.
+  --
+  -- `zoom_in` and `zoom_out` are set in the preview popup's buffer rather than
+  -- in R or S, because they act on the block the popup is showing. In a table's
+  -- popup they are bound and do nothing: the engine wraps a table's cells rather
+  -- than discarding them, so a table has nothing to zoom away from.
+  --
+  -- `scroll_left` and `scroll_right` are set there too, and for the same reason.
+  -- They are the popup's sideways scrolling on one key each, because `zh` and
+  -- `zl` are two keystrokes: there is no key to hold down, so a reader cannot
+  -- cross a wide block by holding one. Unlike the zoom keys these do something
+  -- in a table's popup, which can be wider than the popup as well.
   keymaps = {
     toggle = '<leader>mr',
     write = '<C-s>',
     preview = '<CR>',
     follow = 'gf',
+    zoom_in = '+',
+    zoom_out = '-',
+    scroll_left = '<C-h>',
+    scroll_right = '<C-l>',
   },
 
   -- The preview popup's caps, as fractions of the editor's size. The popup is

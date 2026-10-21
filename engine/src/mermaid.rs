@@ -46,8 +46,8 @@ pub enum MermaidTextBackend {
 ///
 /// * `source` – raw mermaid source text.
 /// * `max_width` – optional column budget; when `Some(w)` the renderer
-///   progressively compacts gap sizes until the output fits within `w`
-///   columns. `None` renders at natural size.
+///   compacts the diagram until it fits within `w` columns, choosing the
+///   shortest arrangement that does. `None` renders at natural size.
 /// * `backend` – the layered-layout backend to use for flowchart and state
 ///   diagrams. Other diagram types ignore this.
 ///

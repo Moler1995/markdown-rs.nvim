@@ -166,8 +166,53 @@ fn no_fixture_emits_a_line_wider_than_the_requested_width() {
                     display_width(line)
                 );
             }
+            // The width guarantee says nothing about what was dropped to keep
+            // it. `layout_width` is the other half of that story, and it must
+            // never under-report the lines that were emitted — a caller reading
+            // it as "at most the budget" would otherwise read a truncated
+            // document as a whole one.
+            let widest = doc.lines.iter().map(display_width).max().unwrap_or(0);
+            assert!(
+                doc.layout_width as usize >= widest,
+                "{name} at width {width}: reported layout width {} is below the \
+                 widest emitted line ({widest}), so a truncation could go unseen",
+                doc.layout_width
+            );
         }
     }
+}
+
+#[test]
+fn a_fixture_that_is_too_wide_says_so_in_its_layout_width() {
+    // The sweep above cannot tell "reported the widest line" apart from
+    // "reported something at least that wide" — both hold for a document that
+    // fits. This pins the other direction, on a fixture and a width where the
+    // engine really does truncate.
+    let (name, content) = fixtures()
+        .into_iter()
+        .find(|(name, _)| name == "diagrams")
+        .expect("the corpus has a diagrams fixture");
+
+    let narrow = SWEEP_WIDTHS
+        .iter()
+        .copied()
+        .min()
+        .expect("the sweep has widths");
+    let doc = render(&content, narrow);
+
+    let widest = doc.lines.iter().map(display_width).max().unwrap_or(0);
+    assert!(
+        doc.layout_width > narrow,
+        "{name} at width {narrow}: the diagrams cannot fit, so the layout width \
+         must exceed the budget, got {}",
+        doc.layout_width
+    );
+    assert!(
+        doc.layout_width as usize > widest,
+        "{name} at width {narrow}: the layout width ({}) must exceed the widest \
+         emitted line ({widest}), which is what shows columns were dropped",
+        doc.layout_width
+    );
 }
 
 #[test]
