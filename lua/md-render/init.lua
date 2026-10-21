@@ -107,6 +107,25 @@ local function new_rendered_buffer(st)
   return buf
 end
 
+--- True when `st`'s window still shows one of the buffers that belong to it.
+---
+--- A window is not ours to rearrange once something else has put a buffer in
+--- it: `:edit`, a file tree's split, any plugin that repurposes the window. The
+--- state stays behind otherwise, and the next refresh — or a render already in
+--- flight — would swap R back in and take the window from whatever took it.
+---
+--- `inherited` is the exception, and it is not a foreign buffer: a window split
+--- off R legitimately shows the *other* window's rendered buffer until its own
+--- first render answers. Counting that as someone else's would throw the state
+--- away at the one moment it is working correctly.
+local function still_ours(st)
+  if not vim.api.nvim_win_is_valid(st.win) then
+    return false
+  end
+  local shown = vim.api.nvim_win_get_buf(st.win)
+  return shown == st.source or shown == st.rendered or shown == st.inherited
+end
+
 --- Show `doc` in R in `st`'s window.
 ---
 --- The cursor is placed by mapping the source position rather than by
@@ -115,7 +134,8 @@ end
 --- lands on the source line being read.
 local function show_rendered(st, doc)
   local win = st.win
-  if not vim.api.nvim_win_is_valid(win) then
+  if not still_ours(st) then
+    state.forget(win)
     return
   end
 
@@ -148,6 +168,10 @@ local function show_rendered(st, doc)
   end
 
   vim.api.nvim_win_set_buf(win, buf)
+
+  -- Its own rendered buffer is in the window now, so the one inherited from the
+  -- window it was split off is no longer what this state is entitled to.
+  st.inherited = nil
 
   -- Measured on 0.12.6: none of the swap paths re-list an unlisted buffer. The
   -- option is what keeps R out of `:ls` and `:bnext`, though, so it is cheap
@@ -184,7 +208,8 @@ end
 --- then it is what they meant.
 local function show_source(st)
   local win = st.win
-  if not vim.api.nvim_win_is_valid(win) then
+  if not still_ours(st) then
+    state.forget(win)
     return
   end
   local source = st.source
@@ -205,6 +230,7 @@ local function show_source(st)
   if vim.api.nvim_win_get_buf(win) ~= source then
     vim.api.nvim_win_set_buf(win, source)
   end
+  st.inherited = nil
 
   if st.source_view then
     vim.fn.winrestview(st.source_view)
@@ -390,6 +416,17 @@ function M.attach(buf, win)
     state.forget(win)
     st = state.get(win)
   end
+  -- A window split off a window showing R starts out showing that window's
+  -- rendered buffer, and keeps showing it until this state's first render
+  -- answers. Recorded so `still_ours` can tell it apart from a buffer somebody
+  -- else has put in the window.
+  if st.rendered == nil then
+    local shown = vim.api.nvim_win_get_buf(win)
+    if state.by_rendered[shown] then
+      st.inherited = shown
+    end
+  end
+
   st.source = buf
   st.want = 'R'
   st.reported = nil
@@ -767,7 +804,8 @@ function M.setup_autocmds()
       if cfg.relative ~= '' or cfg.external then
         return
       end
-      local owner = state.by_rendered[vim.api.nvim_win_get_buf(win)]
+      local inherited = vim.api.nvim_win_get_buf(win)
+      local owner = state.by_rendered[inherited]
       if not owner then
         return
       end
@@ -775,9 +813,30 @@ function M.setup_autocmds()
       -- The second condition is what stops this from re-entering itself:
       -- attaching swaps a rendered buffer into a window, and by the time that
       -- is done the window has state of its own.
-      if st and st.source and state.windows[win] == nil then
-        M.attach(st.source, win)
+      if not (st and st.source) or state.windows[win] ~= nil then
+        return
       end
+
+      -- Deferred, and re-checked against the buffer the window inherited.
+      --
+      -- A window shows the buffer it inherited for a moment whether it was
+      -- split from R or split by a plugin that is about to put its own buffer
+      -- there — `:Lexplore` is the one that found this: netrw splits, inherits
+      -- R, and opens its tree in that window. At `WinEnter` the two are
+      -- indistinguishable. By the next tick a genuine split still shows the
+      -- rendered buffer; netrw's window shows its tree, and is left alone.
+      vim.schedule(function()
+        if not vim.api.nvim_win_is_valid(win) or state.windows[win] ~= nil then
+          return
+        end
+        if vim.api.nvim_win_get_buf(win) ~= inherited then
+          return
+        end
+        local owner_st = state.windows[owner]
+        if owner_st and owner_st.source then
+          M.attach(owner_st.source, win)
+        end
+      end)
     end,
   })
 

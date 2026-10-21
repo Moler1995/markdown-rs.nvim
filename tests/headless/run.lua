@@ -718,6 +718,14 @@ section('10.3', function()
   -- split below narrows this window.
   local before = engine_calls
   vim.cmd('vsplit')
+  local split = vim.api.nvim_get_current_win()
+  -- The attach is deferred by a tick — see the `WinEnter` handler — so the
+  -- split's own render is counted after waiting for it rather than at the
+  -- moment `:vsplit` returns.
+  truthy('10.3 the split\'s own window is attached', wait_until(function()
+    local split_st = state.windows[split]
+    return split_st ~= nil and split_st.mode == 'R'
+  end))
   local split_cost = engine_calls - before
   local after_split = engine_calls
   for _ = 1, 8 do
@@ -984,6 +992,59 @@ section('10.7', function()
     vim.api.nvim_buf_get_lines(other.rendered, 0, 3, false), lines)
 
   vim.cmd('close')
+end)
+
+--------------------------------------------------------------------------------
+-- 10.8 A window another plugin fills
+--------------------------------------------------------------------------------
+
+section('10.8', function()
+  truthy('10.8 in R', reset_to_r())
+  local reading = current_state()
+
+  -- Reaching netrw under `nvim -l`, which loads no plugins of its own.
+  vim.cmd('runtime plugin/netrwPlugin.vim')
+
+  -- What `<leader>e` does in a typical config. Netrw splits the window first —
+  -- inheriting R — and only then puts its tree in the new one, which is exactly
+  -- the moment the split handler fires. That made the handler attach the new
+  -- window as a second md-render window: it got a rendered buffer of its own,
+  -- and the tree was never seen.
+  vim.cmd('Lexplore')
+  local tree
+  truthy('10.8 :Lexplore opens a netrw window', wait_until(function()
+    for _, w in ipairs(vim.api.nvim_list_wins()) do
+      if vim.bo[vim.api.nvim_win_get_buf(w)].filetype == 'netrw' then
+        tree = w
+        return true
+      end
+    end
+    return false
+  end))
+  expect('10.8 the tree window is not attached to md-render', state.windows[tree], nil)
+  expect('10.8 and the window is showing the tree',
+    vim.bo[vim.api.nvim_win_get_buf(tree)].filetype, 'netrw')
+
+  -- A refresh walks every attached window; the tree's is not one of them.
+  vim.cmd('doautocmd VimResized')
+  vim.wait(config.options.resize_debounce + 100)
+  expect('10.8 a refresh leaves the tree window alone', state.windows[tree], nil)
+  expect('10.8 and the tree is still what it shows',
+    vim.bo[vim.api.nvim_win_get_buf(tree)].filetype, 'netrw')
+
+  vim.api.nvim_win_close(tree, true)
+  truthy('10.8 closing the tree leaves R in R', current_state().mode == 'R')
+
+  -- The same rule without a plugin: an ordinary `:edit` can hand the window a
+  -- buffer that is not this state's, and the next refresh must not take it
+  -- back. This used to swap R in over whatever had been edited into the window.
+  truthy('10.8 back in R for the :edit check', reset_to_r())
+  local edited = current_state()
+  vim.cmd('edit ' .. vim.fn.fnameescape(plain))
+  vim.cmd('doautocmd VimResized')
+  vim.wait(config.options.resize_debounce + 100)
+  expect('10.8 :edit keeps the file it opened', vim.api.nvim_buf_get_name(0), plain)
+  expect('10.8 and the abandoned state is dropped', state.windows[edited.win], nil)
 end)
 
 --------------------------------------------------------------------------------

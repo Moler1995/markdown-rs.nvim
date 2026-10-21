@@ -12,6 +12,8 @@ local M = {}
 ---   want      what it should be showing: 'S' or 'R'
 ---   source    the markdown buffer
 ---   rendered  this window's rendered buffer, or nil before the first render
+---   inherited the rendered buffer the window was showing when it was split off
+---             another md-render window, if it was
 ---   doc       the document currently in `rendered`
 ---   generation  bumped per request; a callback from an older one is dropped
 M.windows = {}
@@ -36,6 +38,7 @@ function M.get(win)
       want = 'S',
       source = nil,
       rendered = nil,
+      inherited = nil,
       doc = nil,
       -- The source's view when it was last left, and the rendered one. Held
       -- because `nvim_win_set_buf` restores a cursor line but not a top line.
