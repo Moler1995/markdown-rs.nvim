@@ -17,6 +17,7 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use md_render::document::{layout_document, source_line_count};
+use md_render::image_art::{ImageEncoding, ImageOptions};
 use md_render::renderer::render_markdown;
 use md_render::theme::{Palette, Theme};
 
@@ -38,6 +39,37 @@ struct Cli {
     /// One of the names listed by `md-render --themes`.
     #[arg(long, default_value = "default")]
     theme: String,
+
+    /// Directory that relative image destinations resolve against.
+    ///
+    /// Defaults to the working directory. Absolute destinations and URLs are
+    /// unaffected; a URL is never fetched.
+    #[arg(long, value_name = "DIR")]
+    base: Option<PathBuf>,
+
+    /// Maximum height an image may occupy, in display rows.
+    ///
+    /// Omitted, an image is bounded by the width alone. A bound of zero leaves
+    /// no room for a cell, so every image falls back to its alt text.
+    #[arg(long, value_name = "ROWS")]
+    image_max_height: Option<u16>,
+
+    /// How images are drawn.
+    ///
+    /// `quads` uses quadrant glyphs, four sub-cells in two colours; `blocks`
+    /// uses half-block glyphs and two colours per cell; `ascii` uses one
+    /// characteristic glyph and one colour; and `off` renders references as
+    /// their alt text.
+    #[arg(long, value_enum, default_value = "blocks")]
+    image_encoding: ImageEncoding,
+
+    /// Also emit the frames of animated GIF and WebP images.
+    ///
+    /// Off by default: an image is drawn on its first frame. With this flag an
+    /// animated image additionally carries its frames in the document's
+    /// `animations` field, so a reader can step through or play them.
+    #[arg(long)]
+    image_animation: bool,
 
     /// Markdown file to render. Reads standard input when omitted.
     path: Option<PathBuf>,
@@ -85,7 +117,19 @@ fn run(cli: &Cli) -> Result<String, String> {
 
     let palette = Palette::from_theme(theme);
     let blocks = render_markdown(&content, &palette, theme);
-    let doc = layout_document(&blocks, width, &palette, source_line_count(&content));
+    let images = ImageOptions {
+        base: cli.base.as_deref(),
+        max_height: cli.image_max_height,
+        encoding: cli.image_encoding,
+        animation: cli.image_animation,
+    };
+    let doc = layout_document(
+        &blocks,
+        width,
+        &palette,
+        source_line_count(&content),
+        images,
+    );
 
     serde_json::to_string(&doc).map_err(|err| format!("could not serialise the document: {err}"))
 }

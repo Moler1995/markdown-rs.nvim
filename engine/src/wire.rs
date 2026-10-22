@@ -122,6 +122,36 @@ pub struct WireLine {
     pub spans: Vec<WireSpan>,
 }
 
+/// One frame of an animated image.
+///
+/// `lines` holds spans only — no `source` — because every line of every frame
+/// belongs to the same image reference as the first frame. Their style indices
+/// come from the document's own `styles` table, so a style a frame shares with
+/// the first is stored once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WireFrame {
+    /// How long the frame is shown, in milliseconds, as the file records it.
+    pub delay: u32,
+    pub lines: Vec<Vec<WireSpan>>,
+}
+
+/// An animated image reference and its frames.
+///
+/// The first frame is also in `lines` at `start .. start + rows`, unchanged, so
+/// a reader that ignores this field draws the still image. The entry exists
+/// only when `--image-animation` was asked for and the whole animation fit the
+/// engine's caps; a partial animation is never emitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WireAnimation {
+    /// The 0-indexed source line of the `![…](…)` reference.
+    pub source: u32,
+    /// The first display line of the artwork in `lines`.
+    pub start: u32,
+    /// How many display lines one frame occupies.
+    pub rows: u32,
+    pub frames: Vec<WireFrame>,
+}
+
 /// The document as the plugin receives it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WireDoc {
@@ -146,6 +176,18 @@ pub struct WireDoc {
     /// One entry per source line: the index of the first display line at or
     /// after that source line. Length equals the document's source line count.
     pub source_map: Vec<u32>,
+    /// Animated images, when frames were requested. Omitted entirely when
+    /// there are none, so an ordinary render's document is unchanged.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub animations: Vec<WireAnimation>,
+    /// Source lines of images that are animations but exceeded the engine's
+    /// caps, so `animations` has no entry for them.
+    ///
+    /// The plugin uses this to tell the reader why the step key does nothing,
+    /// instead of leaving them to guess between a still image and a refused
+    /// one. Omitted entirely when empty, like `animations`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub animations_limited: Vec<u32>,
 }
 
 /// Interns styles as they are emitted, so `styles` holds each distinct style
@@ -435,5 +477,79 @@ mod tests {
     #[test]
     fn source_map_of_an_empty_document_is_empty() {
         assert!(build_source_map(&[], 0).is_empty());
+    }
+
+    /// A document with the minimum the wire format requires, plus `animations`.
+    fn doc_with(animations: Vec<WireAnimation>) -> WireDoc {
+        WireDoc {
+            version: WIRE_VERSION,
+            width: 80,
+            layout_width: 80,
+            styles: Vec::new(),
+            lines: vec![WireLine {
+                source: Some(0),
+                spans: Vec::new(),
+            }],
+            source_map: vec![0],
+            animations,
+            animations_limited: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_document_without_animations_has_no_animations_key() {
+        let json = serde_json::to_value(doc_with(Vec::new())).expect("serialise");
+        assert!(
+            json.get("animations").is_none(),
+            "an ordinary render must not carry the field at all: {json}"
+        );
+    }
+
+    #[test]
+    fn an_animated_document_carries_the_designed_shape() {
+        let animation = WireAnimation {
+            source: 2,
+            start: 7,
+            rows: 38,
+            frames: vec![WireFrame {
+                delay: 100,
+                lines: vec![vec![WireSpan(1, "\u{2580}".to_string())]],
+            }],
+        };
+        let json = serde_json::to_value(doc_with(vec![animation])).expect("serialise");
+
+        assert_eq!(json["version"], 1, "adding a field must not bump the version");
+        assert_eq!(
+            json["animations"],
+            serde_json::json!([
+                {
+                    "source": 2,
+                    "start": 7,
+                    "rows": 38,
+                    "frames": [
+                        { "delay": 100, "lines": [[[1, "\u{2580}"]]] }
+                    ]
+                }
+            ]),
+            "the animation entry is not the shape design.md D2 describes"
+        );
+    }
+
+    #[test]
+    fn a_refused_animation_names_its_source_line() {
+        let mut doc = doc_with(Vec::new());
+        doc.animations_limited = vec![4];
+        let json = serde_json::to_value(&doc).expect("serialise");
+        assert_eq!(
+            json["animations_limited"],
+            serde_json::json!([4]),
+            "the plugin needs the line to report the right reference"
+        );
+
+        let json = serde_json::to_value(doc_with(Vec::new())).expect("serialise");
+        assert!(
+            json.get("animations_limited").is_none(),
+            "a document that refused nothing must not carry the field: {json}"
+        );
     }
 }

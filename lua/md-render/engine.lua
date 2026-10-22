@@ -41,22 +41,57 @@ function M.resolve(explicit)
   return nil
 end
 
---- Render `content` at `width`.
+--- Render `content` as `view` describes.
+---
+--- `view` is everything about where the document is going:
+---
+---   width     columns the text may occupy (required)
+---   height    display rows the page has, or nil to bound images by width alone
+---   encoding  the engine's `--image-encoding`: 'quads', 'blocks', 'ascii'
+---             or 'off'
+---   base      directory relative image destinations resolve against, or nil to
+---             leave them to the engine's working directory
+---   animation true to ask for an animated image's frames as well as its first
+---             frame; omitted or false leaves the engine's animation field out
 ---
 --- Calls `cb(err, doc)`. The callback runs on the main loop, so it is safe to
 --- touch buffers from it. `err` is a human-readable string; there is no case
 --- where both are set, and none where neither is.
-function M.render(opts, content, width, cb)
+function M.render(opts, content, view, cb)
   local exe = M.resolve(opts.engine)
   if not exe then
     cb('the md-render engine was not found: it is not on PATH and not in bin/')
     return
   end
 
-  local args = { '--width', tostring(width) }
+  local args = { '--width', tostring(view.width) }
   if opts.theme and opts.theme ~= '' then
     args[#args + 1] = '--theme'
     args[#args + 1] = opts.theme
+  end
+  -- Always sent, so the engine's own default never has to be guessed at here:
+  -- the plugin is the one that knows whether this terminal can show the
+  -- block encodings.
+  if view.encoding and view.encoding ~= '' then
+    args[#args + 1] = '--image-encoding'
+    args[#args + 1] = view.encoding
+  end
+  if view.height then
+    args[#args + 1] = '--image-max-height'
+    args[#args + 1] = tostring(view.height)
+  end
+  -- Omitted for a buffer with no file: the engine's working directory is the
+  -- only thing left to resolve against, and passing it explicitly would say
+  -- the same thing with more ways to be wrong.
+  if view.base and view.base ~= '' then
+    args[#args + 1] = '--base'
+    args[#args + 1] = view.base
+  end
+  -- Only asked for when the caller wants frames. The flag makes the engine
+  -- decode every frame of every animated image, which is work and payload no
+  -- ordinary render should pay for.
+  if view.animation then
+    args[#args + 1] = '--image-animation'
   end
 
   -- Guarded, because a process that cannot be started at all is an error from

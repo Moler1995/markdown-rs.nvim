@@ -134,6 +134,74 @@ has a single definition and the reader does not have to reimplement a scan.
 Every entry is a valid index into `lines`; when nothing is at or after `n` the
 entry is clamped to the last display line.
 
+### `animations`
+
+Animated images, present only when the engine was run with `--image-animation`
+and the document contains a GIF or an animated WebP whose whole animation fits
+the engine's caps. The field is omitted entirely when there is nothing to
+animate, so an ordinary render's document has exactly the shape it had before
+the field existed.
+
+Each entry has:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `source` | integer | The 0-indexed source line of the `![…](…)` reference. |
+| `start` | integer | The index in `lines` of the animation's first display line. |
+| `rows` | integer | How many display lines one frame occupies. |
+| `frames` | array | Every frame, in playback order, including the first. |
+
+A frame is `{ "delay": integer, "lines": [[ [style_index, text], … ], … ] }`.
+`delay` is milliseconds as the file records it — a GIF's hundredths of a second
+are multiplied by ten. Frame lines carry spans only, with no `source`, because
+every line of every frame belongs to the reference the entry names. Their style
+indices index the document's own `styles`, so a style shared with the first
+frame is stored once and a reader that already defined the first frame's groups
+needs to define nothing to show a later one.
+
+**The first frame is also in `lines` at `start .. start + rows - 1`, unchanged.**
+That is what makes the field additive: a reader that ignores `animations` paints
+the still image, and a reader that swaps in frame 0 is redrawing exactly the
+rows it was already showing.
+
+The engine caps an animation at 256 frames and 64,000,000 decoded pixels in
+total. An image past either bound renders as its first frame with no entry
+here at all — the whole animation is present or none of it is, because a partial
+one would loop back to a frame that is not the image's first.
+
+### `animations_limited`
+
+Source lines of image references whose animation the caps refused, present only
+when there is at least one and omitted otherwise. It exists so a reader can tell
+a still image from an animation that was too large: both have no `animations`
+entry and both show the first frame, but the latter usually looks like it should
+move. Entries are 0-indexed source lines, in document order.
+
+```json
+"animations_limited": [4]
+```
+
+The entry below is verbatim: rendering `![anim](image_animation.gif)` at width
+20 with `--image-animation`, where the fixture is a 4×2 three-frame GIF with
+delays of 40, 80 and 120 ms. The document's `lines` holds the first frame
+(`{"source": 0, "spans": [[0, "▀▀▀▀"]]}`), and its `styles` holds the three
+colours the frames use.
+
+```json
+[
+  {
+    "source": 0,
+    "start": 0,
+    "rows": 1,
+    "frames": [
+      { "delay": 40,  "lines": [[[0, "▀▀▀▀"]]] },
+      { "delay": 80,  "lines": [[[1, "▀▀▀▀"]]] },
+      { "delay": 120, "lines": [[[2, "▀▀▀▀"]]] }
+    ]
+  }
+]
+```
+
 ## Source anchoring
 
 The two directions are independent and both are exact:

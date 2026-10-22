@@ -86,6 +86,24 @@ pub enum DocBlock {
     },
     /// A parsed markdown table rendered with fair-share column widths.
     Table(TableBlock),
+    /// An image reference, kept as its destination and alt text for the
+    /// layout stage to render.
+    ///
+    /// Layout is where the decision is made: it knows the width, the page
+    /// height and the base directory, so it is the only stage that can draw
+    /// the image — or discover that it cannot and fall back to the alt text.
+    /// The alt text stays as spans rather than a string so the fallback keeps
+    /// the inline styling it was written with.
+    Image {
+        /// The destination exactly as written. Absolute paths, relative paths,
+        /// URLs and data URIs all arrive here; anything that is not a local
+        /// file falls back.
+        dest: String,
+        /// The alt text, styled with the inline style stack at the reference.
+        alt: Vec<Span>,
+        /// 0-indexed source line where the `![` sits.
+        source_line: u32,
+    },
 }
 
 impl DocBlock {
@@ -101,6 +119,7 @@ impl DocBlock {
             DocBlock::Text { source_lines, .. } => source_lines.first().copied(),
             DocBlock::Mermaid { source_line, .. } => Some(*source_line),
             DocBlock::Table(t) => Some(t.source_line),
+            DocBlock::Image { source_line, .. } => Some(*source_line),
         }
     }
 }

@@ -8,6 +8,7 @@
 //! off than one following none.
 
 use md_render::document::{layout_document, source_line_count};
+use md_render::image_art::ImageOptions;
 use md_render::renderer::render_markdown;
 use md_render::theme::{Palette, Theme};
 
@@ -34,7 +35,13 @@ fn example_json() -> serde_json::Value {
 fn render(input: &str, width: u16) -> serde_json::Value {
     let palette = Palette::from_theme(Theme::default());
     let blocks = render_markdown(input, &palette, Theme::default());
-    let doc = layout_document(&blocks, width, &palette, source_line_count(input));
+    let doc = layout_document(
+        &blocks,
+        width,
+        &palette,
+        source_line_count(input),
+        ImageOptions::default(),
+    );
     serde_json::to_value(&doc).expect("the engine's own output must serialise")
 }
 

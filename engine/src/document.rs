@@ -16,12 +16,15 @@
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::block::DocBlock;
+use crate::image_art::{Artwork, Bounds, ImageOptions, animated_artwork, artwork};
 use crate::mermaid::{MermaidTextBackend, render_text};
 use crate::style::{Line, Span, Style};
 use crate::table::layout_table;
 use crate::text_layout::wrap_spans;
 use crate::theme::Palette;
-use crate::wire::{StyleTable, WIRE_VERSION, WireDoc, WireLine, build_source_map};
+use crate::wire::{
+    StyleTable, WIRE_VERSION, WireAnimation, WireDoc, WireFrame, WireLine, build_source_map,
+};
 
 /// Lay out every block for `width` columns and produce the document the plugin
 /// receives.
@@ -29,14 +32,20 @@ use crate::wire::{StyleTable, WIRE_VERSION, WireDoc, WireLine, build_source_map}
 /// `source_line_count` is the number of lines in the source document — the
 /// length `source_map` is built to, and the bound every emitted source anchor
 /// is clamped to.
+///
+/// `images` says how image references should be drawn, and where their
+/// destinations resolve from. It is the caller's whole say in the matter: the
+/// engine decodes, samples and encodes, but the page size, the base directory
+/// and the encoding are decisions only the caller knows.
 #[must_use]
 pub fn layout_document(
     blocks: &[DocBlock],
     width: u16,
     palette: &Palette,
     source_line_count: usize,
+    images: ImageOptions<'_>,
 ) -> WireDoc {
-    let mut layout = Layout::new(width, palette, source_line_count);
+    let mut layout = Layout::new(width, palette, source_line_count, images);
 
     for block in blocks {
         match block {
@@ -59,6 +68,13 @@ pub fn layout_document(
             DocBlock::Mermaid { source, source_line } => {
                 layout.push_mermaid(source, *source_line);
             }
+            DocBlock::Image {
+                dest,
+                alt,
+                source_line,
+            } => {
+                layout.push_image(dest, alt, *source_line);
+            }
         }
     }
 
@@ -79,6 +95,8 @@ pub fn layout_document(
         styles: layout.styles.into_styles(),
         lines,
         source_map,
+        animations: layout.animations,
+        animations_limited: layout.animations_limited,
     }
 }
 
@@ -103,10 +121,23 @@ struct Layout<'a> {
     /// a caller comparing it against `width` would be told the document fits
     /// while columns were missing.
     layout_width: usize,
+    /// How image references are drawn and where their destinations resolve
+    /// from. Copied in at construction because it is four small values.
+    images: ImageOptions<'a>,
+    /// Animated image frames, in document order.
+    animations: Vec<WireAnimation>,
+    /// Source lines of image references whose animation was refused by the
+    /// caps, in document order. The plugin reports these; they carry no frames.
+    animations_limited: Vec<u32>,
 }
 
 impl<'a> Layout<'a> {
-    fn new(width: u16, palette: &'a Palette, source_line_count: usize) -> Layout<'a> {
+    fn new(
+        width: u16,
+        palette: &'a Palette,
+        source_line_count: usize,
+        images: ImageOptions<'a>,
+    ) -> Layout<'a> {
         Layout {
             width,
             palette,
@@ -114,6 +145,9 @@ impl<'a> Layout<'a> {
             styles: StyleTable::new(),
             lines: Vec::new(),
             layout_width: 0,
+            images,
+            animations: Vec::new(),
+            animations_limited: Vec::new(),
         }
     }
 
@@ -133,6 +167,116 @@ impl<'a> Layout<'a> {
             self.note_width(line.width());
             self.lines.push(self.styles.line(source, &line));
         }
+    }
+
+    /// Append an image reference's alt text, wrapped like any other prose.
+    ///
+    /// A reference with no alt text contributes no display line at all: an
+    /// image the reader cannot see and that says nothing is not worth a blank
+    /// row.
+    fn push_alt_text(&mut self, source_line: u32, alt: &[Span]) {
+        if alt.iter().all(|span| span.content.is_empty()) {
+            return;
+        }
+        self.push(Some(source_line), &Line::from(alt.to_vec()));
+    }
+
+    /// Append the display lines for an image reference.
+    ///
+    /// The artwork is attributed to the reference's own source line, so a
+    /// cursor anywhere in the picture resolves to the `![…]` that produced it.
+    /// When [`artwork`] declines — a URL, a missing file, an unsupported
+    /// format, a limit exceeded, or no room for a cell — the alt text takes
+    /// the artwork's place, wrapped like any other prose.
+    ///
+    /// Artwork lines are pushed through [`Layout::push`] rather than appended
+    /// raw, so the width guarantee is enforced here rather than trusted to the
+    /// encoder. The bounds already fit, so wrapping never actually splits one.
+    fn push_image(&mut self, dest: &str, alt: &[Span], source_line: u32) {
+        let bounds = Bounds {
+            width: self.width,
+            height: self.images.max_height,
+        };
+        if self.images.animation
+            && let Some(art) = animated_artwork(
+                dest,
+                bounds,
+                self.images.encoding,
+                self.images.base,
+            )
+        {
+            self.push_artwork(source_line, art);
+            return;
+        }
+        match artwork(dest, bounds, self.images.encoding, self.images.base) {
+            Some(lines) => {
+                for line in &lines {
+                    self.push(Some(source_line), line);
+                }
+            }
+            None => self.push_alt_text(source_line, alt),
+        }
+    }
+
+    /// Append artwork and record its frames, if it has any.
+    ///
+    /// `start` is the line count before the first frame is pushed and `rows` is
+    /// what the push added, because layout is the only stage that knows either.
+    /// Frames are interned into the same [`StyleTable`] as the rest of the
+    /// document, so a style they share with the first frame is stored once.
+    ///
+    /// Every frame must occupy exactly `rows` lines and fit the width. The
+    /// encoder produced them at the same cell grid as the first frame, so both
+    /// hold by construction; if either did not, the animation is dropped rather
+    /// than emitted with frames the plugin could not swap in place.
+    fn push_artwork(&mut self, source_line: u32, art: Artwork) {
+        let Artwork {
+            lines,
+            frames,
+            animation_limited,
+        } = art;
+        if animation_limited {
+            self.animations_limited
+                .push(source_line.min(self.max_source));
+        }
+        let start = self.lines.len();
+        for line in &lines {
+            self.push(Some(source_line), line);
+        }
+        let rows = self.lines.len() - start;
+
+        if frames.len() < 2
+            || rows == 0
+            || rows != lines.len()
+            || frames.iter().any(|frame| {
+                frame.lines.len() != rows
+                    || frame
+                        .lines
+                        .iter()
+                        .any(|line| line.width() > usize::from(self.width))
+            })
+        {
+            return;
+        }
+
+        let wire_frames: Vec<WireFrame> = frames
+            .iter()
+            .map(|frame| WireFrame {
+                delay: frame.delay_ms,
+                lines: frame
+                    .lines
+                    .iter()
+                    .map(|line| self.styles.line(None, line).spans)
+                    .collect(),
+            })
+            .collect();
+
+        self.animations.push(WireAnimation {
+            source: source_line.min(self.max_source),
+            start: crate::cast::u32_sat(start),
+            rows: crate::cast::u32_sat(rows),
+            frames: wire_frames,
+        });
     }
 
     /// Append the display lines for a mermaid block.
@@ -229,9 +373,19 @@ mod tests {
     use crate::theme::{Palette, Theme};
 
     fn layout(content: &str, width: u16) -> WireDoc {
+        layout_with(content, width, ImageOptions::default())
+    }
+
+    fn layout_with(content: &str, width: u16, images: ImageOptions<'_>) -> WireDoc {
         let palette = Palette::default();
         let blocks = render_markdown(content, &palette, Theme::default());
-        layout_document(&blocks, width, &palette, source_line_count(content))
+        layout_document(&blocks, width, &palette, source_line_count(content), images)
+    }
+
+    /// The absolute, forward-slashed path of an image fixture, as a markdown
+    /// destination would spell it.
+    fn fixture(name: &str) -> String {
+        format!("{}/tests/fixtures/images/{name}", env!("CARGO_MANIFEST_DIR")).replace('\\', "/")
     }
 
     /// The document's text, one string per display line, joined by newlines.
@@ -645,5 +799,194 @@ mod tests {
         // `markdown_options` is exercised here too: an empty document must not
         // panic through the parser.
         assert!(markdown_options().contains(pulldown_cmark::Options::ENABLE_TABLES));
+    }
+
+    #[test]
+    fn a_renderable_image_becomes_artwork_at_the_references_line() {
+        let content = format!("before\n\n![cells]({})\n\nafter\n", fixture("image_cells.png"));
+        let doc = layout(&content, 80);
+        let text: Vec<String> = doc.lines.iter().map(line_text).collect();
+
+        // The 4x2 fixture is one cell row: three opaque cells and a transparent
+        // one, so the exact glyphs are known.
+        assert!(
+            text.contains(&"\u{2580}\u{2580}\u{2580} ".to_string()),
+            "the image did not render as artwork: {text:?}"
+        );
+        let artwork = doc
+            .lines
+            .iter()
+            .find(|line| line_text(line).contains('\u{2580}'))
+            .expect("an artwork line");
+        assert_eq!(artwork.source, Some(2), "artwork anchors to the reference");
+
+        assert!(
+            !text.iter().any(|line| line.contains("cells")),
+            "the alt text must not also be emitted: {text:?}"
+        );
+        // The prose survives on either side.
+        assert!(text.iter().any(|line| line == "before"));
+        assert!(text.iter().any(|line| line == "after"));
+    }
+
+    #[test]
+    fn a_missing_image_falls_back_to_wrapped_alt_text() {
+        let doc = layout("![a missing image](missing.png)\n", 10);
+        let text = lines_text(&doc);
+
+        // The trailing blank line is the paragraph's own spacing.
+        assert_eq!(
+            text, "a missing\nimage\n",
+            "the alt text must wrap like prose"
+        );
+        assert!(
+            !text.contains('\u{2580}') && !text.contains('\u{2584}'),
+            "no artwork may be emitted for an unrenderable reference"
+        );
+    }
+
+    // ── Animation ──────────────────────────────────────────────────────────
+
+    fn animated_layout(content: &str, width: u16) -> WireDoc {
+        layout_with(
+            content,
+            width,
+            ImageOptions {
+                animation: true,
+                ..ImageOptions::default()
+            },
+        )
+    }
+
+    #[test]
+    fn an_animation_is_placed_at_the_references_line_range() {
+        let content = format!("![anim]({})\n", fixture("image_animation.gif"));
+        let doc = animated_layout(&content, 40);
+
+        assert_eq!(doc.animations.len(), 1);
+        let animation = &doc.animations[0];
+        assert_eq!(animation.source, 0, "the reference is source line 0");
+        assert_eq!(animation.start, 0, "the artwork starts at display line 0");
+        assert_eq!(animation.rows, 1, "a 4x2 image is one cell row");
+
+        // The first frame is not merely reachable through the animation: the
+        // document's own lines at the recorded range are that frame, which is
+        // what lets a still reader ignore `animations` and see the image.
+        let shown: Vec<Vec<_>> = doc.lines
+            [animation.start as usize..(animation.start + animation.rows) as usize]
+            .iter()
+            .map(|line| line.spans.clone())
+            .collect();
+        assert_eq!(shown, animation.frames[0].lines);
+    }
+
+    #[test]
+    fn an_animation_over_the_caps_is_named_and_carries_no_frames() {
+        let content = format!("text\n\n![big]({})\n", fixture("image_257.gif"));
+        let doc = animated_layout(&content, 40);
+
+        assert!(
+            doc.animations.is_empty(),
+            "a refused animation must not emit a partial frame list"
+        );
+        assert_eq!(
+            doc.animations_limited,
+            vec![2],
+            "the reference's own source line is what the plugin reports"
+        );
+        assert!(
+            !doc.lines.is_empty(),
+            "the first frame is still drawn as ordinary artwork"
+        );
+    }
+
+    #[test]
+    fn every_frame_fits_the_width_and_the_first_frames_rows() {
+        for width in [2u16, 20, 80] {
+            let content = format!("![anim]({})\n", fixture("image_animation.gif"));
+            let doc = animated_layout(&content, width);
+            let animation = &doc.animations[0];
+
+            for (i, frame) in animation.frames.iter().enumerate() {
+                assert_eq!(
+                    frame.lines.len() as u32,
+                    animation.rows,
+                    "frame {i} at width {width} occupies {} rows, not {}",
+                    frame.lines.len(),
+                    animation.rows
+                );
+                for line in &frame.lines {
+                    let used: usize = line
+                        .iter()
+                        .map(|span| UnicodeWidthStr::width(span.1.as_str()))
+                        .sum();
+                    assert!(
+                        used <= usize::from(width),
+                        "frame {i} at width {width} has a {used}-column line"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frames_share_the_documents_style_table_without_duplicates() {
+        let content = format!("![anim]({})\n", fixture("image_animation.gif"));
+        let doc = animated_layout(&content, 40);
+
+        // Every index a frame names is a real entry.
+        for frame in &doc.animations[0].frames {
+            for line in &frame.lines {
+                for span in line {
+                    assert!(
+                        (span.0 as usize) < doc.styles.len(),
+                        "a frame references style {}, but only {} are defined",
+                        span.0,
+                        doc.styles.len()
+                    );
+                }
+            }
+        }
+
+        // Nothing is interned twice: interning is a lookup, so two equal
+        // entries would mean the table stopped deduplicating.
+        for i in 0..doc.styles.len() {
+            for j in i + 1..doc.styles.len() {
+                assert_ne!(
+                    doc.styles[i], doc.styles[j],
+                    "styles {i} and {j} are equal, so one was interned twice"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_still_image_carries_no_animation_even_when_asked() {
+        let content = format!("![still]({})\n", fixture("image_sample.png"));
+        let doc = animated_layout(&content, 40);
+        assert!(doc.animations.is_empty());
+        assert!(!doc.lines[0].spans.is_empty(), "the image still draws");
+    }
+
+    #[test]
+    fn two_animated_renders_are_byte_identical() {
+        let content = format!("before\n\n![anim]({})\n\nafter\n", fixture("image_animation.gif"));
+        let first = serde_json::to_string(&animated_layout(&content, 40)).expect("serialise");
+        let second = serde_json::to_string(&animated_layout(&content, 40)).expect("serialise");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn turning_artwork_off_shows_the_alt_text_of_a_real_image() {
+        let content = format!("![cells]({})\n", fixture("image_cells.png"));
+        let doc = layout_with(
+            &content,
+            80,
+            ImageOptions {
+                encoding: crate::image_art::ImageEncoding::Off,
+                ..ImageOptions::default()
+            },
+        );
+        assert_eq!(lines_text(&doc), "cells\n");
     }
 }

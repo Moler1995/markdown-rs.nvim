@@ -15,6 +15,7 @@
 
 local config = require('md-render.config')
 local engine = require('md-render.engine')
+local link = require('md-render.link')
 local render = require('md-render.render')
 
 local M = {}
@@ -173,6 +174,36 @@ function M.find_table(lines, line)
   }
 end
 
+--- The image reference on 0-based source line `source`, or nil.
+---
+--- Unlike a fence or a table, an image is not a block in the source at all: it
+--- is a span inside a paragraph or a cell, so there is no lexically obvious
+--- boundary to scan for. It is carried out as the reference's own source text —
+--- from `![` through the closing `)` — because that is the smallest thing the
+--- engine draws as the image alone, alt text included when it cannot be drawn.
+---
+--- The source text is sliced by byte columns rather than reconstructed from the
+--- reference's parts, so an escaped bracket or a title with spaces reaches the
+--- engine exactly as the reader wrote it.
+local function image_block(doc, row, lines)
+  local ref = link.image_at_row(lines, doc, row)
+  if not ref then
+    return nil
+  end
+  local source = render.source_line_for(doc, row)
+  local text = lines[source + 1]
+  if not text then
+    return nil
+  end
+  local raw = text:sub(ref.from, ref.to)
+  return {
+    kind = 'image',
+    first = source + 1,
+    last = source + 1,
+    lines = { raw },
+  }
+end
+
 --- The block under 0-based display row `row`, or nil.
 ---
 --- Two sources, each authoritative for its half. The document says which source
@@ -180,26 +211,63 @@ end
 --- row like a table border — and the source buffer says where the block around
 --- that line begins and ends, which is the only place both kinds have a
 --- lexically obvious boundary.
+---
+--- Fences and tables are tried first because they are the constructs that
+--- cannot be previewed inline at all; an image is a last resort and is found on
+--- the row itself, which covers both its artwork and its alt text.
 function M.locate(doc, row, lines)
   local source = render.source_line_for(doc, row)
   if source == nil then
     return nil
   end
-  return M.find_fence(lines, source) or M.find_table(lines, source)
+  return M.find_fence(lines, source)
+    or M.find_table(lines, source)
+    or image_block(doc, row, lines)
 end
 
 --------------------------------------------------------------------------------
 -- Rendering the block
 --------------------------------------------------------------------------------
 
---- Render `block` at `width`, calling `cb(err, doc)`.
+--- Render `block` as `view` describes, calling `cb(err, doc)`.
 ---
 --- The block's own source lines, joined, are what the engine is given: a fence
---- slice is itself a fenced diagram and a table slice is itself a table, so the
---- existing `--width` contract covers both and nothing has to be wrapped. This
---- is what keeps the whole feature on the Lua side.
-function M.render_block(opts, block, width, cb)
-  engine.render(opts, table.concat(block.lines, '\n'), width, cb)
+--- slice is itself a fenced diagram, a table slice is itself a table, and an
+--- image block is the reference alone, so the existing `--width` contract
+--- covers all three and nothing has to be wrapped. This is what keeps the whole
+--- feature on the Lua side.
+function M.render_block(opts, block, view, cb)
+  engine.render(opts, table.concat(block.lines, '\n'), view, cb)
+end
+
+--- The engine request for the popup's render of `block`.
+---
+--- A **diagram or table** is asked for with artwork off: the block's own layout
+--- at the popup's budget is the point, and a diagram that happens to mention an
+--- image has nothing to draw it with. `off` says that rather than leaving it to
+--- the engine's default.
+---
+--- An **image** is drawn, for once: the popup shows the picture alone, so it is
+--- laid out at the popup's inner width and height at the document's own encoding
+--- rather than at `off`, and `--base` is the document's directory — a relative
+--- reference is relative to the document that holds it. Unlike a diagram, an
+--- image is scaled rather than clipped, so the popup's inner width is the right
+--- budget and a larger one would only make the image larger than the popup.
+---
+--- `animation` is set here, and only here: the popup is where playback happens,
+--- so it is the one request that pays for the frames up front. Every inline
+--- render leaves the flag out until the stepping key asks for it.
+function M.view(block, geometry, base)
+  if block.kind == 'image' then
+    return {
+      width = geometry.inner,
+      height = math.max(1, geometry.max_h - 2),
+      encoding = config.image_encoding(),
+      base = base,
+      animation = config.options.image_animation,
+    }
+  end
+  return { width = geometry.budget, encoding = 'off' }
 end
 
 --------------------------------------------------------------------------------
@@ -327,7 +395,9 @@ function M.geometry(kind, window_budget)
     max_w = max_w,
     max_h = max_h,
     inner = inner,
-    budget = kind == 'table' and math.max(inner, window_budget or 0) or MAX_BUDGET,
+    budget = kind == 'table' and math.max(inner, window_budget or 0)
+      or (kind == 'image' and inner)
+      or MAX_BUDGET,
   }
 end
 
@@ -338,6 +408,141 @@ local function line_text(line)
     parts[#parts + 1] = span[2]
   end
   return table.concat(parts)
+end
+
+--------------------------------------------------------------------------------
+-- Playback
+--------------------------------------------------------------------------------
+
+local uv = vim.uv or vim.loop
+
+--- How long frame `index` is shown, in milliseconds.
+---
+--- The engine reports each frame's own delay. A delay under 20 ms is not a
+--- delay a terminal can show — GIF encoders write 0 for "as fast as possible" —
+--- so it is played at 100 ms, the floor browsers settled on, rather than as a
+--- redraw loop that would keep the editor busy drawing frames nobody sees.
+---
+--- Exposed rather than local because the clamp is a property of a number, and
+--- asserting it through real playback would mean waiting on a clock to prove a
+--- constant.
+function M.frame_delay(animation, index)
+  local frame = animation and animation.frames and animation.frames[index + 1]
+  local ms = frame and frame.delay or 0
+  if ms < 20 then
+    return 100
+  end
+  return ms
+end
+
+--- Stop `popup`'s playback and close its timer.
+---
+--- Idempotent, and safe on a popup that never played: closing a timer that is
+--- not running is fine, and `pcall` covers a handle the loop has already
+--- reclaimed.
+local function stop_playback(popup)
+  if not popup then
+    return
+  end
+  if popup.timer then
+    pcall(popup.timer.stop, popup.timer)
+    pcall(popup.timer.close, popup.timer)
+    popup.timer = nil
+  end
+  popup.playing = false
+end
+
+--- Show frame `index` in `popup`'s buffer, if it can still be shown.
+---
+--- `render.frame` is the same write the inline stepping key uses: only the
+--- artwork rows are replaced, so the popup's window, title and the reader's
+--- place in the buffer are untouched.
+local function show_frame(popup, index)
+  if not popup.doc or not popup.animation then
+    return false
+  end
+  if not render.frame(popup.buf, popup.doc, popup.animation, index) then
+    return false
+  end
+  popup.frame = index
+  return true
+end
+
+--- Arm the popup's one-shot timer for the frame after the one on screen.
+---
+--- One timer, restarted rather than repeating: each frame has its own delay, so
+--- a repeating timer would have to pick one. The delay belongs to the frame on
+--- screen — how long it stays before the next one replaces it.
+---
+--- `vim.schedule_wrap` puts the write on the main loop, which is where buffer
+--- calls belong. The callback re-checks that this is still the popup on screen,
+--- still playing, and still showing the same document: a close, a re-render or
+--- a pause between the timer firing and the write must drop the frame rather
+--- than write into whatever is there now.
+local function arm(popup)
+  if not popup.playing or not popup.timer or not popup.animation then
+    return
+  end
+  local animation, doc = popup.animation, popup.doc
+  popup.timer:start(M.frame_delay(animation, popup.frame), 0, vim.schedule_wrap(function()
+    if M.popup ~= popup or not popup.playing or popup.doc ~= doc then
+      return
+    end
+    local next_index = (popup.frame + 1) % #animation.frames
+    if not show_frame(popup, next_index) then
+      return
+    end
+    arm(popup)
+  end))
+end
+
+--- Start playback from the frame on screen.
+---
+--- The timer is created here rather than at open, so that a still image never
+--- has one: there would be nothing to arm, and an unused handle is a thing to
+--- remember to close for no benefit.
+local function start_playback(popup)
+  if not popup.animation or #popup.animation.frames < 2 or popup.playing then
+    return
+  end
+  if not popup.timer then
+    popup.timer = uv.new_timer()
+  end
+  if not popup.timer then
+    return
+  end
+  popup.playing = true
+  arm(popup)
+end
+
+--- Toggle playback. Bound to `keymaps.pause` in an animated image's popup.
+---
+--- Pausing stops the timer and keeps `frame`, so resuming continues from the
+--- frame on screen rather than restarting the animation.
+function M.pause()
+  local popup = M.popup
+  if not popup or not popup.animation then
+    return
+  end
+  if popup.playing then
+    stop_playback(popup)
+  else
+    start_playback(popup)
+  end
+end
+
+--- Step one frame in the popup, bound to `keymaps.frame_next`.
+---
+--- While playing, the timer owns the cadence and a manual step would be
+--- overtaken by the frame already armed, so the key does nothing there. While
+--- paused it advances exactly one frame, and a later resume continues from the
+--- frame the reader chose.
+function M.frame_step()
+  local popup = M.popup
+  if not popup or not popup.animation or popup.playing then
+    return
+  end
+  show_frame(popup, (popup.frame + 1) % #popup.animation.frames)
 end
 
 --- Close the popup, if one is open.
@@ -351,6 +556,9 @@ function M.close()
     return
   end
   M.popup = nil
+  -- Before the window goes: a timer that fires while the buffer is being
+  -- deleted would be writing into a buffer that is on its way out.
+  stop_playback(popup)
   if popup.win and vim.api.nvim_win_is_valid(popup.win) then
     pcall(vim.api.nvim_win_close, popup.win, true)
   end
@@ -420,6 +628,14 @@ function M.open(doc, geometry, block)
     layout_width = doc_layout_width(doc),
     natural_width = doc_layout_width(doc),
     rung = 'natural',
+    -- Playback state. `doc` is kept because applying a frame needs the document
+    -- the artwork came from — the buffer holds the layout, not the frames — and
+    -- `animation` is the one entry this popup's image carries, if any.
+    doc = doc,
+    animation = geometry.kind == 'image' and doc.animations and doc.animations[1] or nil,
+    frame = 0,
+    playing = false,
+    timer = nil,
   }
 
   local function close()
@@ -496,6 +712,38 @@ function M.open(doc, geometry, block)
   pcall(vim.api.nvim_buf_set_name, buf, popup_buffer_name(popup))
   M.popup = popup
 
+  -- The image animates but the engine refused the frames for size: there is
+  -- nothing to play, so say so rather than leave the reader wondering why the
+  -- popup is still. The document here holds the one reference, so any entry in
+  -- the list is this image.
+  if popup.kind == 'image' and doc.animations_limited and #doc.animations_limited > 0 then
+    vim.notify(
+      'md-render: this image is too large to animate; showing its first frame',
+      vim.log.levels.WARN)
+  end
+
+  -- An animated image is the one popup that moves by itself. The keys are bound
+  -- here and only here: a still image's popup must leave `pause` and
+  -- `frame_next` to Vim, because they are ordinary keys there and nothing in
+  -- this popup means to take them.
+  --
+  -- `pause` is bound for as long as the animated popup exists rather than only
+  -- while it plays: once paused, it is the only way back to playing.
+  if popup.animation and #popup.animation.frames > 1 then
+    for _, entry in ipairs({
+      { config.options.keymaps.pause, function() M.pause() end,
+        'md-render: pause or resume the animation' },
+      { config.options.keymaps.frame_next, function() M.frame_step() end,
+        'md-render: step one frame while paused' },
+    }) do
+      local key, fn, desc = entry[1], entry[2], entry[3]
+      if key and key ~= '' and key ~= false then
+        vim.keymap.set('n', key, fn, { buffer = buf, desc = desc, nowait = true })
+      end
+    end
+    start_playback(popup)
+  end
+
   -- A close by any other route — `:close`, a mouse click elsewhere — leaves the
   -- bookkeeping behind rather than the window. The buffer goes with the window
   -- through `bufhidden=wipe`.
@@ -505,6 +753,10 @@ function M.open(doc, geometry, block)
     once = true,
     callback = function()
       if M.popup and M.popup.win == win then
+        -- The window went without `M.close`, so it is this handler that has to
+        -- stop the timer; otherwise playback would keep writing into a buffer
+        -- `bufhidden=wipe` is taking away.
+        stop_playback(M.popup)
         M.popup = nil
       end
     end,
@@ -529,7 +781,11 @@ function M.render_at(budget, cb)
     return
   end
 
-  M.render_block(config.options, popup.block, budget, function(err, doc)
+  -- A zoom re-lays a diagram or a table, never an image: `M.zoom` returns for
+  -- any other kind. The view is still explicit rather than inherited so that a
+  -- future caller cannot accidentally re-render a block with the popup's image
+  -- settings.
+  M.render_block(config.options, popup.block, { width = budget, encoding = 'off' }, function(err, doc)
     if M.popup ~= popup then
       return
     end
@@ -562,6 +818,16 @@ function M.adopt(doc, budget, rung)
   if not popup then
     return
   end
+
+  -- A re-render replaces what is on screen, and whatever was playing is no
+  -- longer what is there. The timer is stopped before the write so that a frame
+  -- armed for the old document cannot land in the new one, and the playback
+  -- state is dropped with it rather than left pointing at a document the buffer
+  -- no longer shows.
+  stop_playback(popup)
+  popup.doc = doc
+  popup.animation = nil
+  popup.frame = 0
 
   -- Recorded together with the content, so they always describe the buffer.
   popup.budget = budget

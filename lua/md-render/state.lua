@@ -15,6 +15,7 @@ local M = {}
 ---   inherited the rendered buffer the window was showing when it was split off
 ---             another md-render window, if it was
 ---   doc       the document currently in `rendered`
+---   frames    animation source line -> the frame index showing, per image
 ---   generation  bumped per request; a callback from an older one is dropped
 M.windows = {}
 
@@ -25,7 +26,7 @@ M.windows = {}
 --- S cannot invalidate the buffer the other is showing.
 M.by_rendered = {}
 
---- Source buffer -> { tick, width, theme, doc }.
+--- Source buffer -> { tick, width, height, encoding, theme, doc }.
 M.cache = {}
 
 --- The state for `win`, created empty on first use.
@@ -48,6 +49,10 @@ function M.get(win)
       -- has not been entered since. Leaving R maps the cursor back to a source
       -- line only when it has moved off this row.
       rendered_anchor = nil,
+      -- Animation source line -> the frame index showing, per image. Cleared
+      -- whenever a new document is applied, which is what puts every image back
+      -- on its first frame after a resize or an edit.
+      frames = {},
       generation = 0,
     }
     M.windows[win] = st
@@ -70,22 +75,39 @@ function M.forget(win)
   M.windows[win] = nil
 end
 
---- The cached document for this exact (buffer, width, theme, changedtick), or
---- nil.
+--- The cached document for this exact (buffer, width, height, encoding, theme,
+--- animation, changedtick), or nil.
 ---
---- `changedtick` is the whole invalidation story: it changes on every edit and
---- on nothing else, so a cache hit means the render would be byte-identical to
---- the one already held.
-function M.cached(buf, tick, width, theme)
+--- `changedtick` covers the document's *contents*: it changes on every edit and
+--- on nothing else. Everything else in the key is a reason the same contents
+--- could render differently — the width and height the page has, the encoding
+--- images are drawn with, the theme, and whether frames were asked for. A
+--- height-only resize, or flipping `image_mode`, changes what the engine would
+--- produce without touching the buffer, so those have to be part of the key
+--- rather than assumed constant. `animation` is in the key because an animated
+--- render and an ordinary one differ in their payload while agreeing about
+--- every line: without it, asking for frames after a plain render would be
+--- answered by the cache with the very document that has none.
+function M.cached(buf, tick, width, height, encoding, theme, animation)
   local entry = M.cache[buf]
-  if entry and entry.tick == tick and entry.width == width and entry.theme == theme then
+  if entry and entry.tick == tick and entry.width == width and entry.height == height
+    and entry.encoding == encoding and entry.theme == theme
+    and entry.animation == (animation and true or false) then
     return entry.doc
   end
   return nil
 end
 
-function M.store(buf, tick, width, theme, doc)
-  M.cache[buf] = { tick = tick, width = width, theme = theme, doc = doc }
+function M.store(buf, tick, width, height, encoding, theme, animation, doc)
+  M.cache[buf] = {
+    tick = tick,
+    width = width,
+    height = height,
+    encoding = encoding,
+    theme = theme,
+    animation = animation and true or false,
+    doc = doc,
+  }
 end
 
 --- Forget every cached render for `buf`. Used when a buffer is deleted.
