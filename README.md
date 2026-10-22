@@ -3,7 +3,8 @@
 A markdown rendering engine and the Neovim plugin that uses it.
 
 Opening a markdown file shows it rendered — headings in colour, tables drawn as
-tables, diagrams drawn as diagrams, code highlighted. A key toggles back to the
+tables, diagrams drawn as diagrams, images drawn as character-cell artwork, code
+highlighted. A key toggles back to the
 source, which is an ordinary editable buffer. The engine does the rendering;
 the plugin decides when to call it and where the result goes.
 
@@ -82,8 +83,12 @@ R is remade when the window's width changes and when the source buffer changes,
 and it is remade from the buffer rather than from the file — so an edit made in S
 and not yet written is what the next render shows. Nothing is remade while R is
 off screen, and a render of a document that has not moved is answered from a
-cache keyed on the buffer, its `changedtick`, the width and the theme, which is
+cache keyed on the buffer, its `changedtick`, the page's width and height, the
+image encoding, the theme and whether animation frames were asked for, which is
 what makes toggling back and forth free.
+The page size is part of the key because an image has to fit the window showing
+it; an image-free document renders the same at any height, but the plugin cannot
+know that before the engine has answered.
 
 Both kinds of change arrive in bursts — a drag-resize is one event per column,
 typing is one per keystroke — so the render is deferred by `resize_debounce`
@@ -99,7 +104,9 @@ toggle is applied at once, so a resize cannot swallow the key that follows it.
 | `<leader>mr` | R and S | swap between the rendered view and the source |
 | `<C-s>` | R and S | write the source buffer |
 | `gf` | R and S | follow the link under the cursor |
-| `<CR>` | R only | preview the block under the cursor, or close the preview |
+| `gx` | R only | open the image under the cursor with the system application |
+| `<C-n>` | R and the animation popup | show the next frame of the animated image under the cursor; step one frame in the popup while paused |
+| `<CR>` | R only | preview the block or image under the cursor, or close the preview |
 | `i` | R only | cross to S and insert before the cursor |
 | `a` | R only | cross to S and insert after the cursor |
 | `I` | R only | cross to S and insert at the first non-blank |
@@ -146,6 +153,81 @@ a link rather than a link.
 When the cursor is not on a link the key goes back to Vim, so a path written as
 plain text still opens the way `gf` always did.
 
+### Images
+
+A markdown image is drawn in R as character-cell artwork: the engine reads the
+file named by the reference, averages its pixels down to the cells the page has
+room for, and colours each cell from a fixed sixty-four-colour palette. PNG, JPEG,
+GIF, WebP, BMP, TIFF and ICO are supported.
+
+An animated GIF or WebP is drawn on its first frame and stays there. `<C-n>` on
+the artwork advances it one frame, wrapping from the last frame back to the
+first; the frames are fetched the first time the key is pressed on that image,
+so a document that is never stepped through never pays for decoding them. The
+cursor does not move, the artwork keeps its rows, and the key goes back to Vim
+when the cursor is not on an animated image. Set `image_animation = false` to
+turn the whole thing off. Decoding frames can take a second or two, so while the
+fetch is in flight the bottom of the editor says so; pressing `<C-n>` again in
+that window does not start a second fetch — the presses are remembered and the
+image advances one frame for each of them when the frames arrive.
+
+An animation is refused when it has more than 256 frames or more than 64 million
+decoded pixels in total; the image is then drawn on its first frame, and pressing
+`<C-n>` on it warns that it is too large to animate instead of moving the cursor.
+The warning is given once per render, so pressing again neither re-renders nor
+repeats it. The popup warns on open in the same way.
+
+`<CR>` on the artwork opens the image alone in a popup, and there it plays: one
+one-shot timer is restarted with each frame's own delay, and the animation loops
+until the popup is closed. A frame whose delay is under 20 ms is shown for 100 ms,
+the floor browsers use, so a GIF encoded "as fast as possible" cannot turn into a
+redraw loop. `Space` pauses and resumes from the frame on screen, `<C-n>` steps
+one frame while paused, and closing the popup stops the timer — as does anything
+that re-renders what it is showing. A still image's popup binds neither key and
+creates no timer.
+
+`gx` on an image — on its artwork, or on its alt text when the engine cannot
+draw it — opens the referenced file with the operating system's default
+application. A relative destination resolves against the document's directory,
+as it does in the engine. A remote URL, a `data:` URI or a missing file is
+reported rather than fetched or launched, and the key goes back to Vim when the
+cursor is not on an image.
+
+The picture is fitted to the window twice over — to the text width, and to the
+text height or `image_max_height` when that is smaller — and is never enlarged.
+`image_max_height` defaults to 20 display rows, so a figure sits inside the page
+rather than filling it; because the aspect ratio is preserved, the cap narrows
+the artwork too. Set it to `false` to let an image use the whole page again. A
+picture smaller than both bounds keeps its natural size. The preview popup is
+not capped: `<CR>` shows the image at the popup's own size. Resizing the window
+redraws the inline artwork at the new size.
+
+`image_mode` chooses the drawing:
+
+- `auto` (the default) uses quadrant blocks — `▘▝▖▗`, four sub-cells in two
+  colours — when `'termguicolors'` is on, and the ASCII ramp otherwise;
+- `quads` always uses quadrant blocks, twice the horizontal detail of half
+  blocks; it needs a font with the block elements (Cascadia Mono, the Windows
+  Terminal default, has them);
+- `blocks` uses half blocks — `▀`, two colours per cell — for a font without
+  quadrants;
+- `ascii` uses one ASCII character per cell, coloured from the same palette, so
+  it works in a terminal without true colour;
+- `off` draws no artwork at all and shows each reference's alt text, which is
+  exactly what the plugin did before images were supported.
+
+Relative destinations resolve against the directory of the document holding the
+reference, so `![](images/a.png)` means what it means everywhere else. Absolute
+paths work too. A URL or `data:` URI is never fetched and is not something the
+engine will draw. An image that cannot be drawn — missing file, unsupported
+format, one over the engine's limits — falls back to its alt text, the rest of
+the document renders normally, and nothing is reported: a picture the reader
+cannot see is not an error in the document.
+
+Images inside a table cell or a heading stay as alt text. Those constructs hold
+inline text rather than blocks, so there is nowhere to put a picture without
+changing the table's or heading's own layout.
+
 ### Commands
 
 | Command | Does |
@@ -162,12 +244,19 @@ require('md-render').setup({
   engine = nil,                 -- nil resolves to `md-render` on PATH, then
                                 -- <repo>/bin/md-render.exe
   theme = 'catppuccin_mocha',   -- passed to the engine as --theme
+  image_mode = 'auto',          -- 'auto' | 'quads' | 'blocks' | 'ascii' | 'off'
+  image_max_height = 20,        -- display rows one inline image may occupy;
+                                -- false lets it fill the page again
+  image_animation = true,       -- fetch an animated image's frames on demand
   filetypes = { 'markdown' },   -- the filetypes that open in R
   keymaps = {
     toggle = '<leader>mr',
     write = '<C-s>',
     preview = '<CR>',
     follow = 'gf',
+    open_image = 'gx',            -- in R, on an image
+    frame_next = '<C-n>',         -- in R and in the animation popup
+    pause = '<Space>',            -- in the animation popup, while it plays
     zoom_in = '+',                -- in the preview popup, on a diagram
     zoom_out = '-',
     scroll_left = '<C-h>',        -- in the preview popup, on any block
@@ -185,9 +274,10 @@ require('md-render').setup({
 Every field is optional and the merge is deep, so `setup{ keymaps = { toggle =
 'gm' } }` keeps the write key. A filetype that is not listed is left alone
 entirely: no state, no autocmds, no keymaps. Setting `keymaps.toggle`,
-`keymaps.write`, `keymaps.preview` or `keymaps.follow` to `false` leaves that
-key alone, and so do `keymaps.zoom_in`, `keymaps.zoom_out`, `keymaps.scroll_left`
-and `keymaps.scroll_right`.
+`keymaps.write`, `keymaps.preview`, `keymaps.follow`, `keymaps.open_image`,
+`keymaps.frame_next` or `keymaps.pause` to `false` leaves that key alone, and so
+do `keymaps.zoom_in`, `keymaps.zoom_out`, `keymaps.scroll_left` and
+`keymaps.scroll_right`.
 
 The four preview keys are set in the popup's own buffer rather than in R or S,
 because they act on the block the popup is showing. They are deliberately not in

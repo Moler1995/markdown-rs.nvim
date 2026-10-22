@@ -22,6 +22,30 @@ local function line_text(line)
   return table.concat(parts)
 end
 
+--- Style one display row from a wire line's spans.
+---
+--- `styles` is the document's style table; each span's index is an index into
+--- it. Styles are interned here rather than up front, so a frame using a colour
+--- no earlier frame used costs one highlight group and nothing else.
+local function paint_line(buf, row, line, styles)
+  -- Extmark columns are byte offsets, so this walks bytes rather than
+  -- columns. That is also why the engine's width guarantee matters here: a
+  -- line that overflowed would soft-wrap and break the one-display-line-per-
+  -- buffer-line correspondence the cursor mapping depends on.
+  local col = 0
+  for _, span in ipairs(line.spans) do
+    local index, text = span[1], span[2]
+    local len = #text
+    if len > 0 then
+      vim.api.nvim_buf_set_extmark(buf, M.ns, row, col, {
+        end_col = col + len,
+        hl_group = style.group(styles[index + 1], index),
+      })
+      col = col + len
+    end
+  end
+end
+
 --- Replace `buf`'s contents with `doc` and style every span.
 function M.apply(buf, doc)
   local lines = {}
@@ -43,22 +67,7 @@ function M.apply(buf, doc)
   vim.api.nvim_buf_clear_namespace(buf, M.ns, 0, -1)
 
   for i, line in ipairs(doc.lines) do
-    -- Extmark columns are byte offsets, so this walks bytes rather than
-    -- columns. That is also why the engine's width guarantee matters here: a
-    -- line that overflowed would soft-wrap and break the one-display-line-per-
-    -- buffer-line correspondence the cursor mapping depends on.
-    local col = 0
-    for _, span in ipairs(line.spans) do
-      local index, text = span[1], span[2]
-      local len = #text
-      if len > 0 then
-        vim.api.nvim_buf_set_extmark(buf, M.ns, i - 1, col, {
-          end_col = col + len,
-          hl_group = style.group(doc.styles[index + 1], index),
-        })
-        col = col + len
-      end
-    end
+    paint_line(buf, i - 1, line, doc.styles)
   end
 
   vim.bo[buf].modifiable = false
@@ -68,6 +77,47 @@ function M.apply(buf, doc)
   -- something the user could save, so the flag is cleared rather than left to
   -- turn every swap back to S into an E37.
   vim.bo[buf].modified = false
+end
+
+--- Replace an animated image's rows with frame `index` (0-based).
+---
+--- Only `start .. start + rows - 1` is written, and only those rows' extmarks
+--- are reset. Every other line and extmark is left exactly as it was, so the
+--- cursor, the scroll position and the source mapping stay valid while frames
+--- are swapped; the engine guarantees a frame occupies its first frame's rows,
+--- so the buffer's line count does not change either.
+---
+--- A frame line is a span array rather than a wire line — it has no `source`
+--- and no `spans` field, because every row belongs to the reference the
+--- animation names — hence the wrapping below. Styles are shared with the
+--- document, so a colour a later frame introduces is interned on first sight.
+---
+--- Returns false when `index` is not one of `animation`'s frames.
+function M.frame(buf, doc, animation, index)
+  local frame = animation and animation.frames and animation.frames[index + 1]
+  if not frame or not vim.api.nvim_buf_is_valid(buf) then
+    return false
+  end
+
+  local first, rows = animation.start, animation.rows
+  local lines = {}
+  for i = 1, rows do
+    local parts = {}
+    for _, span in ipairs(frame.lines[i] or {}) do
+      parts[#parts + 1] = span[2]
+    end
+    lines[i] = table.concat(parts)
+  end
+
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, first, first + rows, false, lines)
+  vim.api.nvim_buf_clear_namespace(buf, M.ns, first, first + rows)
+  for i = 1, math.min(rows, #frame.lines) do
+    paint_line(buf, first + i - 1, { spans = frame.lines[i] }, doc.styles)
+  end
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].modified = false
+  return true
 end
 
 --- The source line `row` (0-based display row) came from, or nil if synthetic.

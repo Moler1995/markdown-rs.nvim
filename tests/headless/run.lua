@@ -132,6 +132,19 @@ local function current_state()
   return state.get(vim.api.nvim_get_current_win())
 end
 
+--- The height bound the plugin sends to the engine for `win`.
+---
+--- The window's text height unless `image_max_height` asks for less; `false`
+--- (or a non-positive number) means no cap.
+local function image_height(win)
+  local height = vim.api.nvim_win_get_height(win)
+  local cap = config.options.image_max_height
+  if type(cap) == 'number' and cap > 0 then
+    height = math.min(height, cap)
+  end
+  return height
+end
+
 --- True when the current window is really showing this window's rendered
 --- buffer — not merely when the state says so.
 local function showing_rendered()
@@ -198,6 +211,7 @@ section('8.1', function()
   eq_table('8.1 default filetypes', d.filetypes, { 'markdown' })
   eq_table('8.1 default keymaps', d.keymaps,
     { toggle = '<leader>mr', write = '<C-s>', preview = '<CR>', follow = 'gf',
+      open_image = 'gx', frame_next = '<C-n>', pause = '<Space>',
       zoom_in = '+', zoom_out = '-', scroll_left = '<C-h>', scroll_right = '<C-l>' })
   eq_table('8.1 default preview caps', d.preview,
     { max_width_pct = 0.9, max_height_pct = 0.9 })
@@ -573,7 +587,7 @@ section('10.1', function()
   --- A real document for `content` at `width`, from the real engine.
   local function document(content, width)
     local doc, done
-    real_render(config.options, content, width, function(err, d)
+    real_render(config.options, content, { width = width, encoding = 'off' }, function(err, d)
       check(string.format('10.1 the engine rendered at width %d', width),
         err == nil, tostring(err))
       doc, done = d, true
@@ -594,8 +608,8 @@ section('10.1', function()
     wide ~= nil and narrow ~= nil and wide.width == 80 and narrow.width == 40)
 
   local inflight = {}
-  engine_mod.render = function(_, _, width, cb)
-    inflight[#inflight + 1] = { width = width, cb = cb }
+  engine_mod.render = function(_, _, view, cb)
+    inflight[#inflight + 1] = { width = view.width, cb = cb }
   end
 
   -- The first render is asked for at the width the window has now, and the stub
@@ -651,17 +665,23 @@ section('10.2', function()
   local source = st.source
   local width = vim.api.nvim_win_get_width(st.win)
     - (vim.fn.getwininfo(st.win)[1].textoff or 0)
+  local height = image_height(st.win)
+  local encoding = config.image_encoding()
   local tick = vim.api.nvim_buf_get_changedtick(source)
   local theme = config.options.theme
 
-  truthy('10.2 the render is cached under (buffer, tick, width, theme)',
-    state.cached(source, tick, width, theme) ~= nil)
+  truthy('10.2 the render is cached under (buffer, tick, width, height, encoding, theme)',
+    state.cached(source, tick, width, height, encoding, theme) ~= nil)
   expect('10.2 another width is a different render',
-    state.cached(source, tick, width + 1, theme), nil)
+    state.cached(source, tick, width + 1, height, encoding, theme), nil)
+  expect('10.2 another height is a different render',
+    state.cached(source, tick, width, height + 1, encoding, theme), nil)
+  expect('10.2 another encoding is a different render',
+    state.cached(source, tick, width, height, 'off', theme), nil)
   expect('10.2 another changedtick is a different render',
-    state.cached(source, tick + 1, width, theme), nil)
+    state.cached(source, tick + 1, width, height, encoding, theme), nil)
   expect('10.2 another theme is a different render',
-    state.cached(source, tick, width, 'nord'), nil)
+    state.cached(source, tick, width, height, encoding, 'nord'), nil)
 
   -- What the key is for: a round trip costs no process at all.
   local before = engine_calls
@@ -959,7 +979,12 @@ section('10.7', function()
   end))
 
   truthy('10.7 with a rendered buffer of its own', other.rendered ~= reading.rendered)
-  expect('10.7 from the cache, with no engine spawned', engine_calls, before)
+  -- The split halves the window, and the page height is part of what a render
+  -- is: an image has to fit the window that shows it, so the cache key carries
+  -- the height. The split therefore costs one render at the new height rather
+  -- than a cache hit — and the check below is that it produced the same
+  -- document, which is the promise that matters for an image-free file.
+  expect('10.7 one render for the new page height', engine_calls, before + 1)
 
   local lines = vim.api.nvim_buf_get_lines(other.rendered, 0, 3, false)
   eq_table('10.7 and the same content as the window it was split from',
@@ -1181,7 +1206,7 @@ section('11.2', function()
 
   local function render_at(width)
     local doc, err, done
-    preview.render_block(config.options, block, width, function(e, d)
+    preview.render_block(config.options, block, { width = width, encoding = 'off' }, function(e, d)
       err, doc, done = e, d, true
     end)
     wait_until(function() return done end)
@@ -2259,6 +2284,1358 @@ section('13.7', function()
 
   config.options.keymaps.scroll_left = defaults.scroll_left
   config.options.keymaps.scroll_right = defaults.scroll_right
+end)
+
+--------------------------------------------------------------------------------
+-- 14. Images
+--------------------------------------------------------------------------------
+
+section('14.1', function()
+  -- The arguments the plugin builds. The engine is *wrapped* rather than
+  -- stubbed: the command line is what is under test, and the real render that
+  -- follows proves the arguments are ones the engine accepts.
+  local image_fixture = repo .. '/tests/fixtures/image.md'
+  local image_dir = vim.fn.fnamemodify(image_fixture, ':p:h')
+  local commands = {}
+  local wrapped = vim.system
+  vim.system = function(cmd, opts_, on_exit)
+    commands[#commands + 1] = cmd
+    return wrapped(cmd, opts_, on_exit)
+  end
+
+  local function find_arg(cmd, flag)
+    for i, arg in ipairs(cmd) do
+      if arg == flag then
+        return cmd[i + 1]
+      end
+    end
+    return nil
+  end
+
+  local termguicolors = vim.o.termguicolors
+
+  -- 5.4: `auto` follows 'termguicolors' at request time.
+  vim.o.termguicolors = false
+  config.setup({})
+  truthy('14.1 in R on a document with an image', reset_to(image_fixture))
+  local win = vim.api.nvim_get_current_win()
+  local cmd = commands[#commands]
+  truthy('14.1 the engine was asked to render', cmd ~= nil)
+  expect('14.1 without true colour, auto resolves to ascii',
+    find_arg(cmd, '--image-encoding'), 'ascii')
+  expect('14.1 the height bound is the page, capped by image_max_height',
+    find_arg(cmd, '--image-max-height'), tostring(image_height(win)))
+  expect('14.1 relative images resolve from the document\'s directory',
+    find_arg(cmd, '--base'), image_dir)
+
+  -- The same request with true colour on is a different cache key, so the next
+  -- render reaches the engine and the encoding switches.
+  vim.o.termguicolors = true
+  local before = #commands
+  md.show_rendered()
+  truthy('14.1 with true colour, a new render is asked for',
+    wait_until(function() return #commands > before end))
+  expect('14.1 with true colour, auto resolves to quads',
+    find_arg(commands[#commands], '--image-encoding'), 'quads')
+
+  -- 5.2: an unnamed buffer has no directory to resolve against, so the flag is
+  -- left out and the engine falls back to its working directory.
+  local engine = require('md-render.engine')
+  local answered = false
+  engine.render(config.options, 'plain\n', { width = 20, encoding = 'off' }, function()
+    answered = true
+  end)
+  truthy('14.1 the unnamed-buffer render finished', wait_until(function() return answered end))
+  expect('14.1 without a file, --base is omitted',
+    find_arg(commands[#commands], '--base'), nil)
+
+  vim.o.termguicolors = termguicolors
+  vim.system = wrapped
+  config.setup({})
+end)
+
+section('14.2', function()
+  -- 5.3: the height is part of the cache key, so a height-only change reaches
+  -- the engine instead of being answered from a document laid out for another
+  -- page.
+  local image_fixture = repo .. '/tests/fixtures/image.md'
+  local height = vim.api.nvim_win_get_height(vim.api.nvim_get_current_win())
+  config.setup({ image_mode = 'blocks' })
+  truthy('14.2 in R on a document with an image', reset_to(image_fixture))
+  local st = current_state()
+
+  local before = engine_calls
+  vim.cmd(string.format('resize %d', height - 3))
+  vim.api.nvim_exec_autocmds('WinResized', {})
+  truthy('14.2 a height-only change asks the engine again',
+    wait_until(function() return engine_calls > before end))
+  -- `:resize` counts the statusline in its number, so the text height it
+  -- leaves is one row less than asked for; what matters here is only that the
+  -- window changed at all.
+  truthy('14.2 the window really is shorter',
+    vim.api.nvim_win_get_height(st.win) < height,
+    string.format('height %d, was %d', vim.api.nvim_win_get_height(st.win), height))
+
+  vim.cmd(string.format('resize %d', height))
+  config.setup({})
+end)
+
+section('14.3', function()
+  -- 5.6: `off` reproduces the old output exactly — alt text, no artwork.
+  local image_fixture = repo .. '/tests/fixtures/image.md'
+  config.setup({ image_mode = 'off' })
+  truthy('14.3 in R with images off', reset_to(image_fixture))
+
+  local text = table.concat(
+    vim.api.nvim_buf_get_lines(current_state().rendered, 0, -1, false), '\n')
+  truthy('14.3 the alt text is shown', text:find('a sample image', 1, true) ~= nil, text)
+  truthy('14.3 no artwork is drawn',
+    text:find('▀', 1, true) == nil and text:find('▄', 1, true) == nil)
+
+  config.setup({})
+end)
+
+section('14.4', function()
+  -- 5.6: an image the engine cannot draw is not an error. The document around
+  -- it renders, its alt text stands in, and nothing is reported.
+  local missing_fixture = repo .. '/tests/fixtures/missing-image.md'
+  local function errors()
+    local n = 0
+    for _, note in ipairs(notifications) do
+      if note.level >= vim.log.levels.ERROR then
+        n = n + 1
+      end
+    end
+    return n
+  end
+
+  config.setup({ image_mode = 'blocks' })
+  local before_errors = errors()
+  truthy('14.4 in R on a document with a missing image', reset_to(missing_fixture))
+
+  local text = table.concat(
+    vim.api.nvim_buf_get_lines(current_state().rendered, 0, -1, false), '\n')
+  truthy('14.4 the prose before it is there',
+    text:find('Before the missing picture', 1, true) ~= nil, text)
+  truthy('14.4 the alt text stands in for the image',
+    text:find('a missing image', 1, true) ~= nil, text)
+  truthy('14.4 the prose after it is there',
+    text:find('After the missing picture', 1, true) ~= nil, text)
+  expect('14.4 and nothing was reported', errors(), before_errors)
+
+  config.setup({})
+end)
+
+section('14.5', function()
+  -- 5.6: a shorter window means a shorter image, and the picture keeps its
+  -- shape rather than being cropped.
+  local image_fixture = repo .. '/tests/fixtures/image.md'
+  config.setup({ image_mode = 'blocks' })
+  truthy('14.5 in R on a document with an image', reset_to(image_fixture))
+  local st = current_state()
+  local height = vim.api.nvim_win_get_height(st.win)
+
+  local function artwork_rows()
+    local n = 0
+    for _, line in ipairs(vim.api.nvim_buf_get_lines(st.rendered, 0, -1, false)) do
+      if line:find('▀', 1, true) or line:find('▄', 1, true) then
+        n = n + 1
+      end
+    end
+    return n
+  end
+
+  local tall = artwork_rows()
+  truthy('14.5 the artwork is drawn', tall > 0, string.format('%d rows', tall))
+  truthy('14.5 and fits the page', tall <= height,
+    string.format('%d rows in a %d-row page', tall, height))
+
+  vim.cmd(string.format('resize %d', height - 3))
+  vim.api.nvim_exec_autocmds('WinResized', {})
+  truthy('14.5 a shorter window redraws it shorter',
+    wait_until(function() return artwork_rows() < tall end),
+    string.format('still %d rows', artwork_rows()))
+
+  vim.cmd(string.format('resize %d', height))
+  config.setup({})
+end)
+
+section('14.6', function()
+  -- The inline height cap. The harness window is 8 rows (set at the top of this
+  -- file), so the default of 20 cannot bind here: the default is asserted on
+  -- the option itself and the bound with a cap small enough to bite.
+  local image_fixture = repo .. '/tests/fixtures/image.md'
+  expect('14.6 the cap defaults to 20 rows', config.defaults.image_max_height, 20)
+
+  local inner = vim.system
+  local commands = {}
+  vim.system = function(cmd, opts, on_exit)
+    commands[#commands + 1] = cmd
+    return inner(cmd, opts, on_exit)
+  end
+
+  local function find_arg(cmd, flag)
+    for i, arg in ipairs(cmd or {}) do
+      if arg == flag then
+        return cmd[i + 1]
+      end
+    end
+    return nil
+  end
+
+  -- The 16×16 fixture is 16 columns by 8 rows uncapped; a cap of 4 halves it.
+  local function artwork()
+    local rows, widest = 0, 0
+    for _, line in ipairs(
+      vim.api.nvim_buf_get_lines(current_state().rendered, 0, -1, false)) do
+      if line:find('▀', 1, true) or line:find('▄', 1, true) then
+        rows = rows + 1
+        widest = math.max(widest, vim.fn.strdisplaywidth(line))
+      end
+    end
+    return rows, widest
+  end
+
+  config.setup({ image_mode = 'blocks', image_max_height = 4 })
+  truthy('14.6 in R with a 4-row cap', reset_to(image_fixture))
+  local height = vim.api.nvim_win_get_height(current_state().win)
+  truthy('14.6 the window is taller than the cap', height > 4,
+    string.format('window %d rows', height))
+  expect('14.6 the engine is asked for the cap',
+    find_arg(commands[#commands], '--image-max-height'), '4')
+
+  local rows, widest = artwork()
+  truthy('14.6 the artwork is at most 4 rows tall', rows > 0 and rows <= 4,
+    string.format('%d rows', rows))
+  truthy('14.6 and correspondingly narrower than 16 columns', widest < 16,
+    string.format('%d columns', widest))
+
+  -- `false` means no cap. nil could not: `setup` merges tables, and a nil value
+  -- is indistinguishable from a missing key.
+  config.setup({ image_mode = 'blocks', image_max_height = false })
+  truthy('14.6 in R with the cap off', reset_to(image_fixture))
+  expect('14.6 without the cap the engine gets the page height',
+    find_arg(commands[#commands], '--image-max-height'),
+    tostring(vim.api.nvim_win_get_height(current_state().win)))
+  rows = artwork()
+  expect('14.6 and the artwork keeps its natural 8 rows', rows, 8)
+
+  vim.system = inner
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 2.1 Options and keys
+--------------------------------------------------------------------------------
+
+section('2.1', function()
+  config.setup({})
+  expect('2.1 image_animation defaults on', config.options.image_animation, true)
+  expect('2.1 frame_next defaults to <C-n>', config.options.keymaps.frame_next, '<C-n>')
+  expect('2.1 open_image defaults to gx', config.options.keymaps.open_image, 'gx')
+  expect('2.1 pause defaults to <Space>', config.options.keymaps.pause, '<Space>')
+
+  local resolved = config.setup({
+    image_animation = false,
+    keymaps = { frame_next = '<C-p>' },
+  })
+  expect('2.1 setup overrides image_animation', resolved.image_animation, false)
+  expect('2.1 setup overrides frame_next', resolved.keymaps.frame_next, '<C-p>')
+  expect('2.1 setup keeps the other new keys', resolved.keymaps.open_image, 'gx')
+  expect('2.1 and the defaults are not mutated', config.defaults.image_animation, true)
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 2.2 The engine's animation flag
+--------------------------------------------------------------------------------
+
+section('2.2', function()
+  local engine = require('md-render.engine')
+
+  local inner = vim.system
+  local calls = {}
+  vim.system = function(cmd, opts, on_exit)
+    calls[#calls + 1] = cmd
+    return inner(cmd, opts, on_exit)
+  end
+
+  local function has_flag(argv, flag)
+    for _, a in ipairs(argv or {}) do
+      if a == flag then
+        return true
+      end
+    end
+    return false
+  end
+
+  local function render_with(animation)
+    calls = {}
+    local done = false
+    local err
+    engine.render(config.options, 'plain text\n', {
+      width = 20,
+      encoding = 'off',
+      animation = animation,
+    }, function(e)
+      err = e
+      done = true
+    end)
+    truthy('2.2 the engine answers', wait_until(function() return done end),
+      tostring(err or 'no answer'))
+    return calls[1]
+  end
+
+  local animated = render_with(true)
+  truthy('2.2 an animated request passes --image-animation', has_flag(animated, '--image-animation'),
+    vim.inspect(animated))
+
+  local plain = render_with(false)
+  truthy('2.2 an ordinary request passes no flag', plain and not has_flag(plain, '--image-animation'),
+    vim.inspect(plain))
+
+  vim.system = inner
+end)
+
+--------------------------------------------------------------------------------
+-- 2.3 The cache key knows about frames
+--------------------------------------------------------------------------------
+
+section('2.3', function()
+  -- A key that stands apart from any real buffer: the cache is a plain table.
+  local buf = {}
+  local doc = { width = 20, styles = {}, lines = {} }
+  local theme = 'catppuccin_mocha'
+
+  state.store(buf, 7, 80, 10, 'quads', theme, false, doc)
+  truthy('2.3 a plain render is found for a plain request',
+    state.cached(buf, 7, 80, 10, 'quads', theme, false) == doc)
+  expect('2.3 the same render is not returned for an animated request',
+    state.cached(buf, 7, 80, 10, 'quads', theme, true), nil)
+
+  state.store(buf, 7, 80, 10, 'quads', theme, true, doc)
+  expect('2.3 an animated render is not returned for a plain request',
+    state.cached(buf, 7, 80, 10, 'quads', theme, false), nil)
+  truthy('2.3 and it is found for an animated one',
+    state.cached(buf, 7, 80, 10, 'quads', theme, true) == doc)
+
+  state.forget_cache(buf)
+end)
+
+--------------------------------------------------------------------------------
+-- 2.4 Finding the image under the cursor
+--------------------------------------------------------------------------------
+
+section('2.4', function()
+  local image_fixture = repo .. '/tests/fixtures/image.md'
+  local svg_fixture = repo .. '/tests/fixtures/image-svg.md'
+
+  local function rows()
+    local st = current_state()
+    return vim.api.nvim_buf_get_lines(st.rendered, 0, -1, false), st
+  end
+
+  local function row_where(text)
+    local rendered = rows()
+    for i, line in ipairs(rendered) do
+      if line:find(text, 1, true) then
+        return i - 1
+      end
+    end
+    return nil
+  end
+
+  config.setup({ image_mode = 'blocks' })
+  truthy('2.4 in R on a document with a drawn image', reset_to(image_fixture))
+
+  local rendered, st = rows()
+  local artwork
+  for i, line in ipairs(rendered) do
+    if line:find('▀', 1, true) or line:find('▄', 1, true) then
+      artwork = i - 1
+      break
+    end
+  end
+  truthy('2.4 the artwork is drawn', artwork ~= nil)
+  local source_lines = vim.api.nvim_buf_get_lines(st.source, 0, -1, false)
+  local found = artwork and link.image_at_row(source_lines, st.doc, artwork)
+  truthy('2.4 the artwork row finds the image', found ~= nil)
+  expect('2.4 with its destination', found and found.raw, 'images/image_sample.png')
+  truthy('2.4 and it is flagged as an image', found and found.image == true)
+
+  local prose = row_where('Before the picture')
+  truthy('2.4 the prose row exists', prose ~= nil)
+  expect('2.4 a prose row finds no image', link.image_at_row(source_lines, st.doc, prose), nil)
+
+  truthy('2.4 in R on a document with an undrawable image', reset_to(svg_fixture))
+  rendered, st = rows()
+  local alt = row_where('an svg icon')
+  truthy('2.4 the alt text is shown', alt ~= nil)
+  source_lines = vim.api.nvim_buf_get_lines(st.source, 0, -1, false)
+  found = alt and link.image_at_row(source_lines, st.doc, alt)
+  truthy('2.4 the alt-text row finds the image', found ~= nil)
+  expect('2.4 with the SVG destination', found and found.raw, 'images/icon.svg')
+  truthy('2.4 and it is flagged as an image', found and found.image == true)
+
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 3.1 Applying one frame touches only the artwork
+--------------------------------------------------------------------------------
+
+--- The fixture with an animated GIF of three flat-coloured frames.
+local animated_fixture = repo .. '/tests/fixtures/animated.md'
+
+--- The 0-based display row the animated fixture's artwork starts on.
+local function artwork_row(st)
+  for i, line in ipairs(vim.api.nvim_buf_get_lines(st.rendered, 0, -1, false)) do
+    if line:find('▀', 1, true) or line:find('▄', 1, true) then
+      return i - 1
+    end
+  end
+  return nil
+end
+
+--- The 0-based display row whose text contains `text`, or nil.
+local function rendered_row(st, text)
+  for i, line in ipairs(vim.api.nvim_buf_get_lines(st.rendered, 0, -1, false)) do
+    if line:find(text, 1, true) then
+      return i - 1
+    end
+  end
+end
+
+--- Every extmark in `buf`, as `{ row, col, end_col, group }`.
+local function extmarks(buf)
+  local out = {}
+  for _, m in ipairs(vim.api.nvim_buf_get_extmarks(buf, render.ns, 0, -1, { details = true })) do
+    out[#out + 1] = { m[2], m[3], m[4].end_col, m[4].hl_group }
+  end
+  return out
+end
+
+--- Render `source`'s contents, resolving relative images against `path`'s
+--- directory, and wait for the answer.
+local function render_doc(source, path, view)
+  local engine = require('md-render.engine')
+  local content = table.concat(vim.api.nvim_buf_get_lines(source, 0, -1, false), '\n')
+  local ok, doc, err = pcall(function()
+    local got, got_err, done
+    engine.render(config.options, content, vim.tbl_extend('force', {
+      base = vim.fn.fnamemodify(path, ':p:h'),
+      encoding = 'blocks',
+    }, view), function(e, d)
+      got, got_err, done = d, e, true
+    end)
+    wait_until(function() return done end)
+    return got, got_err
+  end)
+  return ok and doc, ok and err or doc
+end
+
+section('3.1', function()
+  config.setup({ image_mode = 'blocks' })
+  truthy('3.1 in R on the animated fixture', reset_to(animated_fixture))
+  local st = current_state()
+  local first = artwork_row(st)
+  truthy('3.1 the artwork is drawn', first ~= nil)
+
+  local static = st.doc
+  local before_lines = vim.api.nvim_buf_get_lines(st.rendered, 0, -1, false)
+  local before_marks = extmarks(st.rendered)
+
+  local doc, err = render_doc(st.source, animated_fixture, {
+    width = static.width,
+    height = vim.api.nvim_win_get_height(st.win),
+    animation = true,
+  })
+  truthy('3.1 the engine returns an animated document', doc ~= nil, tostring(err))
+  local animation = doc and doc.animations and doc.animations[1]
+  truthy('3.1 with an animation', animation ~= nil)
+  expect('3.1 at the artwork row', animation and animation.start, first)
+  expect('3.1 one row tall', animation and animation.rows, 1)
+
+  local span = animation and animation.frames[2].lines[1][1]
+  truthy('3.1 it has a second frame', span ~= nil)
+  truthy('3.1 the frame is applied', render.frame(st.rendered, doc, animation, 1))
+
+  local after_lines = vim.api.nvim_buf_get_lines(st.rendered, 0, -1, false)
+  local mismatched = {}
+  for i, line in ipairs(before_lines) do
+    if i - 1 < animation.start or i - 1 >= animation.start + animation.rows then
+      if after_lines[i] ~= line then
+        mismatched[#mismatched + 1] = i - 1
+      end
+    end
+  end
+  eq_table('3.1 no other line changed', mismatched, {})
+
+  local function outside(marks)
+    local kept = {}
+    for _, m in ipairs(marks) do
+      if m[1] < animation.start or m[1] >= animation.start + animation.rows then
+        kept[#kept + 1] = m
+      end
+    end
+    return kept
+  end
+  eq_table('3.1 no other extmark changed', outside(extmarks(st.rendered)), outside(before_marks))
+
+  local marks = vim.api.nvim_buf_get_extmarks(st.rendered, render.ns,
+    { animation.start, 0 }, { animation.start + animation.rows - 1, -1 }, { details = true })
+  expect('3.1 the artwork is one span', #marks, 1)
+  expect('3.1 showing the requested frame',
+    marks[1] and marks[1][4].hl_group, style.group(doc.styles[span[1] + 1], span[1]))
+  expect('3.1 with the frame\'s text', after_lines[animation.start + 1], span[2])
+
+  truthy('3.1 and the buffer is left unmodifiable', not vim.bo[st.rendered].modifiable)
+  truthy('3.1 and unmodified', not vim.bo[st.rendered].modified)
+
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 3.2 The first press fetches, the rest are immediate
+--------------------------------------------------------------------------------
+
+section('3.2', function()
+  config.setup({ image_mode = 'blocks' })
+  truthy('3.2 in R on the animated fixture', reset_to(animated_fixture))
+  local st = current_state()
+  local row = artwork_row(st)
+  truthy('3.2 the artwork is drawn', row ~= nil)
+  vim.api.nvim_win_set_cursor(st.win, { row + 1, 0 })
+
+  local inner = vim.system
+  local calls = {}
+  vim.system = function(cmd, opts, on_exit)
+    calls[#calls + 1] = cmd
+    return inner(cmd, opts, on_exit)
+  end
+
+  local function has_flag(argv, flag)
+    for _, a in ipairs(argv or {}) do
+      if a == flag then
+        return true
+      end
+    end
+    return false
+  end
+
+  -- Nothing is fetched until the key is pressed.
+  expect('3.2 no frames before the key', st.doc and st.doc.animations, nil)
+  expect('3.2 and no engine call', #calls, 0)
+
+  md.frame_next(st.win)
+  truthy('3.2 the first press fetches the frames',
+    wait_until(function() return st.doc and st.doc.animations and st.doc.animations[1] end))
+  expect('3.2 with exactly one engine call', #calls, 1)
+  truthy('3.2 asking for animation', has_flag(calls[1], '--image-animation'), vim.inspect(calls[1]))
+
+  local animation = st.doc.animations[1]
+  expect('3.2 and shows the second frame', st.frames[animation.source], 1)
+  local rendered = vim.api.nvim_buf_get_lines(st.rendered, 0, -1, false)
+  local marks = vim.api.nvim_buf_get_extmarks(st.rendered, render.ns,
+    { animation.start, 0 }, { animation.start + animation.rows - 1, -1 }, { details = true })
+  local span = animation.frames[2].lines[1][1]
+  expect('3.2 the frame on screen is the second one',
+    marks[1] and marks[1][4].hl_group, style.group(st.doc.styles[span[1] + 1], span[1]))
+  expect('3.2 with its text', rendered[animation.start + 1], span[2])
+
+  -- Later presses are answered from memory.
+  md.frame_next(st.win)
+  expect('3.2 the second press advances', st.frames[animation.source], 2)
+  expect('3.2 with no engine call', #calls, 1)
+  md.frame_next(st.win)
+  expect('3.2 the third wraps to the first frame', st.frames[animation.source], 0)
+
+  vim.system = inner
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 3.3 Off an animated image the key is Vim's
+--------------------------------------------------------------------------------
+
+section('3.3', function()
+  -- A motion stands in for "the key's ordinary editor action": `nvim -l` never
+  -- enters the main loop, so a pending operator (`g@`) is flushed by the time
+  -- the feed returns and cannot be observed. A `w` that moves the cursor is the
+  -- same proof — the key reached Vim rather than being swallowed.
+  config.setup({ image_mode = 'blocks', keymaps = { frame_next = 'w' } })
+  truthy('3.3 in R on the animated fixture', reset_to(animated_fixture))
+  local st = current_state()
+  local row = artwork_row(st)
+  truthy('3.3 the artwork is drawn', row ~= nil)
+
+  local function prose_row()
+    for i, line in ipairs(vim.api.nvim_buf_get_lines(st.rendered, 0, -1, false)) do
+      if line:find('Before the picture', 1, true) then
+        return i - 1
+      end
+    end
+  end
+
+  vim.api.nvim_win_set_cursor(st.win, { prose_row() + 1, 0 })
+  local before = vim.api.nvim_win_get_cursor(st.win)
+  feed('w')
+  truthy('3.3 on prose the key reaches Vim',
+    not vim.deep_equal(vim.api.nvim_win_get_cursor(st.win), before))
+
+  -- Even on the artwork it is fetched, not consumed. `image_animation = false`
+  -- takes the key out of the plugin's hands entirely.
+  config.setup({ image_mode = 'blocks', keymaps = { frame_next = 'w' }, image_animation = false })
+  truthy('3.3 in R with animation off', reset_to(animated_fixture))
+  st = current_state()
+  vim.api.nvim_win_set_cursor(st.win, { artwork_row(st) + 1, 0 })
+  before = vim.api.nvim_win_get_cursor(st.win)
+  feed('w')
+  truthy('3.3 with animation off the key reaches Vim',
+    not vim.deep_equal(vim.api.nvim_win_get_cursor(st.win), before))
+  truthy('3.3 and no frames were fetched', st.doc and st.doc.animations == nil)
+
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 3.4 Stepping keeps the cursor and the source mapping
+--------------------------------------------------------------------------------
+
+section('3.4', function()
+  config.setup({ image_mode = 'blocks' })
+  truthy('3.4 in R on the animated fixture', reset_to(animated_fixture))
+  local st = current_state()
+  local row = artwork_row(st)
+  truthy('3.4 the artwork is drawn', row ~= nil)
+  vim.api.nvim_win_set_cursor(st.win, { row + 1, 0 })
+
+  local before = vim.api.nvim_win_get_cursor(st.win)
+  local lnum = render.source_line_for(st.doc, row)
+  truthy('3.4 the artwork maps to a source line', lnum ~= nil)
+
+  md.frame_next(st.win)
+  truthy('3.4 the first press fetches the frames',
+    wait_until(function() return st.doc and st.doc.animations and st.doc.animations[1] end))
+  md.frame_next(st.win)
+
+  eq_table('3.4 the cursor did not move', vim.api.nvim_win_get_cursor(st.win), before)
+  expect('3.4 the artwork still maps to the same source line',
+    render.source_line_for(st.doc, row), lnum)
+  expect('3.4 and the source line still maps to the artwork',
+    render.row_for_source(st.doc, lnum), row)
+
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 3.5 A re-render puts the image back on its first frame
+--------------------------------------------------------------------------------
+
+section('3.5', function()
+  config.setup({ image_mode = 'blocks' })
+  truthy('3.5 in R on the animated fixture', reset_to(animated_fixture))
+  local st = current_state()
+  local row = artwork_row(st)
+  truthy('3.5 the artwork is drawn', row ~= nil)
+  vim.api.nvim_win_set_cursor(st.win, { row + 1, 0 })
+
+  md.frame_next(st.win)
+  truthy('3.5 frames arrive',
+    wait_until(function() return st.doc and st.doc.animations and st.doc.animations[1] end))
+  local animation = st.doc.animations[1]
+  local source = animation.source
+  expect('3.5 showing a later frame', st.frames[source], 1)
+
+  -- A height change is a re-render: the page changed, so the engine is asked
+  -- again and the answer is a new document with no frame on screen.
+  local height = vim.api.nvim_win_get_height(st.win)
+  vim.cmd(string.format('resize %d', height - 3))
+  vim.api.nvim_exec_autocmds('WinResized', {})
+  truthy('3.5 a resize re-renders',
+    wait_until(function() return st.frames ~= nil and st.frames[source] == nil end))
+  truthy('3.5 and the document is no longer the animated one',
+    st.doc ~= nil and st.doc.animations == nil)
+
+  vim.cmd(string.format('resize %d', height))
+  truthy('3.5 the window is restored', wait_until(function()
+    return vim.api.nvim_win_get_height(st.win) == height
+  end))
+
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 3.6 An animation over the caps is reported, not silently still
+--------------------------------------------------------------------------------
+
+section('3.6', function()
+  config.setup({ image_mode = 'blocks' })
+  local path = repo .. '/tests/fixtures/too-large-animation.md'
+  truthy('3.6 in R on the over-cap fixture', reset_to(path))
+  local st = current_state()
+  local row = artwork_row(st)
+  truthy('3.6 the first frame is drawn', row ~= nil)
+  vim.api.nvim_win_set_cursor(st.win, { row + 1, 0 })
+  local cursor = vim.api.nvim_win_get_cursor(st.win)
+
+  local before = #notifications
+  md.frame_next(st.win)
+  truthy('3.6 the engine names the reference as refused',
+    wait_until(function()
+      return st.doc and st.doc.animations_limited and #st.doc.animations_limited > 0
+    end))
+  truthy('3.6 and the reader is told', wait_until(function()
+    return #notifications > before
+  end), vim.inspect(notifications[#notifications]))
+  expect('3.6 as a warning', notifications[#notifications].level, vim.log.levels.WARN)
+  truthy('3.6 naming the file',
+    notifications[#notifications].msg:find('image_257.gif', 1, true) ~= nil,
+    notifications[#notifications].msg)
+  expect('3.6 with no frames carried', st.doc.animations, nil)
+  truthy('3.6 and the key is not passed on to Vim',
+    vim.deep_equal(vim.api.nvim_win_get_cursor(st.win), cursor))
+
+  -- Pressing again is answered from the state already on screen: the same
+  -- message is not repeated, and no second request is made.
+  local notes = #notifications
+  md.frame_next(st.win)
+  vim.wait(100)
+  expect('3.6 a second press does not repeat the warning', #notifications, notes)
+  truthy('3.6 or move the cursor',
+    vim.deep_equal(vim.api.nvim_win_get_cursor(st.win), cursor))
+
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 3.7 Presses during the fetch are remembered
+--------------------------------------------------------------------------------
+
+section('3.7', function()
+  config.setup({ image_mode = 'blocks' })
+  local path = repo .. '/tests/fixtures/animated.md'
+  truthy('3.7 in R on the animated fixture', reset_to(path))
+  local st = current_state()
+  local row = artwork_row(st)
+  truthy('3.7 the artwork is drawn', row ~= nil)
+  vim.api.nvim_win_set_cursor(st.win, { row + 1, 0 })
+  local cursor = vim.api.nvim_win_get_cursor(st.win)
+
+  -- An animated render cached by an earlier section would answer this request
+  -- immediately, and the in-flight state is exactly what is under test.
+  state.forget_cache(st.source)
+
+  local engine_mod = require('md-render.engine')
+  local real_render = engine_mod.render
+  local calls = 0
+  engine_mod.render = function(opts, content, view, cb)
+    calls = calls + 1
+    vim.defer_fn(function()
+      real_render(opts, content, view, cb)
+    end, 250)
+  end
+
+  local echoes = {}
+  local real_echo = vim.api.nvim_echo
+  vim.api.nvim_echo = function(chunks, history, opts)
+    echoes[#echoes + 1] = chunks[1] and chunks[1][1] or ''
+    return real_echo(chunks, history, opts)
+  end
+
+  -- Both presses land before the answer: one fetch, and the image moves two
+  -- frames — the fixture has three, so two steps is the third frame.
+  md.frame_next(st.win)
+  md.frame_next(st.win)
+  expect('3.7 two presses issue one fetch', calls, 1)
+  truthy('3.7 the fetch is announced at the bottom',
+    echoes[1] and echoes[1]:find('decoding', 1, true) ~= nil, vim.inspect(echoes))
+
+  truthy('3.7 the frames arrive', wait_until(function()
+    return st.doc and st.doc.animations ~= nil
+  end))
+  local animation = st.doc.animations[1]
+  expect('3.7 two presses land the third frame', st.frames[animation.source], 2)
+  expect('3.7 and the hint is cleared', echoes[#echoes], '')
+  expect('3.7 with no second fetch', calls, 1)
+  truthy('3.7 and the cursor has not moved',
+    vim.deep_equal(vim.api.nvim_win_get_cursor(st.win), cursor))
+
+  -- Frames in memory: one press, one frame, still no request.
+  md.frame_next(st.win)
+  expect('3.7 the next press steps one frame', st.frames[animation.source], 0)
+  expect('3.7 and still no engine call', calls, 1)
+
+  engine_mod.render = real_render
+  vim.api.nvim_echo = real_echo
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 4.1 Opening an image with the system application
+--------------------------------------------------------------------------------
+
+section('4.1', function()
+  config.setup({ image_mode = 'blocks' })
+
+  local opened = {}
+  local real_open = vim.ui.open
+  vim.ui.open = function(path)
+    opened[#opened + 1] = path
+    return {}
+  end
+
+  local function latest()
+    return notifications[#notifications] or {}
+  end
+
+  local function same_path(got, want)
+    if not got then
+      return false
+    end
+    return vim.fs.normalize(vim.fn.fnamemodify(got, ':p'))
+      == vim.fs.normalize(vim.fn.fnamemodify(want, ':p'))
+  end
+
+  -- Relative: resolved against the document's directory.
+  truthy('4.1 in R on the animated fixture', reset_to(animated_fixture))
+  local st = current_state()
+  vim.api.nvim_win_set_cursor(st.win, { artwork_row(st) + 1, 0 })
+  md.open_image()
+  expect('4.1 a relative reference opens one file', #opened, 1)
+  truthy('4.1 resolved beside the document',
+    same_path(opened[1], repo .. '/tests/fixtures/images/image_animation.gif'), opened[1])
+
+  -- Absolute: used as given.
+  local abs = repo .. '/tests/fixtures/images/image_sample.png'
+  local tmp = vim.fn.tempname() .. '.md'
+  vim.fn.writefile({ '![absolute](' .. abs .. ')' }, tmp)
+  truthy('4.1 in R on an absolute reference', reset_to(tmp))
+  st = current_state()
+  vim.api.nvim_win_set_cursor(st.win, { artwork_row(st) + 1, 0 })
+  md.open_image()
+  expect('4.1 an absolute reference opens one file', #opened, 2)
+  truthy('4.1 used as written', same_path(opened[2], abs), opened[2])
+  vim.fn.delete(tmp)
+
+  -- Remote: reported, never fetched.
+  truthy('4.1 in R on a remote reference', reset_to(repo .. '/tests/fixtures/remote-image.md'))
+  st = current_state()
+  local remote_row = rendered_row(st, 'a remote picture')
+  truthy('4.1 the remote alt text is shown', remote_row ~= nil)
+  vim.api.nvim_win_set_cursor(st.win, { remote_row + 1, 0 })
+  local before = #notifications
+  md.open_image()
+  expect('4.1 a remote reference opens nothing', #opened, 2)
+  truthy('4.1 and is reported', #notifications > before
+    and latest().msg:find('is not a local file', 1, true) ~= nil, latest().msg)
+  expect('4.1 as a warning', latest().level, vim.log.levels.WARN)
+
+  -- Missing: reported, nothing launched.
+  truthy('4.1 in R on a missing reference', reset_to(repo .. '/tests/fixtures/missing-image.md'))
+  st = current_state()
+  local missing_row = rendered_row(st, 'a missing image')
+  truthy('4.1 the missing image alt text is shown', missing_row ~= nil)
+  vim.api.nvim_win_set_cursor(st.win, { missing_row + 1, 0 })
+  before = #notifications
+  md.open_image()
+  expect('4.1 a missing file opens nothing', #opened, 2)
+  truthy('4.1 and is reported', latest().msg:find('no such file', 1, true) ~= nil, latest().msg)
+
+  -- Not a file: reported, nothing launched.
+  truthy('4.1 in R on a directory reference', reset_to(repo .. '/tests/fixtures/directory-image.md'))
+  st = current_state()
+  local dir_row = rendered_row(st, 'a directory')
+  truthy('4.1 the directory alt text is shown', dir_row ~= nil)
+  vim.api.nvim_win_set_cursor(st.win, { dir_row + 1, 0 })
+  before = #notifications
+  md.open_image()
+  expect('4.1 a directory opens nothing', #opened, 2)
+  truthy('4.1 and is reported', latest().msg:find('not a file', 1, true) ~= nil, latest().msg)
+
+  vim.ui.open = real_open
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 4.2 Alt text of an image the engine cannot draw
+--------------------------------------------------------------------------------
+
+section('4.2', function()
+  config.setup({ image_mode = 'blocks' })
+
+  local opened = {}
+  local real_open = vim.ui.open
+  vim.ui.open = function(path)
+    opened[#opened + 1] = path
+    return {}
+  end
+
+  truthy('4.2 in R on the SVG fixture', reset_to(repo .. '/tests/fixtures/image-svg.md'))
+  local st = current_state()
+  vim.api.nvim_win_set_cursor(st.win, { rendered_row(st, 'an svg icon') + 1, 0 })
+  md.open_image()
+  expect('4.2 the alt text opens the SVG', #opened, 1)
+  truthy('4.2 the file the reference names',
+    opened[1] and opened[1]:match('icon%.svg$') ~= nil, opened[1])
+
+  -- On prose the key is Vim's. A `w` stands in for "the ordinary action", since
+  -- a pending operator is flushed before `nvim -l` can observe it.
+  config.setup({ image_mode = 'blocks', keymaps = { open_image = 'w' } })
+  truthy('4.2 in R with a motion as the key', reset_to(repo .. '/tests/fixtures/image-svg.md'))
+  st = current_state()
+  local prose_row = rendered_row(st, 'Before the picture')
+  truthy('4.2 the prose row exists', prose_row ~= nil)
+  vim.api.nvim_win_set_cursor(st.win, { prose_row + 1, 0 })
+  local cursor = vim.api.nvim_win_get_cursor(st.win)
+  feed('w')
+  truthy('4.2 on prose the key reaches Vim',
+    not vim.deep_equal(vim.api.nvim_win_get_cursor(st.win), cursor))
+
+  vim.ui.open = real_open
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 4.3 A failed launch is reported
+--------------------------------------------------------------------------------
+
+section('4.3', function()
+  config.setup({ image_mode = 'blocks' })
+
+  local real_open = vim.ui.open
+  vim.ui.open = function()
+    return nil, 'no handler on this desktop'
+  end
+
+  truthy('4.3 in R on the animated fixture', reset_to(animated_fixture))
+  local st = current_state()
+  vim.api.nvim_win_set_cursor(st.win, { artwork_row(st) + 1, 0 })
+  local before = #notifications
+  md.open_image()
+  truthy('4.3 the failure is reported to the user', #notifications > before)
+  truthy('4.3 with what the handler said',
+    notifications[#notifications].msg:find('no handler on this desktop', 1, true) ~= nil,
+    notifications[#notifications].msg)
+  expect('4.3 as a warning', notifications[#notifications].level, vim.log.levels.WARN)
+
+  vim.ui.open = real_open
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 5.1 The popup shows the image alone
+--------------------------------------------------------------------------------
+
+--- A document whose only image is inline, in the middle of a paragraph.
+local inline_fixture = repo .. '/tests/fixtures/inline-image.md'
+
+section('5.1', function()
+  config.setup({ image_mode = 'blocks' })
+  truthy('5.1 in R on a document with an inline image', reset_to(inline_fixture))
+  local st = current_state()
+  -- The engine draws an inline image too, so the paragraph is a run of artwork
+  -- rows between the prose before and after it, all mapped to the same source
+  -- line. The cursor can be on any of them; the first artwork row is one.
+  local row = artwork_row(st)
+  truthy('5.1 the inline artwork is drawn', row ~= nil)
+  expect('5.1 and maps to the paragraph\'s line', render.source_line_for(st.doc, row), 2)
+  local lines = vim.api.nvim_buf_get_lines(st.source, 0, -1, false)
+
+  local block = preview.locate(st.doc, row, lines)
+  truthy('5.1 the paragraph row resolves to a block', block ~= nil)
+  expect('5.1 and to the image kind', block and block.kind, 'image')
+  eq_table('5.1 carrying the reference alone', block and block.lines,
+    { '![a small image](images/image_sample.png)' })
+
+  -- The geometry and view agree with design D6: the popup's inner width and
+  -- height are the budget, and the image is drawn rather than asked for at
+  -- `off` — task 5.1's "off-encoding render" is the one line of it the design
+  -- overrides, since `off` would show the alt text and not the image.
+  local geometry = preview.geometry('image', 80)
+  expect('5.1 the image budget is the popup\'s inner width', geometry.budget, geometry.inner)
+
+  local base = vim.fn.fnamemodify(inline_fixture, ':p:h')
+  local view = preview.view(block, geometry, base)
+  expect('5.1 at the popup\'s inner width', view.width, geometry.inner)
+  expect('5.1 bounded by the popup\'s inner height', view.height, geometry.max_h - 2)
+  -- The inline height cap is read only by `request`. The popup keeps its own
+  -- geometry, which is what lets the preview show an image larger than the page
+  -- does at all.
+  config.setup({ image_mode = 'blocks', image_max_height = 3 })
+  expect('5.1 the inline height cap does not reach the popup',
+    preview.view(block, geometry, base).height, geometry.max_h - 2)
+  config.setup({ image_mode = 'blocks' })
+  expect('5.1 at the document\'s encoding, not off', view.encoding, 'blocks')
+  expect('5.1 with the document\'s base', view.base, base)
+
+  local inner = vim.system
+  local calls = {}
+  vim.system = function(cmd, opts, on_exit)
+    calls[#calls + 1] = cmd
+    return inner(cmd, opts, on_exit)
+  end
+
+  local doc, err, done
+  preview.render_block(config.options, block, view, function(e, d)
+    err, doc, done = e, d, true
+  end)
+  truthy('5.1 the popup render answers', wait_until(function() return done end), tostring(err))
+  vim.system = inner
+
+  local function flag(name)
+    for i, a in ipairs(calls[1] or {}) do
+      if a == name then
+        return calls[1][i + 1]
+      end
+    end
+  end
+  expect('5.1 asked for the popup\'s width', flag('--width'), tostring(geometry.inner))
+  expect('5.1 asked for the popup\'s inner height', flag('--image-max-height'),
+    tostring(geometry.max_h - 2))
+  expect('5.1 asked for a real encoding', flag('--image-encoding'), 'blocks')
+  expect('5.1 asked for the document\'s base',
+    flag('--base') and vim.fs.normalize(flag('--base')),
+    vim.fs.normalize(vim.fn.fnamemodify(base, ':p')))
+
+  local text = {}
+  for _, line in ipairs(doc and doc.lines or {}) do
+    local parts = {}
+    for _, span in ipairs(line.spans) do
+      parts[#parts + 1] = span[2]
+    end
+    text[#text + 1] = table.concat(parts)
+  end
+  local joined = table.concat(text, '\n')
+  truthy('5.1 the popup shows the artwork',
+    joined:find('▀', 1, true) ~= nil or joined:find('▄', 1, true) ~= nil, joined)
+  truthy('5.1 and not the prose before the reference', not joined:find('Some text', 1, true))
+  truthy('5.1 and not the prose after it', not joined:find('more text', 1, true))
+
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 5.2 The preview key on an image
+--------------------------------------------------------------------------------
+
+section('5.2', function()
+  -- A motion stands in for the key so that "falls through" is observable under
+  -- `nvim -l`, which never enters the main loop.
+  config.setup({ image_mode = 'blocks', keymaps = { preview = 'w' } })
+  truthy('5.2 in R on the animated fixture', reset_to(animated_fixture))
+  local st = current_state()
+  local art = artwork_row(st)
+  truthy('5.2 the artwork is drawn', art ~= nil)
+  vim.api.nvim_win_set_cursor(st.win, { art + 1, 0 })
+
+  feed('w')
+  truthy('5.2 the key on the artwork opens a popup', wait_until(preview.is_open))
+  local popup = preview.popup
+  expect('5.2 with the image kind', popup and popup.kind, 'image')
+  local shown = popup and table.concat(vim.api.nvim_buf_get_lines(popup.buf, 0, -1, false), '\n') or ''
+  truthy('5.2 showing the artwork',
+    shown:find('▀', 1, true) ~= nil or shown:find('▄', 1, true) ~= nil, shown)
+  truthy('5.2 and not the document around it', not shown:find('Before the picture', 1, true))
+  preview.close()
+
+  -- Off the artwork the key is Vim's again.
+  local prose = rendered_row(st, 'Before the picture')
+  truthy('5.2 the prose row exists', prose ~= nil)
+  vim.api.nvim_win_set_cursor(st.win, { prose + 1, 0 })
+  local cursor = vim.api.nvim_win_get_cursor(st.win)
+  feed('w')
+  truthy('5.2 on prose the key reaches Vim',
+    not vim.deep_equal(vim.api.nvim_win_get_cursor(st.win), cursor))
+  expect('5.2 and no popup was opened', preview.is_open(), false)
+
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 5.3 Playback in the popup
+--------------------------------------------------------------------------------
+
+--- Open the preview on the artwork row of `path` and return the popup, or nil.
+local function open_image_popup(path)
+  truthy('in R on ' .. vim.fn.fnamemodify(path, ':t'), reset_to(path))
+  local st = current_state()
+  local art = artwork_row(st)
+  if not art then
+    return nil
+  end
+  vim.api.nvim_win_set_cursor(st.win, { art + 1, 0 })
+  feed(config.options.keymaps.preview)
+  if not wait_until(preview.is_open) then
+    return nil
+  end
+  return preview.popup
+end
+
+--- The popup's artwork rows, joined.
+local function popup_artwork(popup)
+  local animation = popup.animation
+  if not animation then
+    return ''
+  end
+  return table.concat(vim.api.nvim_buf_get_lines(popup.buf, animation.start,
+    animation.start + animation.rows, false), '\n')
+end
+
+--- The text of frame `index`'s artwork rows.
+local function frame_text(animation, index)
+  local frame = animation.frames[index + 1]
+  local rows = {}
+  for _, spans in ipairs(frame.lines) do
+    local parts = {}
+    for _, span in ipairs(spans) do
+      parts[#parts + 1] = span[2]
+    end
+    rows[#rows + 1] = table.concat(parts)
+  end
+  return table.concat(rows, '\n')
+end
+
+section('5.3', function()
+  -- The clamp is a property of a number, so it is asserted as one.
+  local delays = { frames = {
+    { delay = 0 }, { delay = 19 }, { delay = 20 }, { delay = 120 },
+  } }
+  expect('5.3 a zero delay is played at 100 ms', preview.frame_delay(delays, 0), 100)
+  expect('5.3 a 19 ms delay is played at 100 ms', preview.frame_delay(delays, 1), 100)
+  expect('5.3 a 20 ms delay is kept', preview.frame_delay(delays, 2), 20)
+  expect('5.3 a 120 ms delay is kept', preview.frame_delay(delays, 3), 120)
+
+  config.setup({ image_mode = 'blocks' })
+  local popup = open_image_popup(animated_fixture)
+  truthy('5.3 the popup opens', popup ~= nil)
+  if not popup then
+    return
+  end
+  truthy('5.3 with the animation', popup.animation ~= nil)
+  expect('5.3 three frames', popup.animation and #popup.animation.frames, 3)
+  truthy('5.3 playing by itself', popup.playing)
+  truthy('5.3 with a timer', popup.timer ~= nil)
+
+  -- The fixture's delays are 40/80/120 ms, so a full loop is 240 ms. A generous
+  -- deadline keeps a loaded machine from failing the check while still bounding
+  -- it: the loop must be seen through, not merely entered.
+  local advances, last, wrapped = 0, popup.frame, false
+  local saw_frame = { [last] = true }
+  vim.wait(6000, function()
+    if preview.popup ~= popup then
+      return true
+    end
+    local f = popup.frame
+    if f ~= last then
+      advances = advances + 1
+      last = f
+      saw_frame[f] = true
+      if advances >= 2 and f == 0 then
+        wrapped = true
+        return true
+      end
+    end
+    return false
+  end, 5)
+
+  truthy('5.3 frames advance at least twice', advances >= 2, 'advances=' .. advances)
+  truthy('5.3 and the frame on screen is the one recorded',
+    popup_artwork(popup) == frame_text(popup.animation, popup.frame),
+    popup_artwork(popup))
+  truthy('5.3 the last frame was reached', saw_frame[#popup.animation.frames - 1])
+  truthy('5.3 and playback wrapped to the first', wrapped)
+
+  preview.close()
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 5.4 Pause, resume and stepping while paused
+--------------------------------------------------------------------------------
+
+section('5.4', function()
+  config.setup({ image_mode = 'blocks' })
+  local popup = open_image_popup(animated_fixture)
+  truthy('5.4 the popup opens', popup ~= nil)
+  if not popup then
+    return
+  end
+  truthy('5.4 playing', popup.playing)
+
+  -- Space is the pause key, bound in this popup's buffer.
+  feed(config.options.keymaps.pause)
+  expect('5.4 the key pauses', popup.playing, false)
+  expect('5.4 and closes the timer', popup.timer, nil)
+  local paused_at = popup.frame
+  vim.wait(400)
+  expect('5.4 and no frame advances while paused', popup.frame, paused_at)
+
+  -- While paused, the stepping key moves exactly one frame.
+  feed(config.options.keymaps.frame_next)
+  expect('5.4 one step advances exactly one frame',
+    popup.frame, (paused_at + 1) % #popup.animation.frames)
+  expect('5.4 and stays paused', popup.playing, false)
+  expect('5.4 and still has no timer', popup.timer, nil)
+  truthy('5.4 the buffer shows the stepped frame',
+    popup_artwork(popup) == frame_text(popup.animation, popup.frame))
+
+  -- Resuming continues from the frame the reader chose.
+  local resumed_at = popup.frame
+  feed(config.options.keymaps.pause)
+  expect('5.4 the key resumes', popup.playing, true)
+  truthy('5.4 with a new timer', popup.timer ~= nil)
+  local next_seen
+  vim.wait(2000, function()
+    if preview.popup ~= popup then
+      return true
+    end
+    if popup.frame ~= resumed_at then
+      next_seen = popup.frame
+      return true
+    end
+    return false
+  end, 5)
+  expect('5.4 the first frame after resuming is the next one',
+    next_seen, (resumed_at + 1) % #popup.animation.frames)
+
+  preview.close()
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 5.5 Closing and re-rendering stop playback
+--------------------------------------------------------------------------------
+
+--- The number of live timer handles libuv holds.
+local function timer_handles()
+  local n = 0
+  vim.uv.walk(function(handle)
+    if handle and not handle:is_closing() and handle:get_type() == 'timer' then
+      n = n + 1
+    end
+  end)
+  return n
+end
+
+section('5.5', function()
+  config.setup({ image_mode = 'blocks' })
+  local baseline = timer_handles()
+
+  local popup = open_image_popup(animated_fixture)
+  truthy('5.5 the popup opens', popup ~= nil)
+  if not popup then
+    return
+  end
+  truthy('5.5 playing', popup.playing)
+  expect('5.5 one timer was created', timer_handles(), baseline + 1)
+
+  -- Close through the window rather than `M.close`, so the `WinClosed` path is
+  -- the one under test.
+  vim.cmd('close')
+  truthy('5.5 the close is noticed', wait_until(function() return preview.popup == nil end))
+  truthy('5.5 and the buffer is gone', not vim.api.nvim_buf_is_valid(popup.buf))
+  expect('5.5 and the timer is closed', timer_handles(), baseline)
+  local last = popup.frame
+  vim.wait(300)
+  expect('5.5 and no frame was written after the close', popup.frame, last)
+
+  -- A re-render replaces the content, so playback of the old document stops.
+  local again = open_image_popup(animated_fixture)
+  truthy('5.5 a second popup opens and plays', again and again.playing)
+  if not again then
+    return
+  end
+  local replacement = {
+    width = 1,
+    layout_width = 1,
+    styles = { { fg = '#000000', bg = nil, bold = false, underline = false } },
+    lines = { { spans = { { 0, 'x' } }, source = 0 } },
+    source_map = { 0 },
+  }
+  preview.adopt(replacement, again.budget, 'natural')
+  expect('5.5 a re-render stops the old playback', again.playing, false)
+  expect('5.5 and closes its timer', again.timer, nil)
+  expect('5.5 leaving no animation behind', again.animation, nil)
+  expect('5.5 and no handle at the baseline', timer_handles(), baseline)
+
+  preview.close()
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 5.6 A still image does not play
+--------------------------------------------------------------------------------
+
+section('5.6', function()
+  config.setup({ image_mode = 'blocks' })
+  local baseline = timer_handles()
+
+  -- A still PNG.
+  local popup = open_image_popup(repo .. '/tests/fixtures/image.md')
+  truthy('5.6 a still image opens a popup', popup ~= nil)
+  if not popup then
+    return
+  end
+  expect('5.6 with no animation', popup.animation, nil)
+  expect('5.6 not playing', popup.playing, false)
+  expect('5.6 with no timer', popup.timer, nil)
+  expect('5.6 and no handle was created', timer_handles(), baseline)
+
+  -- `pause` and `frame_next` are not bound here: they keep their ordinary
+  -- editor meanings. Space moves the cursor right and <C-n> moves it down.
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
+  local before = vim.api.nvim_win_get_cursor(0)
+  feed(config.options.keymaps.pause)
+  local after_pause = vim.api.nvim_win_get_cursor(0)
+  truthy('5.6 pause is Vim\'s space',
+    after_pause[1] == before[1] and after_pause[2] > before[2],
+    vim.inspect(after_pause))
+  vim.api.nvim_win_set_cursor(0, { 1, 0 })
+  feed(config.options.keymaps.frame_next)
+  local after_step = vim.api.nvim_win_get_cursor(0)
+  truthy('5.6 frame_next keeps its ordinary meaning', after_step[1] > 1,
+    vim.inspect(after_step))
+  truthy('5.6 the popup is still open', preview.is_open())
+  preview.close()
+
+  -- An animated GIF with animation off is a still image too.
+  config.setup({ image_mode = 'blocks', image_animation = false })
+  popup = open_image_popup(animated_fixture)
+  truthy('5.6 animation off still opens a popup', popup ~= nil)
+  if not popup then
+    return
+  end
+  expect('5.6 with no animation data', popup.animation, nil)
+  expect('5.6 no timer', popup.timer, nil)
+  expect('5.6 and the handle count is unchanged', timer_handles(), baseline)
+  preview.close()
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 5.8 An animation over the caps is reported in the popup too
+--------------------------------------------------------------------------------
+
+section('5.8', function()
+  config.setup({ image_mode = 'blocks' })
+  local before = #notifications
+  local popup = open_image_popup(repo .. '/tests/fixtures/too-large-animation.md')
+  truthy('5.8 a refused animation still opens a popup', popup ~= nil)
+  if not popup then
+    return
+  end
+  truthy('5.8 and the reader is told', wait_until(function()
+    return #notifications > before
+  end))
+  expect('5.8 as a warning', notifications[#notifications].level, vim.log.levels.WARN)
+  truthy('5.8 saying the image is too large',
+    notifications[#notifications].msg:find('too large to animate', 1, true) ~= nil,
+    notifications[#notifications].msg)
+  expect('5.8 with nothing to play', popup.animation, nil)
+  expect('5.8 and no timer', popup.timer, nil)
+  preview.close()
+  config.setup({})
 end)
 
 --------------------------------------------------------------------------------

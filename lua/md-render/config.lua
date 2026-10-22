@@ -20,6 +20,58 @@ M.defaults = {
   -- entirely — no state, no autocmds, no keymaps.
   filetypes = { 'markdown' },
 
+  -- How images in the document are drawn.
+  --
+  --   'auto'    `quads` when the terminal can show 24-bit colour
+  --             (`'termguicolors'`), `ascii` when it cannot. Resolved when a
+  --             render is asked for, not at setup, so toggling `'termguicolors'`
+  --             takes effect on the next render.
+  --   'quads'   Quadrant glyphs, four sub-cells in two colours. Twice the
+  --             horizontal detail of `blocks` at the same width, and only worth
+  --             it with true colour and a font that draws the block elements
+  --             (Cascadia Mono, the Windows Terminal default, does).
+  --   'blocks'  Half-block glyphs, two colours per cell. The fallback for a
+  --             terminal whose font has no quadrants.
+  --   'ascii'   One ASCII glyph per cell from a fixed luminance ramp. Works in
+  --             any terminal, in one colour per cell.
+  --   'off'     No artwork at all: every image reference reads as its alt text,
+  --             which is exactly what the plugin showed before images were
+  --             supported.
+  --
+  -- An image the engine cannot draw — a URL, a missing file, an unsupported
+  -- format, one over the size limits — falls back to its alt text whatever this
+  -- is set to, so no document can fail to render because of a picture.
+  image_mode = 'auto',
+
+  -- The most display rows one inline image may occupy.
+  --
+  -- The engine scales an image by a single factor, so capping the height also
+  -- narrows the artwork: a 640×360 picture in a 126-column window is 72×20
+  -- rather than the 126×35 the width alone would allow. The aspect ratio is
+  -- preserved and the window's own height remains a hard bound, so this is a
+  -- "sit inside the page" setting, not a zoom.
+  --
+  -- `false` removes the cap, leaving the window's text height as the only
+  -- bound — the behaviour before this option existed. `nil` cannot mean that:
+  -- `setup` merges with `vim.tbl_deep_extend`, where a nil value is
+  -- indistinguishable from a missing key.
+  --
+  -- The block preview is unaffected: its popup has its own height, so the
+  -- preview key still shows an image larger than the page does.
+  image_max_height = 20,
+
+  -- Whether an animated GIF or WebP is rendered with its frames.
+  --
+  -- The rendered view never plays by itself: it shows the first frame, and
+  -- `keymaps.frame_next` steps through the rest. `true` asks the engine for the
+  -- frames in the first place; `false` renders every image as its first frame
+  -- with no animation data at all, and the stepping key is left alone.
+  --
+  -- This costs decode time and payload only for documents that contain an
+  -- animated image: the engine's animation field is omitted entirely when
+  -- there is nothing to animate.
+  image_animation = true,
+
   -- Buffer-local keymaps set in R. Set a value to `false` to leave the key
   -- alone. `toggle` swaps between R and S; `preview` opens the block popup and
   -- belongs to R only, since in S the cursor is already on the block's source.
@@ -43,11 +95,29 @@ M.defaults = {
   -- `zl` are two keystrokes: there is no key to hold down, so a reader cannot
   -- cross a wide block by holding one. Unlike the zoom keys these do something
   -- in a table's popup, which can be wider than the popup as well.
+  --
+  -- `frame_next` belongs to R and to the popup's buffer. In R it steps the
+  -- animated image under the cursor — paused is the default state, so one press
+  -- is one frame — and off such an image the key goes back to Vim, so `<C-n>`
+  -- keeps its ordinary meaning everywhere else. In the popup it steps while
+  -- playback is paused.
+  --
+  -- `open_image` belongs to R: it resolves the image reference under the
+  -- cursor — the reference's artwork, or its alt text when the engine cannot
+  -- draw it — and hands the file to `vim.ui.open`. Off an image it goes back to
+  -- Vim. It shadows `gx`, which means "open this with the system handler"
+  -- already, so a URL or a path on prose keeps working.
+  --
+  -- `pause` is the popup's playback toggle, bound there only while an animated
+  -- image is playing.
   keymaps = {
     toggle = '<leader>mr',
     write = '<C-s>',
     preview = '<CR>',
     follow = 'gf',
+    open_image = 'gx',
+    frame_next = '<C-n>',
+    pause = '<Space>',
     zoom_in = '+',
     zoom_out = '-',
     scroll_left = '<C-h>',
@@ -81,6 +151,21 @@ end
 --- True when `ft` is one the plugin manages.
 function M.manages(ft)
   return vim.tbl_contains(M.options.filetypes, ft)
+end
+
+--- The image encoding to ask the engine for, with `auto` resolved now.
+---
+--- Resolved per call rather than at setup because `'termguicolors'` can be
+--- toggled at any moment; a choice made once at setup would be wrong from the
+--- first toggle onwards. The block encodings' two colours per cell are
+--- what make it worth the extra styles, so a terminal that cannot show 24-bit
+--- colour gets the ASCII ramp instead.
+function M.image_encoding()
+  local mode = M.options.image_mode
+  if mode == 'auto' then
+    return vim.o.termguicolors and 'quads' or 'ascii'
+  end
+  return mode
 end
 
 return M

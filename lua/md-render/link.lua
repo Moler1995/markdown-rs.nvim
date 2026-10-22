@@ -93,7 +93,8 @@ end
 --- Parse a link or image starting at `i`, or nil when there is not one there.
 local function parse_at(line, i, refs)
   local start = i
-  if line:sub(i, i) == '!' and line:sub(i + 1, i + 1) == '[' then
+  local image = line:sub(i, i) == '!' and line:sub(i + 1, i + 1) == '['
+  if image then
     i = i + 1
   elseif line:sub(i, i) ~= '[' then
     return nil
@@ -110,7 +111,12 @@ local function parse_at(line, i, refs)
     if not endp then
       return nil
     end
-    return { from = start, to = endp, raw = clean_target(line:sub(close + 2, endp - 1)) }
+    return {
+      from = start,
+      to = endp,
+      raw = clean_target(line:sub(close + 2, endp - 1)),
+      image = image,
+    }
   end
 
   if after == '[' then
@@ -124,12 +130,12 @@ local function parse_at(line, i, refs)
       label = line:sub(i + 1, close - 1)
     end
     local raw = refs[label:lower()]
-    return raw and { from = start, to = endb, raw = raw } or nil
+    return raw and { from = start, to = endb, raw = raw, image = image } or nil
   end
 
   -- A shortcut reference: `[text]` with the definition elsewhere.
   local raw = refs[line:sub(i + 1, close - 1):lower()]
-  return raw and { from = start, to = close, raw = raw } or nil
+  return raw and { from = start, to = close, raw = raw, image = image } or nil
 end
 
 --- A URL written as itself rather than as a link's destination.
@@ -208,6 +214,7 @@ local function finish(parsed)
     target = target,
     fragment = fragment,
     kind = kind,
+    image = parsed.image,
   }
 end
 
@@ -270,6 +277,41 @@ function M.at(lines, lnum, col)
     end
   end
   return nil
+end
+
+--- Every image reference on line `lnum` (0-based), in left-to-right order.
+---
+--- An image is a link whose text was introduced by `!`; the rest of the entry
+--- is the same shape `M.links` returns, `image = true` being what tells them
+--- apart.
+function M.images(lines, lnum)
+  local out = {}
+  for _, l in ipairs(M.links(lines, lnum)) do
+    if l.image then
+      out[#out + 1] = l
+    end
+  end
+  return out
+end
+
+--- The image reference on the display line `row` (0-based) of rendered `doc`.
+---
+--- Every display line of an image's artwork carries the reference's source line,
+--- and so does the line showing its alt text when the engine cannot draw it.
+--- That is the whole lookup: no column arithmetic, because a display column has
+--- no byte column in the source. A line with no source of its own — a table
+--- border, a diagram's rows — has no image either, and so the helper returns nil
+--- rather than guessing at a neighbour's.
+---
+--- The first image on the line wins when it holds more than one, which is the
+--- same rule `M.at` follows from R.
+function M.image_at_row(lines, doc, row)
+  local line = doc and doc.lines and doc.lines[row + 1]
+  local lnum = line and line.source
+  if lnum == nil then
+    return nil
+  end
+  return M.images(lines, lnum)[1]
 end
 
 --- The GitHub-style anchor a heading line produces.

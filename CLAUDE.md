@@ -103,7 +103,7 @@ Rendering is deterministic: same source, width and theme produce byte-identical 
 
 - `engine/src/theme/` defines semantic `Tokens`, derives a flat `Palette` from them, and keeps one constructor per theme in `themes.rs`. Add a theme there, not in the token types.
 - `engine/src/mermaid.rs` wraps the vendored `mermaid-text`. `MermaidTextBackend::Auto` is a narrow lexical heuristic: it picks the Native backend only for a `subgraph` containing its own `direction` line, where Sugiyama is documented to be less compact; everything else uses Sugiyama.
-- The dependency set is deliberately small and is asserted by a test: no terminal-drawing crate, no async runtime, no image decoder. Do not add one to solve a rendering problem.
+- The dependency set is deliberately small and is asserted by `engine/tests/dependencies.rs`: no terminal-drawing crate, no async runtime. The one decoder is `image`, added knowingly for image artwork: markdown images are decoded and drawn as character cells by `engine/src/image_art.rs`, the only stage that knows both the width and the page height. Adding any other crate means adding it to that test's allowlist, with the job it does.
 
 ### The plugin
 

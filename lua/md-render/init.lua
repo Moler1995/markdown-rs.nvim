@@ -48,6 +48,29 @@ local function text_width(win)
   return math.max(1, vim.api.nvim_win_get_width(win) - off)
 end
 
+--- Display rows available to text in `win`.
+---
+--- `nvim_win_get_height` is the window's text height: the statusline is not in
+--- it. That is what an image may be bounded by — artwork that covered the
+--- statusline would not be shown, it would be scrolled past.
+local function page_height(win)
+  return vim.api.nvim_win_get_height(win)
+end
+
+--- The directory relative image destinations in `source` resolve against.
+---
+--- The source file's own directory, so `![](img/a.png)` means what it means to
+--- every other markdown tool. An unnamed buffer has no directory to speak of;
+--- the engine then resolves against its working directory, so this is left nil
+--- rather than guessed at.
+local function image_base(source)
+  local name = vim.api.nvim_buf_get_name(source)
+  if name == '' then
+    return nil
+  end
+  return vim.fn.fnamemodify(name, ':p:h')
+end
+
 --- The name to give this window's rendered buffer.
 ---
 --- The buffer must be named: `:w` on an unnamed `acwrite` buffer fails with
@@ -149,6 +172,12 @@ local function show_rendered(st, doc)
   if st.doc ~= doc then
     render.apply(buf, doc)
     st.doc = doc
+    -- A new document is a new layout, and the frame that was showing belonged
+    -- to the old one. Every render starts the image over on its first frame.
+    -- The reports go with it: a resize is a new answer, and a new warning to
+    -- give if the image is still over the caps.
+    st.frames = {}
+    st.limited = {}
   end
 
   -- Read before the swap, not after. `nvim_win_set_buf` leaves the window
@@ -275,11 +304,27 @@ local function fall_through()
   feed(config.options.keymaps.preview)
 end
 
+--- A one-line hint at the bottom of the editor, or its removal when `nil`.
+---
+--- The frame fetch is the one render that can take seconds — a 640×360 GIF of
+--- 189 frames costs about a second and a half of decoding — and until it lands
+--- the picture looks inert, so a reader pressing the step key has no way to
+--- tell work from a broken key. The hint is echoed rather than notified: it is
+--- status, not a message worth keeping in `:messages`, and it is cleared when
+--- the answer arrives whether or not the answer was usable.
+local function status(message)
+  vim.api.nvim_echo({ { message or '', 'Comment' } }, false, {})
+end
+
 --- Ask the engine for a document, and show it if R is still what we want.
 ---
 --- A cache hit short-circuits the process entirely; that is what makes toggling
 --- back and forth free. Otherwise the request is stamped with a generation, and
 --- a callback from an older generation is dropped rather than applied.
+---
+--- `opts.animate` asks the engine for an animated image's frames as well as its
+--- first frame. `opts.after(doc)` runs with the answer once it has been accepted
+--- — after the staleness check, so it is safe to act on.
 local function request(st, opts)
   opts = opts or {}
   local win = st.win
@@ -288,15 +333,41 @@ local function request(st, opts)
     return
   end
 
+  -- Anything that is not the frame fetch supersedes it: its answer will be
+  -- dropped by the generation check, so the in-flight state cannot wait for
+  -- that answer to clear itself.
+  if not opts.animate then
+    st.fetching = nil
+    st.pending_steps = nil
+  end
+
   local width = text_width(win)
+  -- Inline artwork is bounded by the page unless the reader asked for smaller
+  -- pictures. `false` (or any non-positive number) means no cap: `setup`
+  -- merges tables, where nil cannot say "off" because it is indistinguishable
+  -- from a missing key. The popup builds its own view and is deliberately not
+  -- routed through here, so the preview still shows an image at its own size.
+  local height = page_height(win)
+  local cap = config.options.image_max_height
+  if type(cap) == 'number' and cap > 0 then
+    height = math.min(height, cap)
+  end
+  local encoding = config.image_encoding()
   local tick = vim.api.nvim_buf_get_changedtick(source)
   local theme = config.options.theme
+  -- Frames are asked for only when a caller actually wants them — the step key
+  -- on an image, or the popup opening one. With the option off they are never
+  -- asked for, whatever the caller wants.
+  local animation = (opts.animate and config.options.image_animation) and true or false
 
-  local cached = state.cached(source, tick, width, theme)
+  local cached = state.cached(source, tick, width, height, encoding, theme, animation)
   if cached then
     st.reported = nil
     if st.want == 'R' then
       show_rendered(st, cached)
+    end
+    if opts.after then
+      opts.after(cached)
     end
     return
   end
@@ -305,8 +376,22 @@ local function request(st, opts)
   st.generation = generation
 
   local content = table.concat(vim.api.nvim_buf_get_lines(source, 0, -1, false), '\n')
+  local view = {
+    width = width,
+    height = height,
+    encoding = encoding,
+    base = image_base(source),
+    animation = animation,
+  }
 
-  engine.render(config.options, content, width, function(err, doc)
+  if opts.animate then
+    status('md-render: decoding image frames…')
+  end
+
+  engine.render(config.options, content, view, function(err, doc)
+    if opts.animate then
+      status(nil)
+    end
     -- Two answers are stale, and both have to be dropped here rather than
     -- checked for downstream: one for a state that has asked again, and one for
     -- a state the window no longer has. The second is the subtle one — a state
@@ -322,6 +407,13 @@ local function request(st, opts)
     end
 
     if err then
+      -- The fetch failed, so no `after` will run: the in-flight state has to be
+      -- cleared here or the step key would wait forever for an answer that is
+      -- never coming.
+      if opts.animate then
+        st.fetching = nil
+        st.pending_steps = nil
+      end
       -- The spec is explicit that a failure leaves the editor in S rather than
       -- showing a partial view, so this swaps back if R had already been shown.
       report(st, err)
@@ -332,9 +424,20 @@ local function request(st, opts)
     end
 
     st.reported = nil
-    state.store(source, tick, width, theme, doc)
-    if st.want == 'R' then
+    state.store(source, tick, width, height, encoding, theme, animation, doc)
+    if opts.animate and st.doc and st.want == 'R' then
+      -- Adopted, not applied. The engine guarantees an animated document's
+      -- `lines` are the static document's, so swapping the document under the
+      -- buffer would repaint every line to say the same thing — and would throw
+      -- away the frame index the caller is about to step from.
+      st.doc = doc
+    elseif st.want == 'R' then
       show_rendered(st, doc)
+    end
+    -- Runs only for an answer that passed the staleness check, so a step that
+    -- was overtaken by a newer render never writes a frame.
+    if opts.after then
+      opts.after(doc)
     end
   end)
 end
@@ -503,7 +606,8 @@ function M.preview(win)
   local generation = preview_generation
 
   local geometry = preview.geometry(block.kind, text_width(win))
-  preview.render_block(config.options, block, geometry.budget, function(err, doc)
+  local view = preview.view(block, geometry, image_base(source))
+  preview.render_block(config.options, block, view, function(err, doc)
     if generation ~= preview_generation then
       return
     end
@@ -523,6 +627,237 @@ local function source_lines(st)
     return nil
   end
   return vim.api.nvim_buf_get_lines(st.source, 0, -1, false)
+end
+
+--- The animation `doc` carries for the reference on source line `lnum`, if any.
+---
+--- Absent while the document was rendered without `--image-animation`, which is
+--- every ordinary render: the frames are fetched the first time they are asked
+--- for, not before.
+local function animation_for(doc, lnum)
+  for _, animation in ipairs(doc.animations or {}) do
+    if animation.source == lnum then
+      return animation
+    end
+  end
+  return nil
+end
+
+--- True when the engine refused the animation for the reference on `lnum`.
+---
+--- The image is a GIF or WebP that does animate, but the whole frame set was
+--- over the engine's frame or pixel cap. The document still draws its first
+--- frame; only the frames are missing, and the reader is told so rather than
+--- left pressing the step key at a picture that never moves.
+local function animation_limited(doc, lnum)
+  for _, source in ipairs(doc.animations_limited or {}) do
+    if source == lnum then
+      return true
+    end
+  end
+  return false
+end
+
+--- Tell the reader that `ref` is too large to animate, once per render.
+---
+--- The network of causes here is worth one clear message rather than a key
+--- that silently does nothing: the picture is drawn, so it looks playable, and
+--- only the frames are missing. Repeating the press is answered from
+--- `st.limited`, so a reader who keeps trying gets no engine round trip and no
+--- second warning.
+local function notify_limited(st, ref, lnum)
+  st.limited = st.limited or {}
+  if st.limited[lnum] then
+    return
+  end
+  st.limited[lnum] = true
+  vim.notify(
+    ('md-render: %s is too large to animate; showing its first frame'):format(
+      vim.fn.fnamemodify(ref.target or '', ':t')),
+    vim.log.levels.WARN)
+end
+
+--- True when `ref` names something that could be animated.
+---
+--- Only a local GIF or WebP can carry frames, so the step key needs no engine
+--- round trip to know a PNG, a URL or a `data:` URI is not worth one. Whether
+--- the file really animates — and whether it is over the engine's caps — is the
+--- engine's answer, not the extension's.
+local function maybe_animated(ref)
+  if not ref or ref.kind ~= 'file' then
+    return false
+  end
+  local target = (ref.target or ''):lower()
+  return target:sub(-4) == '.gif' or target:sub(-5) == '.webp'
+end
+
+--- Draw frame `index` (0-based) of `animation` and remember it.
+local function show_frame(st, animation, index)
+  if render.frame(st.rendered, st.doc, animation, index) then
+    st.frames = st.frames or {}
+    st.frames[animation.source] = index
+  end
+end
+
+--- Draw the frame `delta` places from the one on screen, wrapping at the ends.
+local function step_frame(st, animation, delta)
+  local current = (st.frames and st.frames[animation.source]) or 0
+  show_frame(st, animation, (current + delta) % #animation.frames)
+end
+
+--- Show the next frame of the animated image under the cursor in `win`.
+---
+--- R never plays by itself: this key is the only thing that moves an image, and
+--- it moves it one frame. When the document on screen has no frames for the
+--- image — the ordinary case, since frames are fetched lazily — the animated
+--- render is requested and the step is taken as it lands. Everywhere else the
+--- key goes back to Vim, so `<C-n>` keeps its ordinary meaning on prose and on
+--- a still image.
+function M.frame_next(win)
+  win = win or vim.api.nvim_get_current_win()
+  local key = config.options.keymaps.frame_next
+  local st = state.get(win)
+  local buf = vim.api.nvim_win_get_buf(win)
+  if not config.options.image_animation or not st.doc or buf ~= st.rendered then
+    return feed(key)
+  end
+
+  local lines = source_lines(st)
+  if not lines then
+    return feed(key)
+  end
+
+  local row = vim.api.nvim_win_get_cursor(win)[1] - 1
+  local lnum = render.source_line_for(st.doc, row)
+  local ref = lnum and link.images(lines, lnum)[1]
+  if not ref then
+    return feed(key)
+  end
+
+  local animation = animation_for(st.doc, lnum)
+  if animation then
+    if #animation.frames > 1 then
+      step_frame(st, animation, 1)
+    else
+      feed(key)
+    end
+    return
+  end
+
+  -- Already refused by an earlier press: say so again without a second engine
+  -- render, because nothing about the answer can have changed.
+  if animation_limited(st.doc, lnum) then
+    return notify_limited(st, ref, lnum)
+  end
+
+  if not maybe_animated(ref) then
+    return feed(key)
+  end
+
+  -- A press while the frames are already being fetched is remembered, not
+  -- thrown away: decoding the same image again in parallel only burns another
+  -- CPU core and starts a second multi-megabyte render whose answer the
+  -- generation check would drop. The presses are counted here and replayed when
+  -- the one answer lands, so three presses move three frames.
+  if st.fetching then
+    st.pending_steps = (st.pending_steps or 1) + 1
+    return
+  end
+  st.fetching = true
+  st.pending_steps = 1
+
+  -- Asked for and stepped in one press. The step waits for the answer, so the
+  -- image goes from its first frame straight to its second; if the answer has
+  -- no frames for this image — a still GIF, a file that is not there — the
+  -- press falls through as if the key had never been seen. An image the engine
+  -- refused for size is different: the key is consumed and the reader is told
+  -- why, because falling through would move the cursor and still not explain
+  -- the motionless picture.
+  local want = lnum
+  request(st, {
+    animate = true,
+    after = function(doc)
+      st.fetching = nil
+      local steps = st.pending_steps or 1
+      st.pending_steps = nil
+      if animation_limited(doc, want) then
+        return notify_limited(st, ref, want)
+      end
+      local fetched = animation_for(doc, want)
+      if not fetched or #fetched.frames < 2 then
+        -- Each press was the reader's, not ours: hand them all back.
+        for _ = 1, steps do
+          feed(key)
+        end
+        return
+      end
+      show_frame(st, fetched, steps % #fetched.frames)
+    end,
+  })
+end
+
+--- Open the image under the cursor in `win` with the system application.
+---
+--- The destination is resolved the way the engine resolves it: an absolute path
+--- as given, a relative one against the directory of the document holding the
+--- reference, and a document with no file against the working directory. Only
+--- a local file is opened: a URL and a `data:` URI are reported rather than
+--- fetched, and so is a path that is not there. Off an image the key goes back
+--- to Vim, where `gx` keeps its own meaning.
+function M.open_image(win)
+  win = win or vim.api.nvim_get_current_win()
+  local key = config.options.keymaps.open_image
+  local st = state.get(win)
+  local buf = vim.api.nvim_win_get_buf(win)
+  if not st.doc or buf ~= st.rendered then
+    return feed(key)
+  end
+
+  local lines = source_lines(st)
+  if not lines then
+    return feed(key)
+  end
+
+  local row = vim.api.nvim_win_get_cursor(win)[1] - 1
+  local lnum = render.source_line_for(st.doc, row)
+  local ref = lnum and link.images(lines, lnum)[1]
+  if not ref then
+    return feed(key)
+  end
+
+  local target = ref.target or ''
+  if ref.kind == 'url' or target:match('^data:') then
+    vim.notify('md-render: cannot open ' .. ref.raw .. ': it is not a local file',
+      vim.log.levels.WARN)
+    return
+  end
+
+  local name = vim.api.nvim_buf_get_name(st.source)
+  local base = name ~= '' and vim.fn.fnamemodify(name, ':h') or vim.fn.getcwd()
+  local path = target
+  -- Absolute in either the POSIX or the Windows sense: a leading separator, a
+  -- drive letter, or a UNC share.
+  if not (path:match('^[/\\]') or path:match('^%a:[/\\]')) then
+    path = base .. '/' .. path
+  end
+  path = vim.fn.fnamemodify(path, ':p')
+
+  local stat = (vim.uv or vim.loop).fs_stat(path)
+  if not stat then
+    vim.notify('md-render: cannot open ' .. target .. ': no such file', vim.log.levels.WARN)
+    return
+  end
+  if stat.type ~= 'file' then
+    vim.notify('md-render: cannot open ' .. target .. ': not a file', vim.log.levels.WARN)
+    return
+  end
+
+  -- `vim.ui.open` is the editor's own dispatch layer: it knows the desktop's
+  -- handler on this platform, and it returns the reason when there is none.
+  local _, err = vim.ui.open(path)
+  if err then
+    vim.notify('md-render: could not open ' .. target .. ': ' .. err, vim.log.levels.WARN)
+  end
 end
 
 --- Move the cursor to the heading `fragment` names, in whichever state the
@@ -736,6 +1071,17 @@ function M.set_keymaps(buf, insert_entry)
   map(options.keymaps.preview, function()
     M.preview()
   end, 'md-render: preview this block')
+
+  -- Frames and files are R's too: an image is something the rendered view can
+  -- show, and in S its reference is ordinary text that Vim's own `gx`/`<C-n>`
+  -- should keep operating on.
+  map(options.keymaps.frame_next, function()
+    M.frame_next()
+  end, 'md-render: next frame of the animated image')
+
+  map(options.keymaps.open_image, function()
+    M.open_image()
+  end, 'md-render: open the image under the cursor')
 
   for _, key in ipairs(INSERT_ENTRY) do
     map(key, function()
