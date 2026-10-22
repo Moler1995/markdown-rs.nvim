@@ -12,6 +12,7 @@
 
 use md_render::block::DocBlock;
 use md_render::document::{display_width, layout_document, source_line_count};
+use md_render::image_art::ImageOptions;
 use md_render::renderer::render_markdown;
 use md_render::theme::{Palette, Theme};
 use md_render::wire::WireDoc;
@@ -54,7 +55,13 @@ fn fixtures() -> Vec<(String, String)> {
 fn render(content: &str, width: u16) -> WireDoc {
     let palette = Palette::from_theme(Theme::default());
     let blocks = render_markdown(content, &palette, Theme::default());
-    layout_document(&blocks, width, &palette, source_line_count(content))
+    layout_document(
+        &blocks,
+        width,
+        &palette,
+        source_line_count(content),
+        ImageOptions::default(),
+    )
 }
 
 /// A stable, readable view of a rendered document: one row per display line,
@@ -248,6 +255,7 @@ fn block_kind(block: &DocBlock) -> &'static str {
         DocBlock::Text { .. } => "text",
         DocBlock::Mermaid { .. } => "mermaid",
         DocBlock::Table(_) => "table",
+        DocBlock::Image { .. } => "image",
     }
 }
 

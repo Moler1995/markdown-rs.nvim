@@ -14,12 +14,28 @@ path = "src/lib.rs"
 name = "md-render"
 path = "src/main.rs"
 
-# The dependency set is deliberately small and is asserted by a test in the
-# build: no terminal-drawing crate, no async runtime, no image decoder. The
+# The dependency set is deliberately small and is asserted by
+# tests/dependencies.rs: no terminal-drawing crate, no async runtime. The
 # engine renders once and hands back data, so anything that exists to own a
 # screen or a thread pool is weight it should not carry.
+#
+# `image` is the one decoder, and it is deliberate rather than an accident of
+# the allowlist. Drawing a markdown image as character cells means decoding
+# the file somewhere, and the engine is the only stage that knows both the
+# requested width and the page height — the plugin sees neither until the
+# document exists. Default features are off so that only the seven promised
+# formats are compiled in.
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = [
+    "bmp",
+    "gif",
+    "ico",
+    "jpeg",
+    "png",
+    "tiff",
+    "webp",
+] }
 mermaid-text = { path = "../crates/mermaid-text" }
 pulldown-cmark = "0.13"
 serde = { version = "1", features = ["derive"] }

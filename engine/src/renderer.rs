@@ -197,6 +197,28 @@ struct MdRenderer {
     /// header row; indices `1..=table_rows.len()` are body rows. Flushed into
     /// `TableBlock::row_source_lines` in `emit_table_block`.
     table_row_source_lines: Vec<u32>,
+
+    // ── Image references ─────────────────────────────────────────────────────
+    /// True while collecting an image's alt text.
+    in_image: bool,
+    /// Whether the image being collected becomes a `DocBlock::Image` of its
+    /// own rather than inline alt text.
+    ///
+    /// A table cell and a heading hold a span list, not a sequence of blocks:
+    /// artwork in either would break the table's columns or the heading's
+    /// line, so there the reference stays what it always was — its alt text.
+    image_as_block: bool,
+    /// Destination of the image being collected.
+    image_dest: String,
+    /// Alt text of the image being collected, in the inline style it was
+    /// written with.
+    image_alt: Vec<Span>,
+    /// Source line where the image's `![` sits.
+    image_source_line: u32,
+    /// True when the last block emitted was an image. A paragraph that ends
+    /// there has no pending spans to flush, and flushing the empty ones would
+    /// add a second blank line under the artwork.
+    after_image_block: bool,
 }
 
 impl MdRenderer {
@@ -231,6 +253,12 @@ impl MdRenderer {
             table_start_line: 0,
             current_table_row_source_line: 0,
             table_row_source_lines: Vec::new(),
+            in_image: false,
+            image_as_block: false,
+            image_dest: String::new(),
+            image_alt: Vec::new(),
+            image_source_line: 0,
+            after_image_block: false,
         }
     }
 
@@ -353,8 +381,12 @@ impl MdRenderer {
                         .current_style()
                         .fg(self.tokens.syntax.inline_code)
                         .add_modifier(Modifier::BOLD);
-                    self.current_spans
-                        .push(Span::styled(format!("`{code}`"), style));
+                    let span = Span::styled(format!("`{code}`"), style);
+                    if self.in_image && self.image_as_block {
+                        self.image_alt.push(span);
+                    } else {
+                        self.current_spans.push(span);
+                    }
                 }
                 Event::SoftBreak => {
                     // Preserve the source line break instead of joining the two
@@ -602,6 +634,24 @@ impl MdRenderer {
                         .add_modifier(Modifier::UNDERLINED),
                 );
             }
+            Tag::Image { dest_url, .. } => {
+                self.in_image = true;
+                self.image_as_block = !self.in_table && !self.in_heading;
+                if self.image_as_block {
+                    // The artwork takes the reference's place in the flow, so
+                    // the text before it ends here rather than being glued to
+                    // whatever follows.
+                    if !self.current_spans.is_empty() {
+                        let line = self.current_source_line;
+                        self.current_source_line = self.span_source_line;
+                        self.flush_line();
+                        self.current_source_line = line;
+                    }
+                    self.image_dest = dest_url.to_string();
+                    self.image_alt.clear();
+                    self.image_source_line = self.current_source_line;
+                }
+            }
             Tag::Table(alignments) => {
                 self.in_table = true;
                 self.table_alignments = alignments;
@@ -644,7 +694,13 @@ impl MdRenderer {
                 self.in_heading = false;
             }
             TagEnd::Paragraph => {
-                self.flush_line();
+                // A paragraph that ended on an image has no trailing spans —
+                // the image block already ended the line — and flushing the
+                // empty ones would leave a second blank row under the artwork.
+                if !self.current_spans.is_empty() || !self.after_image_block {
+                    self.flush_line();
+                }
+                self.after_image_block = false;
                 // Blank line belongs to this paragraph's block, then flush so
                 // each paragraph is a separate DocBlock::Text.
                 self.push_blank_line();
@@ -726,6 +782,21 @@ impl MdRenderer {
                 self.in_link = false;
                 self.pop_style();
             }
+            TagEnd::Image => {
+                self.in_image = false;
+                if self.image_as_block {
+                    self.image_as_block = false;
+                    // The text before the image is a block of its own, then the
+                    // image block, in that order.
+                    self.flush_text_block();
+                    self.blocks.push(DocBlock::Image {
+                        dest: std::mem::take(&mut self.image_dest),
+                        alt: std::mem::take(&mut self.image_alt),
+                        source_line: self.image_source_line,
+                    });
+                    self.after_image_block = true;
+                }
+            }
             TagEnd::Table => {
                 self.emit_table_block();
                 self.in_table = false;
@@ -781,7 +852,13 @@ impl MdRenderer {
     }
 
     fn handle_text(&mut self, text: &str) {
-        if self.in_code_block {
+        if self.in_image && self.image_as_block {
+            // Alt text is not body text: it belongs to the reference, ready to
+            // stand in for the image if the image cannot be drawn.
+            self.after_image_block = false;
+            self.image_alt
+                .push(Span::styled(text.to_string(), self.current_style()));
+        } else if self.in_code_block {
             for line in text.split('\n') {
                 self.code_block_content.push(line.to_string());
             }
@@ -1083,4 +1160,117 @@ fn looks_like_mermaid(content: &[String]) -> bool {
         return true;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::{Palette, Theme};
+
+    /// The blocks a document renders to, under the default theme.
+    fn blocks(content: &str) -> Vec<DocBlock> {
+        render_markdown(content, &Palette::default(), Theme::default())
+    }
+
+    /// Each block as a word: what kind of thing the document turned into.
+    fn kinds(blocks: &[DocBlock]) -> Vec<&'static str> {
+        blocks
+            .iter()
+            .map(|block| match block {
+                DocBlock::Text { .. } => "text",
+                DocBlock::Table(_) => "table",
+                DocBlock::Mermaid { .. } => "mermaid",
+                DocBlock::Image { .. } => "image",
+            })
+            .collect()
+    }
+
+    /// Every `Text` block's text, one display line per line.
+    fn text_of(blocks: &[DocBlock]) -> String {
+        blocks
+            .iter()
+            .filter_map(|block| match block {
+                DocBlock::Text { text, .. } => Some(
+                    text.lines
+                        .iter()
+                        .map(Line::text)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The alt text an image block carries.
+    fn alt_of(block: &DocBlock) -> String {
+        match block {
+            DocBlock::Image { alt, .. } => alt.iter().map(|span| span.content.as_str()).collect(),
+            other => panic!("expected an image block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_image_mid_paragraph_splits_the_text_around_it() {
+        let blocks = blocks("text before ![alt](x.png) text after");
+
+        assert_eq!(kinds(&blocks), ["text", "image", "text"]);
+        assert_eq!(alt_of(&blocks[1]), "alt");
+        // The alt text is not also body text.
+        let text = text_of(&blocks);
+        assert!(text.contains("text before"), "{text:?}");
+        assert!(text.contains("text after"), "{text:?}");
+        assert!(!text.contains("alt"), "{text:?}");
+    }
+
+    #[test]
+    fn an_image_is_anchored_at_its_own_reference() {
+        let blocks = blocks("# Title\n\n![alt](x.png)\n");
+
+        let images: Vec<&DocBlock> = blocks
+            .iter()
+            .filter(|block| matches!(block, DocBlock::Image { .. }))
+            .collect();
+        assert_eq!(images.len(), 1, "{blocks:?}");
+
+        match images[0] {
+            DocBlock::Image { source_line, .. } => assert_eq!(*source_line, 2),
+            other => panic!("expected an image block, got {other:?}"),
+        }
+        assert!(!text_of(&blocks).contains("alt"), "{blocks:?}");
+    }
+
+    #[test]
+    fn an_image_inside_a_table_cell_stays_alt_text() {
+        // A cell holds spans, not blocks: a table's columns are sized from its
+        // cells, so there is nowhere for a block of artwork to go.
+        let blocks = blocks("| a | b |\n| - | - |\n| ![alt](x.png) | y |\n");
+
+        assert_eq!(kinds(&blocks), ["table"]);
+        assert!(
+            text_of(&blocks).is_empty(),
+            "a table is not a text block: {blocks:?}"
+        );
+        match &blocks[0] {
+            DocBlock::Table(table) => {
+                let cell: String = table.rows[0][0]
+                    .iter()
+                    .map(|span| span.content.as_str())
+                    .collect();
+                assert_eq!(cell, "alt");
+            }
+            other => panic!("expected a table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_image_inside_a_heading_stays_alt_text() {
+        // A heading is one line: the reference keeps the alt text it always
+        // had rather than pushing the heading's own line apart.
+        let blocks = blocks("# ![alt](x.png)");
+
+        assert_eq!(kinds(&blocks), ["text"]);
+        assert!(text_of(&blocks).contains("alt"), "{blocks:?}");
+    }
 }

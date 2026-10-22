@@ -38,6 +38,7 @@ pub mod block;
 pub mod cast;
 pub mod document;
 pub mod highlight;
+pub mod image_art;
 pub mod math;
 pub mod mermaid;
 pub mod renderer;
