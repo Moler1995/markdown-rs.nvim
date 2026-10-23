@@ -10,6 +10,11 @@
 
 local repo = assert(vim.env.MDRN_REPO, 'MDRN_REPO must be set to the repository root')
 
+-- Unbuffered, so a run that dies (a crash in Neovim itself, a `cquit`) still
+-- says which check it reached. Redirected output is otherwise block-buffered
+-- and the last section's checks are lost with the process.
+io.stdout:setvbuf('no')
+
 local is_windows = vim.fn.has('win32') == 1
 
 --- Write a stand-in engine the host platform can execute.
@@ -115,6 +120,10 @@ end
 --- A section of checks. A section that raises is reported as one failure and
 --- the run continues, so one broken task does not hide the rest.
 local function section(name, fn)
+  -- On stdout as the section starts, so a run killed by a crash in Neovim
+  -- itself still names the section it died in; the checks are printed at the
+  -- end and never get there.
+  io.write('== section ' .. name .. '\n')
   local ok, err = xpcall(fn, debug.traceback)
   if not ok then
     check(name .. ' (section raised)', false, err)
@@ -281,7 +290,15 @@ section('8.2', function()
 
   -- A position deep in the source, so a lost view would be obvious.
   vim.fn.winrestview({ lnum = 9, topline = 3, col = 0 })
+
+  -- A window that cannot hold a scroll position cannot show one being
+  -- restored. Neovim v0.10.4 under `-l` reports a 22-line window but scrolls
+  -- every command to the cursor's line (`zt` included), so `winrestview` there
+  -- is not observable. Probing beats naming a version: whether the window holds
+  -- the position is exactly the property the check needs.
+  vim.cmd('redraw')
   local before = vim.fn.winsaveview()
+  local holds_scroll = before.topline == 3
 
   md.toggle()
   truthy('8.2 the toggle returns to R', wait_until(showing_rendered))
@@ -290,7 +307,9 @@ section('8.2', function()
 
   local after = vim.fn.winsaveview()
   expect('8.2 R->S->R restores the source cursor line', after.lnum, before.lnum)
-  expect('8.2 R->S->R restores the source scroll position', after.topline, before.topline)
+  if holds_scroll then
+    expect('8.2 R->S->R restores the source scroll position', after.topline, before.topline)
+  end
 
   -- A non-markdown buffer is not the plugin's business.
   local calls_before = engine_calls
@@ -1344,7 +1363,9 @@ section('11.3', function()
 
   local cfg = vim.api.nvim_win_get_config(popup.win)
   expect('11.3 relative', cfg.relative, 'editor')
-  expect('11.3 style', cfg.style, 'minimal')
+  -- `nvim_win_get_config` only answers `style` from 0.11 on; in 0.10 a float is
+  -- minimal and the key is absent, so read the absence as the minimal style.
+  expect('11.3 style', cfg.style or 'minimal', 'minimal')
   -- A window option rather than part of the open config, so it is read from the
   -- window. Without it a row of artwork would soft-wrap and the block would stop
   -- being scrollable.
@@ -3913,14 +3934,34 @@ end)
 -- 5.5 Closing and re-rendering stop playback
 --------------------------------------------------------------------------------
 
---- The number of live timer handles libuv holds.
+--- The timer handles opened since here, set aside when they are closed.
+---
+--- `vim.uv.walk` would answer this directly, but it segfaults on Neovim
+--- v0.10.4 — even with an empty callback — so the set is kept by wrapping the
+--- constructor and the close method instead. Both live on libuv's own
+--- setmetatable, so every timer any code creates after this point is counted;
+--- a timer opened before it is neither counted nor missed when it closes.
+local open_timers = {}
+do
+  local timer_mt = getmetatable(vim.uv.new_timer())
+  local new_timer = vim.uv.new_timer
+  local close = timer_mt.__index.close
+  vim.uv.new_timer = function(...)
+    local timer = new_timer(...)
+    open_timers[timer] = true
+    return timer
+  end
+  timer_mt.__index.close = function(self)
+    open_timers[self] = nil
+    return close(self)
+  end
+end
+
 local function timer_handles()
   local n = 0
-  vim.uv.walk(function(handle)
-    if handle and not handle:is_closing() and handle:get_type() == 'timer' then
-      n = n + 1
-    end
-  end)
+  for _ in pairs(open_timers) do
+    n = n + 1
+  end
   return n
 end
 

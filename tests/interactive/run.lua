@@ -164,9 +164,21 @@ env.MDRN_OUT = OUT
 
 -- The server's own output is kept: an error raised inside it — a failing step,
 -- a bad key — arrives here rather than as a silent missing report.
+--
+-- Collected through callbacks rather than written to paths by `vim.system`:
+-- Neovim 0.10 accepts only a callback there, a path arrived in 0.11.
+local server_output = { ['server.out'] = {}, ['server.err'] = {} }
+local function collect(name)
+  return function(_, data)
+    if data then
+      local sink = server_output[name]
+      sink[#sink + 1] = data
+    end
+  end
+end
 local server = vim.system(
   { 'nvim', '--headless', '--listen', ADDRESS, '-u', 'NONE' },
-  { env = env, stdout = OUT .. '/server.out', stderr = OUT .. '/server.err' }
+  { env = env, stdout = collect('server.out'), stderr = collect('server.err') }
 )
 
 local started = false
@@ -289,6 +301,12 @@ local function cross(src, offset)
   md_call('reset()')
   md_call(string.format('goto(%d, %d)', src, offset))
   step('i')
+  -- The key crosses to S and feeds `i` back to Vim, so that key travels
+  -- through the server's own typeahead rather than this driver's input queue.
+  -- Wait until Vim has read it before sending `<Esc>`: a late `i` can otherwise
+  -- arrive in the middle of the next command on a loaded machine, entering
+  -- insert mode inside the command line.
+  wait_for(OUT .. '/events.txt')
   step('<Esc>')
   return report(string.format('cross%d_%d', src, offset))
 end
@@ -360,6 +378,11 @@ local function body()
   md_call('reset()')
   md_call('split()')
   step('O')
+  -- `O` is read by the server's own loop too, so wait for the `InsertEnter` it
+  -- raised: a text step that arrives before it is read as normal-mode commands
+  -- (`#` searches, `i` starts inserting) and mangles the buffer instead of
+  -- typing a line into it.
+  wait_for(OUT .. '/events.txt')
   step('# live-edit-10.4')
   step('<Esc>')
   md_call('settle(600)')
@@ -549,9 +572,9 @@ server:wait()
 -- else. Printed before the results so it reads as the explanation of them.
 if not ok then
   for _, name in ipairs({ 'server.err', 'server.out' }) do
-    local text = read(OUT .. '/' .. name)
-    if text and #text > 0 then
-      io.stdout:write(string.format('\n--- %s ---\n%s\n', name, table.concat(text, '\n')))
+    local text = table.concat(server_output[name])
+    if #text > 0 then
+      io.stdout:write(string.format('\n--- %s ---\n%s\n', name, text))
     end
   end
 end

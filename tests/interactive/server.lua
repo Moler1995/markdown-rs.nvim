@@ -119,9 +119,13 @@ end
 --- there edits the source while R is on screen. That is the arrangement the
 --- change-triggered refresh exists for, and the one no other step here makes.
 function M.split()
+  -- Read before the split: after it the current window is the new one, which
+  -- has no state yet. The plugin attaches a window split from R on `WinEnter`,
+  -- but only deferred, so the new window would still be showing R when the
+  -- next key arrives.
+  local s = st()
   vim.cmd('split')
   local win = vim.api.nvim_get_current_win()
-  local s = st()
   md.attach(s.source, win)
   md.show_source(win)
 end
@@ -243,6 +247,10 @@ function M.narrow(cols)
   vim.cmd('vsplit')
   vim.cmd('wincmd p')
   vim.api.nvim_win_set_width(vim.api.nvim_get_current_win(), cols)
+  local s = st()
+  vim.wait(8000, function()
+    return s.rendered ~= nil and widest(s.rendered, s.win) <= cols
+  end)
 end
 
 --- Close the preview, if one is open.
