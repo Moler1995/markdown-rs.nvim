@@ -40,6 +40,27 @@ The engine knows nothing about Neovim. It takes text and a width and returns
 data. That is what makes it testable without an editor, and what makes the
 plugin a consumer rather than a component.
 
+Image artwork is controlled by flags. `--help` is the authoritative list; these
+are the spellings it prints:
+
+| Flag | Values | Default | Does |
+| --- | --- | --- | --- |
+| `--image-encoding` | `braille`, `quads`, `blocks`, `ascii`, `off` | `braille` | How a cell is drawn |
+| `--image-palette` | `theme`, `adaptive`, `full` | `theme` | Where cell colours come from |
+| `--image-background` | `terminal`, `theme`, `#rrggbb` | `terminal` | What transparency is composited against |
+| `--image-paper` | `#rrggbb` | from the background | The page braille inks against |
+| `--image-dither` | `auto`, `on`, `off` | `off` | Whether quantisation is ordered-dithered |
+| `--image-min-rows` | rows | `0` | Enlarge an image to at least this many display rows |
+| `--image-sharpen` | — | off | Unsharp-mask an image that was reduced |
+| `--image-max-height` | rows | none | Height bound in display rows |
+| `--image-animation` | — | off | Also emit an animation's frames |
+
+The palette, background, dithering, minimum-height and sharpening defaults are
+the conservative ones: an older caller that does not pass them gets the same
+look it had before they existed. Braille is the default encoding, so a caller
+that wants the previous half-block output asks for `--image-encoding blocks`
+and, for the previous colours, `--image-palette theme --image-dither off`.
+
 ## The plugin
 
 `lua/md-render/` is a Neovim plugin. It renders through the engine binary,
@@ -138,10 +159,27 @@ from wherever you are reading:
 - an **anchor** — `#section`, on its own or after a path — scrolls to the
   heading it names, in this document or in the one just opened.
 
-It reads the source, never the rendered text. The engine drops link targets, so
-in R the display row is first mapped back to the source line it came from —
-the same step the toggle makes — and the link is read from there. That is what
-makes it work from the reading view without crossing to S first.
+A rendered diagram can carry links of its own: a mermaid `click NODE href "…"`
+directive names a target for a node, and with the cursor on that node's label
+the same key follows it. The engine reports the label's byte range along with
+the artwork, so the node is clickable without leaving the reading view and
+without the plugin re-parsing the fence. The label is underlined in R so the
+target is visible rather than guessed at; the hint is tied to the `follow` key,
+since with no key bound an underline would advertise nothing. It is the
+`MdRenderLink` highlight group and sets only `underline`, so a theme can restyle
+it without touching the artwork's colours. The preview popup does not bind the
+key, so it shows the diagram without the hint.
+
+For everything else it reads the source, never the rendered text. In R the
+display row is first mapped back to the source line it came from — the same
+step the toggle makes — and the link is read from there. That is what makes it
+work from the reading view without crossing to S first.
+
+Following a file records the source line it was followed from, so `<C-o>` comes
+back to that document and the plugin renders it again instead of leaving the
+window on source. The record is a real jump-list entry rather than a side
+effect of swapping buffers: the plugin's own R↔S swaps are `keepjumps`, so a
+toggle cannot push a stray entry between the reader and where they came from.
 
 The forms it resolves are the ones a cursor actually lands on: inline
 `[text](target)` and `![alt](target)`, reference `[text][ref]` with the
@@ -194,27 +232,61 @@ reported rather than fetched or launched, and the key goes back to Vim when the
 cursor is not on an image.
 
 The picture is fitted to the window twice over — to the text width, and to the
-text height or `image_max_height` when that is smaller — and is never enlarged.
-`image_max_height` defaults to 20 display rows, so a figure sits inside the page
-rather than filling it; because the aspect ratio is preserved, the cap narrows
-the artwork too. Set it to `false` to let an image use the whole page again. A
-picture smaller than both bounds keeps its natural size. The preview popup is
-not capped: `<CR>` shows the image at the popup's own size. Resizing the window
-redraws the inline artwork at the new size.
+text height or `image_max_height` when that is smaller — and is not enlarged
+unless `image_min_rows` asks for it. `image_max_height` defaults to 20 display
+rows, so a figure sits inside the page rather than filling it; because the
+aspect ratio is preserved, the cap narrows the artwork too. Set it to `false` to
+let an image use the whole page again. A picture smaller than both bounds keeps
+its natural size. The preview popup is not capped: `<CR>` shows the image at the
+popup's own size. Resizing the window redraws the inline artwork at the new
+size.
 
 `image_mode` chooses the drawing:
 
-- `auto` (the default) uses quadrant blocks — `▘▝▖▗`, four sub-cells in two
-  colours — when `'termguicolors'` is on, and the ASCII ramp otherwise;
-- `quads` always uses quadrant blocks, twice the horizontal detail of half
-  blocks; it needs a font with the block elements (Cascadia Mono, the Windows
-  Terminal default, has them);
+- `auto` (the default) uses braille — `⣿`, eight dots in a 2×4 grid — when
+  `'termguicolors'` is on, and the ASCII ramp otherwise;
+- `braille` always uses braille. Each cell has one colour and eight dots, so a
+  photograph reads as tone and a line drawing keeps its edges; the dots are ink
+  on the page they sit on, so on a dark terminal the bright side of the picture
+  is drawn and a white screenshot becomes light dots with its own dark features
+  left as gaps, while on a light terminal the dark side is drawn instead. That
+  page is the editor's own background, read from `Normal`; it needs a font with
+  the braille patterns (Cascadia Mono and Segoe UI Symbol have them);
+- `quads` always uses quadrant blocks — `▘▝▖▗`, four sub-cells in two colours —
+  twice the horizontal detail of half blocks, and the nearest thing to the
+  pre-braille default. It needs a font with the block elements (Cascadia Mono,
+  the Windows Terminal default, has them);
 - `blocks` uses half blocks — `▀`, two colours per cell — for a font without
   quadrants;
 - `ascii` uses one ASCII character per cell, coloured from the same palette, so
   it works in a terminal without true colour;
 - `off` draws no artwork at all and shows each reference's alt text, which is
   exactly what the plugin did before images were supported.
+
+The image's colours and finishing are separate knobs:
+
+- `image_palette` — `auto` (the default) asks for exact colours for `braille`
+  and `ascii`, and a per-image 64-colour palette for `quads` and `blocks`;
+  `theme` is the old fixed cube, `adaptive` the per-image palette and `full`
+  exact colours bounded at 4,096 styles per document;
+- `image_background` — `terminal` (the default) leaves transparent pixels to
+  the terminal, `theme` blends them into the theme's background, and `#rrggbb`
+  names a colour; a named background is what removes the hard halo around a
+  logo with soft edges, and it is also the page braille inks against, so with
+  `terminal` the plugin sends `Normal`'s background as the page instead;
+- `image_dither` — `auto` (the default) dithers `braille` and reduced-palette
+  `ascii`, and leaves the two-colour encodings alone; `true` and `false` force
+  it;
+- `image_min_rows` — 0 (the default) never enlarges; a positive value enlarges
+  a small image by the smallest whole factor that reaches that many rows, which
+  is what pixel art wants;
+- `image_sharpen` — `false` by default; `true` runs an unsharp mask over an
+  image that was reduced to fit the page.
+
+The previous look is one configuration away: `image_mode = 'quads'`,
+`image_palette = 'theme'`, `image_dither = false`, `image_min_rows = 0` and
+`image_sharpen = false` reproduce the output the plugin had before braille was
+the default.
 
 Relative destinations resolve against the directory of the document holding the
 reference, so `![](images/a.png)` means what it means everywhere else. Absolute
@@ -244,9 +316,14 @@ require('md-render').setup({
   engine = nil,                 -- nil resolves to `md-render` on PATH, then
                                 -- <repo>/bin/md-render.exe
   theme = 'catppuccin_mocha',   -- passed to the engine as --theme
-  image_mode = 'auto',          -- 'auto' | 'quads' | 'blocks' | 'ascii' | 'off'
+  image_mode = 'auto',          -- 'auto' | 'braille' | 'quads' | 'blocks' | 'ascii' | 'off'
   image_max_height = 20,        -- display rows one inline image may occupy;
                                 -- false lets it fill the page again
+  image_palette = 'auto',       -- 'auto' | 'theme' | 'adaptive' | 'full'
+  image_background = 'terminal',-- 'terminal' | 'theme' | '#rrggbb'
+  image_dither = 'auto',        -- 'auto' | true | false
+  image_min_rows = 0,           -- enlarge a small image to at least this many rows
+  image_sharpen = false,        -- unsharp-mask an image reduced to fit
   image_animation = true,       -- fetch an animated image's frames on demand
   filetypes = { 'markdown' },   -- the filetypes that open in R
   keymaps = {

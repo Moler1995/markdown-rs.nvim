@@ -12,6 +12,20 @@ local M = {}
 --- Group name per style key, so the same style is defined once per session.
 M.cache = {}
 
+--- The group laid on top of a line's span styling for a link the engine laid
+--- into it — a mermaid node named by a `click` directive.
+---
+--- It sets only an attribute, never a colour, so it merges with whatever style
+--- the artwork has underneath: the node keeps the theme's colour and gains an
+--- underline saying it can be followed. Linking to `Underlined` instead would
+--- repaint the run in the link colour, which on diagram artwork means a node
+--- that no longer matches its neighbours.
+---
+--- `default` leaves the name to the user: a colourscheme or config that defines
+--- `MdRenderLink` itself is not overwritten.
+M.link_group = 'MdRenderLink'
+vim.api.nvim_set_hl(0, M.link_group, { underline = true, default = true })
+
 --- The sixteen system colours of the xterm 256-colour palette.
 ---
 --- These are the conventional values, not the terminal's actual ones. A style

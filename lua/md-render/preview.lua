@@ -257,15 +257,20 @@ end
 --- `animation` is set here, and only here: the popup is where playback happens,
 --- so it is the one request that pays for the frames up front. Every inline
 --- render leaves the flag out until the stepping key asks for it.
+---
+--- The image quality options come from the same `config.image_options()` the
+--- inline render uses, so the popup cannot show a palette or background the
+--- page does not. The engine's argument builder is shared; there is no second
+--- copy of these flags here.
 function M.view(block, geometry, base)
   if block.kind == 'image' then
-    return {
+    return vim.tbl_extend('force', {
       width = geometry.inner,
       height = math.max(1, geometry.max_h - 2),
       encoding = config.image_encoding(),
       base = base,
       animation = config.options.image_animation,
-    }
+    }, config.image_options())
   end
   return { width = geometry.budget, encoding = 'off' }
 end
@@ -606,7 +611,9 @@ function M.open(doc, geometry, block)
   vim.bo[buf].bufhidden = 'wipe'
   vim.bo[buf].swapfile = false
   vim.bo[buf].buflisted = false
-  render.apply(buf, doc)
+  -- A popup binds no follow key, so an underline there would advertise
+  -- nothing: show the artwork without the hint.
+  render.apply(buf, doc, false)
 
   -- What the popup is showing, and what it was laid out at. Neither can be
   -- recovered from the buffer once the clip has run — the buffer holds the
@@ -833,7 +840,7 @@ function M.adopt(doc, budget, rung)
   popup.budget = budget
   popup.layout_width = doc_layout_width(doc)
   popup.rung = rung
-  render.apply(popup.buf, doc)
+  render.apply(popup.buf, doc, false)
 
   local name = popup_buffer_name(popup)
   if vim.api.nvim_buf_is_valid(popup.buf)

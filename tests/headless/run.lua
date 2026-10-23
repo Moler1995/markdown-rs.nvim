@@ -669,19 +669,32 @@ section('10.2', function()
   local encoding = config.image_encoding()
   local tick = vim.api.nvim_buf_get_changedtick(source)
   local theme = config.options.theme
+  local image = config.image_options()
 
-  truthy('10.2 the render is cached under (buffer, tick, width, height, encoding, theme)',
-    state.cached(source, tick, width, height, encoding, theme) ~= nil)
+  truthy('10.2 the render is cached under its whole key',
+    state.cached(source, tick, width, height, encoding, theme, false, image) ~= nil)
   expect('10.2 another width is a different render',
-    state.cached(source, tick, width + 1, height, encoding, theme), nil)
+    state.cached(source, tick, width + 1, height, encoding, theme, false, image), nil)
   expect('10.2 another height is a different render',
-    state.cached(source, tick, width, height + 1, encoding, theme), nil)
+    state.cached(source, tick, width, height + 1, encoding, theme, false, image), nil)
   expect('10.2 another encoding is a different render',
-    state.cached(source, tick, width, height, 'off', theme), nil)
+    state.cached(source, tick, width, height, 'off', theme, false, image), nil)
   expect('10.2 another changedtick is a different render',
-    state.cached(source, tick + 1, width, height, encoding, theme), nil)
+    state.cached(source, tick + 1, width, height, encoding, theme, false, image), nil)
   expect('10.2 another theme is a different render',
-    state.cached(source, tick, width, height, encoding, 'nord'), nil)
+    state.cached(source, tick, width, height, encoding, 'nord', false, image), nil)
+  for _, field in ipairs({ 'palette', 'background', 'dither', 'min_rows', 'sharpen' }) do
+    local changed = vim.deepcopy(image)
+    if type(changed[field]) == 'boolean' then
+      changed[field] = not changed[field]
+    elseif type(changed[field]) == 'number' then
+      changed[field] = changed[field] + 1
+    else
+      changed[field] = 'other'
+    end
+    expect('10.2 another image ' .. field .. ' is a different render',
+      state.cached(source, tick, width, height, encoding, theme, false, changed), nil)
+  end
 
   -- What the key is for: a round trip costs no process at all.
   local before = engine_calls
@@ -1711,6 +1724,104 @@ section('12.2', function()
 end)
 
 --------------------------------------------------------------------------------
+-- 12.3 Following a diagram node link
+--------------------------------------------------------------------------------
+
+section('12.3', function()
+  local diagram_links_fixture = repo .. '/tests/fixtures/diagram_links.md'
+  local opened = {}
+  local real_ui_open = vim.ui.open
+  vim.ui.open = function(url)
+    opened[#opened + 1] = url
+  end
+
+  local function reset_to_diagram_links()
+    vim.cmd('edit! ' .. vim.fn.fnameescape(diagram_links_fixture))
+    md.attach(vim.api.nvim_get_current_buf())
+    return wait_until(showing_rendered)
+  end
+
+  local function wait_for_source(name)
+    return wait_until(function()
+      local s = state.windows[vim.api.nvim_get_current_win()]
+      return s ~= nil and s.source ~= nil and vim.api.nvim_buf_is_valid(s.source)
+        and vim.fn.fnamemodify(vim.api.nvim_buf_get_name(s.source), ':t') == name
+    end)
+  end
+
+  truthy('12.3 in R with the diagram fixture', reset_to_diagram_links())
+  local st = current_state()
+  local row, alpha, beta
+  for i, line in ipairs(st.doc.lines) do
+    for _, l in ipairs(line.links or {}) do
+      if l[3] == './linked.md' then
+        row, alpha = i - 1, l
+      elseif l[3] == 'https://example.com/diagram' then
+        beta = l
+      end
+    end
+  end
+  truthy('12.3 the engine reports both click targets', row ~= nil and alpha ~= nil and beta ~= nil)
+  truthy('12.3 the artwork carries no terminal escapes',
+    not table.concat(vim.tbl_map(function(l)
+      return table.concat(vim.tbl_map(function(s) return s[2] end, l.spans))
+    end, st.doc.lines), ''):find('\27', 1, true))
+
+  -- The label is underlined, on top of the artwork's own style, so a reader
+  -- who has not read the manual can see the node is followable.
+  local hinted = false
+  for _, m in ipairs(vim.api.nvim_buf_get_extmarks(st.rendered, render.ns,
+      { row, 0 }, { row, -1 }, { details = true })) do
+    local d = m[4]
+    if d.hl_group == 'MdRenderLink' and m[3] == alpha[1] and d.end_col == alpha[2] then
+      hinted = true
+    end
+  end
+  truthy('12.3 the node label carries the link hint', hinted)
+
+  -- The plugin resolves a rendered link by byte column, so the boundaries are
+  -- exclusive on both sides: a cursor one byte before the label is not on it,
+  -- and neither is one on the byte just past it.
+  local at = link.rendered_at(st.doc, row, alpha[1])
+  expect('12.3 the first byte of the label resolves the link', at and at.raw, './linked.md')
+  expect('12.3 one byte before the label does not', link.rendered_at(st.doc, row, alpha[1] - 1), nil)
+  expect('12.3 the exclusive end does not', link.rendered_at(st.doc, row, alpha[2]), nil)
+  expect('12.3 a local target is a file link', at and at.kind, 'file')
+  expect('12.3 the row before carries no link', link.rendered_at(st.doc, row - 1, alpha[1]), nil)
+
+  -- A URL node goes to `vim.ui.open`; a file node opens the target in the
+  -- window, exactly as a source-level link does.
+  vim.api.nvim_win_set_cursor(st.win, { row + 1, beta[1] })
+  md.follow()
+  eq_table('12.3 a URL node goes to vim.ui.open', opened, { 'https://example.com/diagram' })
+
+  vim.api.nvim_win_set_cursor(st.win, { row + 1, alpha[1] })
+  md.follow()
+  truthy('12.3 a file node opens its target', wait_for_source('linked.md'))
+  truthy('12.3 and the target is rendered', wait_until(showing_rendered))
+
+  -- `<C-o>` returns through the jumplist, which holds the first document but
+  -- not its rendered view: R is `bufhidden=wipe` and the plugin's own swaps are
+  -- `keepjumps`, so the jump restores the first document's *source* buffer. The
+  -- window has to notice a managed buffer it did not ask for — here, because
+  -- its state names the document it left — or it stays on source while every
+  -- key still acts on the other document.
+  feed('<C-o>')
+  truthy('12.3 <C-o> returns to the first document', wait_until(function()
+    local s = state.windows[vim.api.nvim_get_current_win()]
+    return s ~= nil and s.source ~= nil
+      and vim.fn.fnamemodify(vim.api.nvim_buf_get_name(s.source), ':t') == 'diagram_links.md'
+  end))
+  truthy('12.3 and the return is rendered, not source', wait_until(showing_rendered))
+  md.toggle()
+  truthy('12.3 and the toggle still reaches S', wait_until(showing_source))
+  md.toggle()
+  truthy('12.3 and back to R', wait_until(showing_rendered))
+
+  vim.ui.open = real_ui_open
+end)
+
+--------------------------------------------------------------------------------
 -- 13. Zoom
 --------------------------------------------------------------------------------
 
@@ -2335,8 +2446,8 @@ section('14.1', function()
   md.show_rendered()
   truthy('14.1 with true colour, a new render is asked for',
     wait_until(function() return #commands > before end))
-  expect('14.1 with true colour, auto resolves to quads',
-    find_arg(commands[#commands], '--image-encoding'), 'quads')
+  expect('14.1 with true colour, auto resolves to braille',
+    find_arg(commands[#commands], '--image-encoding'), 'braille')
 
   -- 5.2: an unnamed buffer has no directory to resolve against, so the flag is
   -- left out and the engine falls back to its working directory.
@@ -2525,6 +2636,152 @@ section('14.6', function()
 end)
 
 --------------------------------------------------------------------------------
+-- 6.1 The image quality options
+--------------------------------------------------------------------------------
+
+section('6.1', function()
+  config.setup({})
+  expect('6.1 image_mode defaults to auto', config.defaults.image_mode, 'auto')
+  expect('6.1 image_palette defaults to auto', config.defaults.image_palette, 'auto')
+  expect('6.1 image_background defaults to terminal',
+    config.defaults.image_background, 'terminal')
+  expect('6.1 image_dither defaults to auto', config.defaults.image_dither, 'auto')
+  expect('6.1 image_min_rows defaults to 0', config.defaults.image_min_rows, 0)
+  expect('6.1 image_sharpen defaults to false', config.defaults.image_sharpen, false)
+
+  local resolved = config.setup({
+    image_palette = 'adaptive',
+    image_background = '#102030',
+    image_dither = false,
+    image_min_rows = 8,
+    image_sharpen = true,
+  })
+  expect('6.1 setup overrides image_palette', resolved.image_palette, 'adaptive')
+  expect('6.1 setup overrides image_background', resolved.image_background, '#102030')
+  expect('6.1 setup overrides image_dither', resolved.image_dither, false)
+  expect('6.1 setup overrides image_min_rows', resolved.image_min_rows, 8)
+  expect('6.1 setup overrides image_sharpen', resolved.image_sharpen, true)
+  expect('6.1 and the defaults are not mutated', config.defaults.image_palette, 'auto')
+
+  -- `braille` is a mode in its own right, not only the `auto` result.
+  config.setup({ image_mode = 'braille' })
+  expect('6.1 braille is selectable', config.image_encoding(), 'braille')
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 6.2 The options reach the engine
+--------------------------------------------------------------------------------
+
+section('6.2', function()
+  local image_fixture = repo .. '/tests/fixtures/image.md'
+  local inner = vim.system
+  local commands = {}
+  vim.system = function(cmd, opts, on_exit)
+    commands[#commands + 1] = cmd
+    return inner(cmd, opts, on_exit)
+  end
+
+  local function flag(name, cmd)
+    cmd = cmd or commands[#commands] or {}
+    for i, arg in ipairs(cmd) do
+      if arg == name then
+        return cmd[i + 1]
+      end
+    end
+    return nil
+  end
+
+  local function has(name, cmd)
+    return flag(name, cmd) ~= nil or vim.tbl_contains(cmd or commands[#commands] or {}, name)
+  end
+
+  config.setup({
+    image_mode = 'quads',
+    image_palette = 'theme',
+    image_background = '#102030',
+    image_dither = true,
+    image_min_rows = 8,
+    image_sharpen = true,
+  })
+  truthy('6.2 in R on a document with an image', reset_to(image_fixture))
+  expect('6.2 palette is passed', flag('--image-palette'), 'theme')
+  expect('6.2 background is passed', flag('--image-background'), '#102030')
+  expect('6.2 dither true becomes on', flag('--image-dither'), 'on')
+  expect('6.2 minimum height is passed', flag('--image-min-rows'), '8')
+  truthy('6.2 sharpening is passed', has('--image-sharpen'))
+  -- A named background already is the page braille is drawn on, so the plugin
+  -- does not name a second one.
+  expect('6.2 no page is sent when the background is named',
+    has('--image-paper'), false)
+
+  -- With transparency left to the terminal the plugin is the only one that
+  -- knows the page, and braille inks the side away from it.
+  local termguicolors = vim.o.termguicolors
+  vim.o.termguicolors = true
+  vim.api.nvim_set_hl(0, 'Normal', { bg = 0x1e1e2e })
+  config.setup({
+    image_mode = 'quads',
+    image_background = 'terminal',
+  })
+  truthy('6.2 a terminal page asks the engine again',
+    reset_to(image_fixture))
+  expect('6.2 the terminal background is passed as the page',
+    flag('--image-paper'), '#1e1e2e')
+  vim.o.termguicolors = termguicolors
+  vim.api.nvim_set_hl(0, 'Normal', {})
+  config.setup({ image_background = '#102030' })
+
+  -- Each of the five is in the cache key: changing one re-renders rather than
+  -- reusing a document drawn with the old value.
+  local before = engine_calls
+  config.setup({
+    image_mode = 'quads',
+    image_palette = 'theme',
+    image_background = '#102030',
+    image_dither = false,
+    image_min_rows = 8,
+    image_sharpen = true,
+  })
+  md.show_rendered()
+  truthy('6.2 a changed option asks the engine again',
+    wait_until(function() return engine_calls > before end))
+  expect('6.2 dither false becomes off', flag('--image-dither'), 'off')
+
+  vim.system = inner
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 6.3 `auto` resolution
+--------------------------------------------------------------------------------
+
+section('6.3', function()
+  local termguicolors = vim.o.termguicolors
+
+  config.setup({ image_mode = 'auto', image_palette = 'auto' })
+  vim.o.termguicolors = true
+  expect('6.3 auto with true colour is braille', config.image_encoding(), 'braille')
+  expect('6.3 and the palette is full', config.image_palette(), 'full')
+  vim.o.termguicolors = false
+  expect('6.3 auto without true colour is ascii', config.image_encoding(), 'ascii')
+  expect('6.3 and the palette is still full', config.image_palette(), 'full')
+
+  for _, mode in ipairs({ 'quads', 'blocks' }) do
+    config.setup({ image_mode = mode, image_palette = 'auto' })
+    expect('6.3 ' .. mode .. ' keeps its encoding', config.image_encoding(), mode)
+    expect('6.3 ' .. mode .. ' resolves the palette to adaptive',
+      config.image_palette(), 'adaptive')
+  end
+
+  config.setup({ image_mode = 'quads', image_palette = 'theme' })
+  expect('6.3 an explicit palette wins over auto', config.image_palette(), 'theme')
+
+  vim.o.termguicolors = termguicolors
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
 -- 2.1 Options and keys
 --------------------------------------------------------------------------------
 
@@ -2607,17 +2864,25 @@ section('2.3', function()
   local doc = { width = 20, styles = {}, lines = {} }
   local theme = 'catppuccin_mocha'
 
-  state.store(buf, 7, 80, 10, 'quads', theme, false, doc)
-  truthy('2.3 a plain render is found for a plain request',
-    state.cached(buf, 7, 80, 10, 'quads', theme, false) == doc)
-  expect('2.3 the same render is not returned for an animated request',
-    state.cached(buf, 7, 80, 10, 'quads', theme, true), nil)
+  local image = {
+    palette = 'theme',
+    background = 'terminal',
+    dither = false,
+    min_rows = 0,
+    sharpen = false,
+  }
 
-  state.store(buf, 7, 80, 10, 'quads', theme, true, doc)
+  state.store(buf, 7, 80, 10, 'quads', theme, false, image, doc)
+  truthy('2.3 a plain render is found for a plain request',
+    state.cached(buf, 7, 80, 10, 'quads', theme, false, image) == doc)
+  expect('2.3 the same render is not returned for an animated request',
+    state.cached(buf, 7, 80, 10, 'quads', theme, true, image), nil)
+
+  state.store(buf, 7, 80, 10, 'quads', theme, true, image, doc)
   expect('2.3 an animated render is not returned for a plain request',
-    state.cached(buf, 7, 80, 10, 'quads', theme, false), nil)
+    state.cached(buf, 7, 80, 10, 'quads', theme, false, image), nil)
   truthy('2.3 and it is found for an animated one',
-    state.cached(buf, 7, 80, 10, 'quads', theme, true) == doc)
+    state.cached(buf, 7, 80, 10, 'quads', theme, true, image) == doc)
 
   state.forget_cache(buf)
 end)
@@ -3297,6 +3562,13 @@ section('5.1', function()
   expect('5.1 asked for the document\'s base',
     flag('--base') and vim.fs.normalize(flag('--base')),
     vim.fs.normalize(vim.fn.fnamemodify(base, ':p')))
+  -- 6.4: the popup's request is built by the same code as the inline render's,
+  -- so it carries the same resolved image options rather than a second copy.
+  expect('6.4 the popup asks for the resolved palette',
+    flag('--image-palette'), 'adaptive')
+  expect('6.4 the popup asks for the background',
+    flag('--image-background'), 'terminal')
+  expect('6.4 the popup asks for dithering', flag('--image-dither'), 'auto')
 
   local text = {}
   for _, line in ipairs(doc and doc.lines or {}) do

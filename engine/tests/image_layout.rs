@@ -9,6 +9,8 @@
 //! The files are the committed fixtures under `tests/fixtures/images/`, so a
 //! test run needs nothing from the network or the working directory.
 
+use std::path::Path;
+
 use md_render::document::{display_width, layout_document, source_line_count};
 use md_render::image_art::{ImageEncoding, ImageOptions, PALETTE};
 use md_render::renderer::render_markdown;
@@ -96,7 +98,11 @@ fn artwork_maps_back_to_the_reference_line() {
     let artwork: Vec<&WireLine> = doc
         .lines
         .iter()
-        .filter(|line| line_text(line).contains('\u{2580}') || line_text(line).contains('\u{2584}'))
+        .filter(|line| {
+            line_text(line)
+                .chars()
+                .any(|ch| ('\u{2800}'..='\u{28ff}').contains(&ch))
+        })
         .collect();
     assert!(!artwork.is_empty(), "no artwork was emitted");
     for line in artwork {
@@ -115,6 +121,7 @@ fn artwork_uses_only_palette_colours() {
     let allowed: Vec<String> = PALETTE.iter().map(colour_hex).collect();
 
     for encoding in [
+        ImageEncoding::Braille,
         ImageEncoding::Blocks,
         ImageEncoding::Quads,
         ImageEncoding::Ascii,
@@ -141,6 +148,33 @@ fn artwork_uses_only_palette_colours() {
             }
         }
     }
+}
+
+/// The `theme` palette with the half-block encoding is the pre-change render
+/// path, so its output is pinned to what the engine produced before the image
+/// work: `theme_blocks_width40.json` was captured from that binary.
+#[test]
+fn the_theme_palette_reproduces_the_pre_change_block_output() {
+    let golden: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/golden/theme_blocks_width40.json"))
+            .expect("the golden render must parse");
+
+    let content = "![art](image_sample.png)\n";
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/images");
+    let doc = render(
+        content,
+        40,
+        ImageOptions {
+            base: Some(&base),
+            encoding: ImageEncoding::Blocks,
+            ..ImageOptions::default()
+        },
+    );
+    let actual = serde_json::to_value(&doc).expect("serialise");
+    assert_eq!(
+        actual, golden,
+        "the theme palette and half-blocks must still match the pre-change render"
+    );
 }
 
 #[test]

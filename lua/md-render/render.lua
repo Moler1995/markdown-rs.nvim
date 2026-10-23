@@ -7,6 +7,7 @@
 -- is no conceal, no virtual text and no line-height arithmetic, because R is a
 -- real buffer rather than a decorated view of S.
 
+local config = require('md-render.config')
 local style = require('md-render.style')
 
 local M = {}
@@ -22,12 +23,12 @@ local function line_text(line)
   return table.concat(parts)
 end
 
---- Style one display row from a wire line's spans.
+--- Style one display row from a wire line's spans, and underline its links.
 ---
 --- `styles` is the document's style table; each span's index is an index into
 --- it. Styles are interned here rather than up front, so a frame using a colour
 --- no earlier frame used costs one highlight group and nothing else.
-local function paint_line(buf, row, line, styles)
+local function paint_line(buf, row, line, styles, hints)
   -- Extmark columns are byte offsets, so this walks bytes rather than
   -- columns. That is also why the engine's width guarantee matters here: a
   -- line that overflowed would soft-wrap and break the one-display-line-per-
@@ -44,10 +45,37 @@ local function paint_line(buf, row, line, styles)
       col = col + len
     end
   end
+
+  -- A link the engine laid into the line — a mermaid node named by a `click`
+  -- directive — gets a second extmark whose group only adds an underline, so
+  -- it says "this can be followed" without repainting the artwork. The ranges
+  -- are byte offsets and the engine has already clamped them to the visible
+  -- line; the clamp below is repeated because an extmark past the line's end is
+  -- an error rather than a quiet truncation.
+  --
+  -- The hint is tied to the `follow` key: with no key bound there is nothing to
+  -- advertise, and an underline that does nothing would be worse than none.
+  if hints and line.links and config.options.keymaps.follow then
+    for _, link in ipairs(line.links) do
+      local from, to = link[1], math.min(link[2], col)
+      if from < to then
+        vim.api.nvim_buf_set_extmark(buf, M.ns, row, from, {
+          end_col = to,
+          hl_group = style.link_group,
+          priority = 10,
+        })
+      end
+    end
+  end
 end
 
 --- Replace `buf`'s contents with `doc` and style every span.
-function M.apply(buf, doc)
+---
+--- `hints` (default true) says whether a link the engine laid into a line is
+--- underlined. The preview popup passes false: it shows the same lines but
+--- binds no follow key of its own, and a hint for a key that is not there
+--- would mislead.
+function M.apply(buf, doc, hints)
   local lines = {}
   for i, line in ipairs(doc.lines) do
     lines[i] = line_text(line)
@@ -67,7 +95,7 @@ function M.apply(buf, doc)
   vim.api.nvim_buf_clear_namespace(buf, M.ns, 0, -1)
 
   for i, line in ipairs(doc.lines) do
-    paint_line(buf, i - 1, line, doc.styles)
+    paint_line(buf, i - 1, line, doc.styles, hints ~= false)
   end
 
   vim.bo[buf].modifiable = false

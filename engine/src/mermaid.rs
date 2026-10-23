@@ -65,7 +65,61 @@ pub fn render_text(
         backend: to_layout_backend(backend, source),
         ..Default::default()
     };
-    mermaid_text::render_with_options(source, &opts).map_err(|e| format!("{e}"))
+    render(source, &opts).map(|art| art.text)
+}
+
+/// [`render_text`], keeping the clickable runs a `click` directive put on a
+/// node's label.
+///
+/// `mermaid-text` marks a linked label with OSC 8 hyperlink sequences instead
+/// of returning the target separately. Stripping those sequences without
+/// reading them would throw the target away with them, so the renderer parses
+/// them into byte ranges on each line before removing them. That is what lets
+/// the plugin follow a node link from the rendered view.
+///
+/// # Errors
+///
+/// As [`render_text`].
+pub fn render_artwork(
+    source: &str,
+    max_width: Option<usize>,
+    backend: MermaidTextBackend,
+) -> Result<MermaidArt, String> {
+    let opts = mermaid_text::RenderOptions {
+        max_width,
+        backend: to_layout_backend(backend, source),
+        ..Default::default()
+    };
+    render(source, &opts)
+}
+
+/// Render `source` with `opts` and sanitise the result, keeping link ranges.
+fn render(source: &str, opts: &mermaid_text::RenderOptions) -> Result<MermaidArt, String> {
+    mermaid_text::render_with_options(source, opts)
+        .map(|art| strip_escape_sequences(&art))
+        .map_err(|e| format!("{e}"))
+}
+
+/// Rendered diagram artwork together with the clickable runs on its lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MermaidArt {
+    /// The artwork, with every terminal escape sequence removed.
+    pub text: String,
+    /// One entry per line of `text`, in `text.lines()` order. Each range is a
+    /// half-open byte range into that line's text.
+    pub links: Vec<Vec<MermaidLink>>,
+}
+
+/// A clickable run of a rendered line: bytes `start..end` of the line.
+///
+/// Byte offsets rather than display columns because the plugin compares them
+/// with an editor cursor's byte column, and because slicing the line in Lua
+/// works in bytes too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MermaidLink {
+    pub start: u32,
+    pub end: u32,
+    pub target: String,
 }
 
 /// [`render_text`] with an explicit `(layer_gap, node_gap)` override,
@@ -89,7 +143,114 @@ pub fn render_text_with_gaps(
         backend: to_layout_backend(backend, source),
         ..Default::default()
     };
-    mermaid_text::render_with_options(source, &opts).map_err(|e| format!("{e}"))
+    render(source, &opts).map(|art| art.text)
+}
+
+/// Remove ANSI escape sequences from rendered artwork, collecting OSC 8 links.
+///
+/// `mermaid-text` wraps the label of every node named by a `click` directive
+/// in OSC 8 hyperlink sequences (`ESC ] 8 ; ; url ESC \ label ESC ] 8 ; ; ESC
+/// \`) because its own consumer is a terminal that understands them. This
+/// engine's consumer is an editor buffer, which shows the bytes literally: a
+/// linked label would read `^[]8;;url^[\L2 Prefill LB^[]8;;^[\`, and — worse —
+/// the URL's characters would count as display width in
+/// [`crate::document`]'s measurement and clipping, so the diagram would lose
+/// real columns and report an inflated `layout_width`.
+///
+/// The sequences still carry something the wire format wants, though: the URL
+/// and the exact run of cells it covered. Each opening sequence starts a range
+/// in the *cleaned* line's byte coordinates and each closing one ends it; the
+/// escapes themselves are dropped. CSI sequences are dropped too, so a future
+/// coloured render cannot leak them either.
+fn strip_escape_sequences(art: &str) -> MermaidArt {
+    let mut text = String::with_capacity(art.len());
+    let mut links: Vec<Vec<MermaidLink>> = Vec::new();
+    let mut line_links: Vec<MermaidLink> = Vec::new();
+    // Byte offset in `text` where the current line starts.
+    let mut line_start = 0usize;
+    // `(start, target)` of the OSC 8 run currently open, relative to the line.
+    let mut active: Option<(usize, String)> = None;
+
+    let mut chars = art.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' {
+            if ch == '\n' {
+                close_link(&mut line_links, &mut active, text.len() - line_start);
+                links.push(std::mem::take(&mut line_links));
+                text.push('\n');
+                line_start = text.len();
+            } else {
+                text.push(ch);
+            }
+            continue;
+        }
+        match chars.next() {
+            // OSC: `ESC ]` … terminated by BEL or ST (`ESC \`).
+            Some(']') => {
+                let mut payload = String::new();
+                while let Some(c) = chars.next() {
+                    if c == '\x07' {
+                        break;
+                    }
+                    if c == '\x1b' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                    payload.push(c);
+                }
+                if let Some(target) = osc8_target(&payload) {
+                    close_link(&mut line_links, &mut active, text.len() - line_start);
+                    if !target.is_empty() {
+                        active = Some((text.len() - line_start, target.to_string()));
+                    }
+                }
+            }
+            // CSI: `ESC [` … terminated by a final byte in `0x40..=0x7e`.
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            // Any other escape (or a truncated one): drop what we have.
+            _ => {}
+        }
+    }
+    close_link(&mut line_links, &mut active, text.len() - line_start);
+    links.push(line_links);
+
+    // The loop starts a fresh line after every newline, so it leaves one entry
+    // too many exactly when the artwork ends with one — and an empty artwork
+    // has no lines at all. `lines()` is what the caller iterates, so trim the
+    // link table to match it.
+    links.truncate(text.lines().count());
+
+    MermaidArt { text, links }
+}
+
+/// End the open OSC 8 run at byte `end`, recording it if it covers anything.
+fn close_link(links: &mut Vec<MermaidLink>, active: &mut Option<(usize, String)>, end: usize) {
+    let Some((start, target)) = active.take() else {
+        return;
+    };
+    if end > start {
+        links.push(MermaidLink {
+            start: crate::cast::u32_sat(start),
+            end: crate::cast::u32_sat(end),
+            target,
+        });
+    }
+}
+
+/// The URL of an OSC 8 payload (`8;params;url`), or `None` for any other OSC.
+///
+/// A closing sequence (`8;;`) yields `Some("")`, which is what tells the
+/// caller to end the run rather than start one.
+fn osc8_target(payload: &str) -> Option<&str> {
+    let rest = payload.strip_prefix("8;")?;
+    let (_params, target) = rest.split_once(';')?;
+    Some(target)
 }
 
 /// Resolve a [`MermaidTextBackend`] into a concrete `mermaid-text` backend.
@@ -409,6 +570,108 @@ mod tests {
         assert!(
             render_text("this is not a diagram", None, MermaidTextBackend::Auto).is_err(),
             "text that names no diagram type must surface as an error"
+        );
+    }
+
+    // ── Terminal escape sanitisation ─────────────────────────────────────────
+
+    /// A `click` directive must not put OSC 8 hyperlink bytes into the engine's
+    /// output. An editor buffer shows them literally (`^[]8;;…`), and the URL
+    /// characters would be measured as display width, corrupting the clip and
+    /// `layout_width`.
+    #[test]
+    fn click_directives_do_not_leak_escape_sequences() {
+        let src = "graph LR\n\
+                   A[Alpha] --> B[Beta]\n\
+                   click A href \"https://example.com/a\" \"Alpha\"\n";
+        let art = render_text(src, None, MermaidTextBackend::Auto).expect("click render");
+        assert!(
+            !art.contains('\x1b'),
+            "OSC 8 hyperlink bytes leaked into the artwork: {:?}",
+            art
+        );
+        assert!(
+            !art.contains("example.com"),
+            "the URL itself leaked into the artwork: {art:?}"
+        );
+        assert!(art.contains("Alpha"), "the label must survive: {art:?}");
+    }
+
+    /// A linked label's byte range must cover exactly the label cells — the
+    /// plugin compares a cursor byte column against it, so an off-by-one puts
+    /// the link on the box border or drops its first byte.
+    #[test]
+    fn click_directives_carry_link_ranges() {
+        let src = "graph LR\n\
+                   A[Alpha] --> B[Beta]\n\
+                   click A href \"https://example.com/a\" \"Alpha\"\n";
+        let art = render_artwork(src, None, MermaidTextBackend::Auto).expect("click render");
+
+        let (row, link) = art
+            .links
+            .iter()
+            .enumerate()
+            .flat_map(|(row, links)| links.iter().map(move |link| (row, link)))
+            .find(|(_, link)| link.target == "https://example.com/a")
+            .expect("the click target must be reported");
+        let line = art.text.lines().nth(row).expect("the link's line");
+        assert_eq!(
+            &line[link.start as usize..link.end as usize],
+            "Alpha",
+            "the range must cover exactly the label, not its padding or border"
+        );
+    }
+
+    /// The sanitizer must handle both OSC terminators and CSI sequences, and
+    /// must leave ordinary box drawing untouched.
+    #[test]
+    fn strip_escape_sequences_removes_osc_and_csi() {
+        let bel = strip_escape_sequences("a\x1b]8;;https://x\x07b");
+        let st = strip_escape_sequences("a\x1b]8;;https://x\x1b\\b");
+        let csi = strip_escape_sequences("a\x1b[31;1mb\x1b[0m");
+        assert_eq!(bel.text, "ab");
+        assert_eq!(st.text, "ab");
+        assert_eq!(csi.text, "ab");
+        assert_eq!(strip_escape_sequences("│ ┌─┐ │").text, "│ ┌─┐ │");
+    }
+
+    /// Ranges are byte offsets into the *cleaned* line, so a CJK label needs
+    /// three bytes per glyph and the escape bytes must not count.
+    #[test]
+    fn link_ranges_are_byte_offsets_into_the_cleaned_line() {
+        let art = strip_escape_sequences("│\x1b]8;;https://x\x1b\\名称\x1b]8;;\x1b\\│");
+        assert_eq!(art.text, "│名称│");
+        assert_eq!(
+            art.links,
+            vec![vec![MermaidLink {
+                start: 3,
+                end: 9,
+                target: "https://x".to_string(),
+            }]]
+        );
+    }
+
+    /// Links are per line, and a run that is never closed ends with its line
+    /// rather than swallowing the next one.
+    #[test]
+    fn link_ranges_are_per_line() {
+        let art =
+            strip_escape_sequences("a\x1b]8;;u1\x1b\\b\x1b]8;;\x1b\\c\nd\x1b]8;;u2\x1b\\e");
+        assert_eq!(art.text, "abc\nde");
+        assert_eq!(
+            art.links,
+            vec![
+                vec![MermaidLink {
+                    start: 1,
+                    end: 2,
+                    target: "u1".to_string(),
+                }],
+                vec![MermaidLink {
+                    start: 1,
+                    end: 2,
+                    target: "u2".to_string(),
+                }],
+            ]
         );
     }
 }

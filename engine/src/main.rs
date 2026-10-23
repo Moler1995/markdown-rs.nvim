@@ -17,7 +17,10 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use md_render::document::{layout_document, source_line_count};
-use md_render::image_art::{ImageEncoding, ImageOptions};
+use md_render::image_art::{
+    DitherMode, ImageBackground, ImageEncoding, ImageOptions, ImagePalette,
+};
+use md_render::style::Color;
 use md_render::renderer::render_markdown;
 use md_render::theme::{Palette, Theme};
 
@@ -56,12 +59,58 @@ struct Cli {
 
     /// How images are drawn.
     ///
+    /// `braille` uses eight dots in a 2 × 4 grid and one colour per cell;
     /// `quads` uses quadrant glyphs, four sub-cells in two colours; `blocks`
     /// uses half-block glyphs and two colours per cell; `ascii` uses one
     /// characteristic glyph and one colour; and `off` renders references as
     /// their alt text.
-    #[arg(long, value_enum, default_value = "blocks")]
+    #[arg(long, value_enum, default_value = "braille")]
     image_encoding: ImageEncoding,
+
+    /// Where image cell colours come from.
+    ///
+    /// `theme` is the fixed sixty-four-colour cube; `adaptive` cuts sixty-four
+    /// colours from the image itself; `full` emits sampled colours exactly,
+    /// up to the document's style bound and quantised after it.
+    #[arg(long, value_enum, default_value = "theme")]
+    image_palette: ImagePalette,
+
+    /// What partly transparent image pixels are composited against.
+    ///
+    /// `terminal` leaves them to the terminal (the default); `theme` uses the
+    /// selected theme's background; `#rrggbb` names a colour.
+    #[arg(long, default_value = "terminal", value_name = "terminal|theme|#rrggbb")]
+    image_background: String,
+
+    /// The colour braille artwork is drawn on.
+    ///
+    /// Braille has one colour per cell and one bit per dot, so it draws a
+    /// picture as ink on paper: the dots carry whichever side of a sub-cell is
+    /// away from the paper. On a dark page a white screenshot becomes a field
+    /// of light dots with its text left as gaps; on a light page the sketch is
+    /// dark instead. Defaults to what the background resolves to, or the
+    /// theme's background when transparency is left to the terminal.
+    #[arg(long, value_name = "#rrggbb")]
+    image_paper: Option<String>,
+
+    /// Whether image quantisation is ordered-dithered.
+    ///
+    /// `auto` enables it for braille, and for ASCII with a reduced palette;
+    /// `on` and `off` force it. Off by default, as before.
+    #[arg(long, value_enum, default_value = "off", value_name = "auto|on|off")]
+    image_dither: DitherMode,
+
+    /// Enlarge an image to at least this many display rows.
+    ///
+    /// Zero (the default) never enlarges. A positive value enlarges by the
+    /// smallest whole factor from 2 to 4 that reaches the count, without
+    /// crossing the width or height bounds.
+    #[arg(long, default_value_t = 0, value_name = "ROWS")]
+    image_min_rows: u16,
+
+    /// Sharpen an image that was reduced to fit the page.
+    #[arg(long)]
+    image_sharpen: bool,
 
     /// Also emit the frames of animated GIF and WebP images.
     ///
@@ -116,12 +165,26 @@ fn run(cli: &Cli) -> Result<String, String> {
     let content = read_input(cli.path.as_ref())?;
 
     let palette = Palette::from_theme(theme);
+    let background = parse_background(&cli.image_background, &palette)?;
+    // Braille's page is whatever the image is composited onto, so a named
+    // background doubles as the paper; `terminal` leaves both to the caller.
+    let paper = match (&cli.image_paper, background) {
+        (Some(hex), _) => Some(parse_hex(hex, "--image-paper")?),
+        (None, ImageBackground::Rgb(rgb)) => Some(rgb),
+        (None, ImageBackground::Terminal) => None,
+    };
     let blocks = render_markdown(&content, &palette, theme);
     let images = ImageOptions {
         base: cli.base.as_deref(),
         max_height: cli.image_max_height,
         encoding: cli.image_encoding,
         animation: cli.image_animation,
+        palette: cli.image_palette,
+        background,
+        dither: cli.image_dither,
+        min_rows: cli.image_min_rows,
+        sharpen: cli.image_sharpen,
+        paper,
     };
     let doc = layout_document(
         &blocks,
@@ -132,6 +195,36 @@ fn run(cli: &Cli) -> Result<String, String> {
     );
 
     serde_json::to_string(&doc).map_err(|err| format!("could not serialise the document: {err}"))
+}
+
+/// Resolve `--image-background` against the selected theme.
+fn parse_background(value: &str, palette: &Palette) -> Result<ImageBackground, String> {
+    match value {
+        "terminal" => Ok(ImageBackground::Terminal),
+        "theme" => {
+            let rgb = match palette.background {
+                Color::Rgb(r, g, b) => [r, g, b],
+                _ => [0, 0, 0],
+            };
+            Ok(ImageBackground::Rgb(rgb))
+        }
+        hex => Ok(ImageBackground::Rgb(parse_hex(hex, "--image-background")?)),
+    }
+}
+
+/// Parse `#rrggbb`, naming the option in any error.
+fn parse_hex(value: &str, option: &str) -> Result<[u8; 3], String> {
+    let digits = value
+        .strip_prefix('#')
+        .ok_or_else(|| format!("{option}: expected #rrggbb, got {value}"))?;
+    if digits.len() != 6 || !digits.is_ascii() {
+        return Err(format!("{option}: expected six hex digits, got {value}"));
+    }
+    let channel = |start: usize| {
+        u8::from_str_radix(&digits[start..start + 2], 16)
+            .map_err(|_| format!("{option}: {value} is not a hex colour"))
+    };
+    Ok([channel(0)?, channel(2)?, channel(4)?])
 }
 
 fn read_input(path: Option<&PathBuf>) -> Result<String, String> {
