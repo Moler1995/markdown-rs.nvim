@@ -21,11 +21,14 @@ const DOC_WIDTH: u16 = 40;
 
 /// Pull the single fenced `json` block out of the format document.
 fn example_json() -> serde_json::Value {
-    let start = FORMAT_DOC
+    // The document is checked out with CRLF on Windows; fenced-block
+    // detection must not depend on the line ending.
+    let document = FORMAT_DOC.replace("\r\n", "\n");
+    let start = document
         .find("```json\n")
         .expect("the format document must contain a ```json block")
         + "```json\n".len();
-    let rest = &FORMAT_DOC[start..];
+    let rest = &document[start..];
     let end = rest
         .find("\n```")
         .expect("the document's ```json block must be closed");
@@ -86,7 +89,7 @@ fn the_documented_top_level_fields_are_the_ones_emitted() {
 }
 
 #[test]
-fn every_line_carries_exactly_source_and_spans() {
+fn every_line_carries_source_and_spans_plus_optional_links() {
     let real = render(DOC_INPUT, DOC_WIDTH);
     for (i, line) in real["lines"]
         .as_array()
@@ -94,12 +97,25 @@ fn every_line_carries_exactly_source_and_spans() {
         .iter()
         .enumerate()
     {
-        let keys: Vec<&String> = line
+        let keys: Vec<&str> = line
             .as_object()
             .unwrap_or_else(|| panic!("line {i} must be an object"))
             .keys()
+            .map(String::as_str)
             .collect();
-        assert_eq!(keys, ["source", "spans"], "line {i} has unexpected fields");
+        for key in &keys {
+            assert!(
+                matches!(*key, "source" | "spans" | "links"),
+                "line {i} has an undocumented field `{key}`: {keys:?}"
+            );
+        }
+        assert!(keys.contains(&"source"), "line {i} lacks `source`");
+        assert!(keys.contains(&"spans"), "line {i} lacks `spans`");
+        assert!(
+            !keys.contains(&"links"),
+            "line {i} carries `links` although the documented example has no \
+             clickable runs — the field must be omitted when empty"
+        );
     }
 }
 
@@ -176,4 +192,49 @@ fn source_map_is_one_valid_index_per_source_line() {
             "source_map[{i}] is {index}, but there are only {line_count} lines"
         );
     }
+}
+
+/// A mermaid `click` directive must reach the wire as a byte range on the
+/// label — not as the terminal's OSC 8 escape bytes, which an editor buffer
+/// would show literally.
+#[test]
+fn a_click_directive_reaches_the_wire_as_a_byte_range() {
+    const CLICK_INPUT: &str = "\
+```mermaid
+graph LR
+  A[Alpha] --> B[Beta]
+  click A href \"linked.md\" \"Alpha\"
+```
+";
+    let real = render(CLICK_INPUT, 80);
+
+    let lines = real["lines"].as_array().expect("lines must be an array");
+    let line = lines
+        .iter()
+        .find(|line| line.get("links").is_some())
+        .expect("the clicked node's row must carry `links`");
+
+    let text: String = line["spans"]
+        .as_array()
+        .expect("spans")
+        .iter()
+        .map(|span| span[1].as_str().expect("span text"))
+        .collect();
+    assert!(
+        !text.contains('\x1b'),
+        "terminal escapes must never reach the buffer: {text:?}"
+    );
+
+    let link = &line["links"].as_array().expect("links")[0];
+    let pair = link.as_array().expect("a link must be an array");
+    assert_eq!(pair.len(), 3, "a link is `[start, end, target]`");
+    assert_eq!(pair[2], "linked.md", "the target must survive verbatim");
+
+    let start = pair[0].as_u64().expect("start") as usize;
+    let end = pair[1].as_u64().expect("end") as usize;
+    assert_eq!(
+        &text[start..end],
+        "Alpha",
+        "the range must cover exactly the label"
+    );
 }

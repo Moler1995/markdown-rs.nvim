@@ -22,14 +22,23 @@ M.defaults = {
 
   -- How images in the document are drawn.
   --
-  --   'auto'    `quads` when the terminal can show 24-bit colour
+  --   'auto'    `braille` when the terminal can show 24-bit colour
   --             (`'termguicolors'`), `ascii` when it cannot. Resolved when a
   --             render is asked for, not at setup, so toggling `'termguicolors'`
   --             takes effect on the next render.
+  --   'braille' Eight dots in a 2×4 grid, one colour per cell: eight times the
+  --             sub-cell detail of a half block, drawn as dot density. The dots
+  --             are ink on the page they sit on, so on a dark background the
+  --             bright side of the picture is drawn and a white screenshot
+  --             shows as light dots with its own dark features as gaps; on a
+  --             light background the dark side is drawn instead. Needs a font
+  --             with the braille patterns (Cascadia Mono and Segoe UI Symbol
+  --             have them).
   --   'quads'   Quadrant glyphs, four sub-cells in two colours. Twice the
   --             horizontal detail of `blocks` at the same width, and only worth
-  --             it with true colour and a font that draws the block elements
-  --             (Cascadia Mono, the Windows Terminal default, does).
+  --             it with true colour and a font that draws the block elements.
+  --             `image_mode = 'quads'` restores the look the plugin had before
+  --             braille was the default.
   --   'blocks'  Half-block glyphs, two colours per cell. The fallback for a
   --             terminal whose font has no quadrants.
   --   'ascii'   One ASCII glyph per cell from a fixed luminance ramp. Works in
@@ -42,6 +51,62 @@ M.defaults = {
   -- format, one over the size limits — falls back to its alt text whatever this
   -- is set to, so no document can fail to render because of a picture.
   image_mode = 'auto',
+
+  -- Where an image's cell colours come from.
+  --
+  --   'auto'      `full` for `braille` and `ascii`, where a cell carries one
+  --               colour and exact colours are what makes the picture look like
+  --               itself; `adaptive` for `quads` and `blocks`, where a cell
+  --               carries a colour pair and a per-image palette keeps the pair
+  --               coherent. Resolved with the encoding, at the same time.
+  --   'theme'     The engine's fixed 64-colour cube. The colours the plugin
+  --               used before this option existed.
+  --   'adaptive'  Up to 64 colours cut from the image itself.
+  --   'full'      The sampled colour itself, up to 4,096 styles per document;
+  --               past that the engine quantises to the adaptive palette.
+  --
+  -- Every distinct image style becomes one highlight group in the session, and
+  -- a group is never removed while the editor runs, so `full` is bounded by the
+  -- engine rather than free-form.
+  image_palette = 'auto',
+
+  -- What partly transparent pixels are blended with, before quantisation.
+  --
+  --   'terminal'  Nothing: the terminal's own background shows through. The
+  --               gentle default, and what the plugin always did.
+  --   'theme'     The selected theme's background colour.
+  --   '#rrggbb'   An explicit colour, for an image meant for one background.
+  --
+  -- A named background is what removes the hard halo around a logo with soft
+  -- edges; `terminal` leaves those pixels alone instead. A named background is
+  -- also the page braille inks against; with `terminal`, the editor's own
+  -- `Normal` background is sent as the page, since only the editor knows it.
+  image_background = 'terminal',
+
+  -- Whether image quantisation is ordered-dithered.
+  --
+  --   'auto'   On for `braille`, and for `ascii` with a reduced palette; off
+  --            for the two-colour encodings, where a dithered cell would
+  --            speckle, and for `full`, where there is nothing to dither.
+  --   true     Always dither.
+  --   false    Never. `false` with `image_mode = 'quads'` and
+  --            `image_palette = 'theme'` is the pre-braille output.
+  image_dither = 'auto',
+
+  -- Enlarge a small image to at least this many display rows.
+  --
+  -- Zero (the default) never enlarges. A positive value asks the engine for the
+  -- smallest whole factor from 2 to 4 that reaches the count, by
+  -- nearest-neighbour sampling and without crossing the width or height bound,
+  -- so pixel art gets bigger instead of staying a thumbnail.
+  image_min_rows = 0,
+
+  -- Sharpen an image that was reduced to fit the page.
+  --
+  -- Applies a fixed unsharp mask after the area average, which restores some of
+  -- the edge contrast a downscaled photograph loses. A natural-size or enlarged
+  -- image is unchanged.
+  image_sharpen = false,
 
   -- The most display rows one inline image may occupy.
   --
@@ -80,10 +145,17 @@ M.defaults = {
   --
   -- `follow` is the one key set in both states, because a link is followed from
   -- wherever the reader happens to be: in S it resolves the link under the
-  -- cursor, and in R it maps the display row back to its source line first and
-  -- resolves the link there. It shadows `gf` in a managed buffer, and hands the
-  -- key back to Vim when the cursor is not on a link, so a bare path still
-  -- opens the way it always did.
+  -- cursor, and in R it first follows a link the engine laid into the rendered
+  -- line — a mermaid node named by a `click` directive — and otherwise maps
+  -- the display row back to its source line and resolves the link there. It
+  -- shadows `gf` in a managed buffer, and hands the key back to Vim when the
+  -- cursor is not on a link, so a bare path still opens the way it always did.
+  -- Set it to `gd` or any other key if that suits your habits better.
+  --
+  -- A link the engine laid into a diagram is also underlined, so a reader can
+  -- see the node is followable without knowing the key first. The hint is tied
+  -- to this key: set it to `false` and the underline goes away with it, since
+  -- there would be nothing left to follow.
   --
   -- `zoom_in` and `zoom_out` are set in the preview popup's buffer rather than
   -- in R or S, because they act on the block the popup is showing. In a table's
@@ -157,15 +229,73 @@ end
 ---
 --- Resolved per call rather than at setup because `'termguicolors'` can be
 --- toggled at any moment; a choice made once at setup would be wrong from the
---- first toggle onwards. The block encodings' two colours per cell are
---- what make it worth the extra styles, so a terminal that cannot show 24-bit
---- colour gets the ASCII ramp instead.
+--- first toggle onwards. Braille's per-cell colour is what makes it worth the
+--- extra styles, so a terminal that cannot show 24-bit colour gets the ASCII
+--- ramp instead.
 function M.image_encoding()
   local mode = M.options.image_mode
   if mode == 'auto' then
-    return vim.o.termguicolors and 'quads' or 'ascii'
+    return vim.o.termguicolors and 'braille' or 'ascii'
   end
   return mode
+end
+
+--- The palette to ask the engine for, with `auto` resolved against the
+--- encoding this render will use.
+---
+--- One colour per cell (`braille`, `ascii`) is what makes `full` worthwhile:
+--- quantising the cell's single colour to 64 entries throws away the tone that
+--- the dot pattern is reproducing. Two colours per cell (`quads`, `blocks`)
+--- need the pair to be coherent, which the per-image adaptive palette gives.
+function M.image_palette()
+  local mode = M.options.image_palette
+  if mode ~= 'auto' then
+    return mode
+  end
+  local encoding = M.image_encoding()
+  if encoding == 'braille' or encoding == 'ascii' then
+    return 'full'
+  end
+  return 'adaptive'
+end
+
+--- `#rrggbb` of the editor's own background, or nil when it has none.
+---
+--- Read per call, like the encoding, because a colourscheme change moves it
+--- and a braille image inked for the old page is the wrong way round on the
+--- new one. `termguicolors` off leaves the colour to the terminal, which this
+--- cannot see, so the engine falls back to the theme.
+local function page_background()
+  if not vim.o.termguicolors then
+    return nil
+  end
+  local ok, hl = pcall(vim.api.nvim_get_hl, 0, { name = 'Normal' })
+  if not ok or type(hl.bg) ~= 'number' then
+    return nil
+  end
+  return string.format('#%06x', hl.bg)
+end
+
+--- The image options in the shape the render views carry.
+---
+--- One place resolves `auto`, so the inline render and the preview popup cannot
+--- disagree about what an option means. The engine's builder turns these into
+--- flags; nothing here knows a flag name.
+---
+--- `paper` is only named when transparency is left to the terminal: then the
+--- page an image is drawn on is the editor's own background, and braille needs
+--- it to know which side of a cell is ink. A named background already says
+--- what the page is, so the engine uses that instead.
+function M.image_options()
+  local background = M.options.image_background
+  return {
+    palette = M.image_palette(),
+    background = background,
+    dither = M.options.image_dither,
+    min_rows = M.options.image_min_rows,
+    sharpen = M.options.image_sharpen,
+    paper = background == 'terminal' and page_background() or nil,
+  }
 end
 
 return M

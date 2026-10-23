@@ -47,12 +47,20 @@ end
 ---
 ---   width     columns the text may occupy (required)
 ---   height    display rows the page has, or nil to bound images by width alone
----   encoding  the engine's `--image-encoding`: 'quads', 'blocks', 'ascii'
----             or 'off'
+---   encoding  the engine's `--image-encoding`: 'braille', 'quads', 'blocks',
+---             'ascii' or 'off'
 ---   base      directory relative image destinations resolve against, or nil to
 ---             leave them to the engine's working directory
 ---   animation true to ask for an animated image's frames as well as its first
 ---             frame; omitted or false leaves the engine's animation field out
+---   palette   the engine's `--image-palette`: 'theme', 'adaptive' or 'full'
+---   background what transparency is composited against: 'terminal', 'theme'
+---             or a '#rrggbb' colour
+---   dither    'auto', true or false for `--image-dither`
+---   min_rows  fewest display rows to enlarge an image to, or 0 for never
+---   sharpen   true to sharpen an image that was reduced
+---   paper     the '#rrggbb' braille inks against, when the caller knows it;
+---             nil lets the engine derive it from `background`
 ---
 --- Calls `cb(err, doc)`. The callback runs on the main loop, so it is safe to
 --- touch buffers from it. `err` is a human-readable string; there is no case
@@ -92,6 +100,41 @@ function M.render(opts, content, view, cb)
   -- ordinary render should pay for.
   if view.animation then
     args[#args + 1] = '--image-animation'
+  end
+  -- The image quality options. The plugin resolves `auto` before it gets here,
+  -- so what is sent is always a concrete engine value; the engine's own
+  -- defaults exist for callers that are not this plugin.
+  if view.palette and view.palette ~= '' then
+    args[#args + 1] = '--image-palette'
+    args[#args + 1] = view.palette
+  end
+  if view.background and view.background ~= '' then
+    args[#args + 1] = '--image-background'
+    args[#args + 1] = view.background
+  end
+  -- The page braille inks against. Only sent when the plugin knows it, which
+  -- is when transparency is the terminal's: a named background already is the
+  -- page, and the engine derives the paper from it.
+  if view.paper and view.paper ~= '' then
+    args[#args + 1] = '--image-paper'
+    args[#args + 1] = view.paper
+  end
+  if view.dither ~= nil then
+    local dither = view.dither
+    if dither == true then
+      dither = 'on'
+    elseif dither == false then
+      dither = 'off'
+    end
+    args[#args + 1] = '--image-dither'
+    args[#args + 1] = dither
+  end
+  if view.min_rows and view.min_rows > 0 then
+    args[#args + 1] = '--image-min-rows'
+    args[#args + 1] = tostring(view.min_rows)
+  end
+  if view.sharpen then
+    args[#args + 1] = '--image-sharpen'
   end
 
   -- Guarded, because a process that cannot be started at all is an error from

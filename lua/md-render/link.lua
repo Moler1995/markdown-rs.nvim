@@ -279,6 +279,31 @@ function M.at(lines, lnum, col)
   return nil
 end
 
+--- The engine-reported link covering byte column `col` (0-based) on display
+--- row `row` (0-based), or nil.
+---
+--- These are the links that are not in the source text: a mermaid `click`
+--- directive names a URL, and the engine reports the label cells it covers as
+--- byte ranges on the rendered line. Reading them from the document rather
+--- than re-parsing the fence is what keeps "what is clickable" in one place.
+---
+--- The ranges are byte offsets into the line's text, which is exactly what a
+--- cursor column is, so no display-column arithmetic is involved.
+function M.rendered_at(doc, row, col)
+  local line = doc and doc.lines and doc.lines[row + 1]
+  local links = line and line.links
+  if not links then
+    return nil
+  end
+  for _, link in ipairs(links) do
+    local from, to, raw = link[1], link[2], link[3]
+    if col >= from and col < to then
+      return finish({ raw = raw })
+    end
+  end
+  return nil
+end
+
 --- Every image reference on line `lnum` (0-based), in left-to-right order.
 ---
 --- An image is a link whose text was introduced by `!`; the rest of the entry

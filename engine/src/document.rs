@@ -16,14 +16,17 @@
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::block::DocBlock;
-use crate::image_art::{Artwork, Bounds, ImageOptions, animated_artwork, artwork};
-use crate::mermaid::{MermaidTextBackend, render_text};
+use crate::image_art::{
+    Artwork, Bounds, ImageOptions, StyleBudget, animated_artwork, artwork,
+};
+use crate::mermaid::{MermaidLink, MermaidTextBackend, render_artwork};
 use crate::style::{Line, Span, Style};
 use crate::table::layout_table;
 use crate::text_layout::wrap_spans;
 use crate::theme::Palette;
 use crate::wire::{
-    StyleTable, WIRE_VERSION, WireAnimation, WireDoc, WireFrame, WireLine, build_source_map,
+    StyleTable, WIRE_VERSION, WireAnimation, WireDoc, WireFrame, WireLine, WireLink,
+    build_source_map,
 };
 
 /// Lay out every block for `width` columns and produce the document the plugin
@@ -129,6 +132,9 @@ struct Layout<'a> {
     /// Source lines of image references whose animation was refused by the
     /// caps, in document order. The plugin reports these; they carry no frames.
     animations_limited: Vec<u32>,
+    /// Distinct image styles emitted so far, shared by every image in the
+    /// document so the full palette cannot exceed [`crate::image_art::MAX_IMAGE_STYLES`].
+    image_styles: StyleBudget,
 }
 
 impl<'a> Layout<'a> {
@@ -148,6 +154,7 @@ impl<'a> Layout<'a> {
             images,
             animations: Vec::new(),
             animations_limited: Vec::new(),
+            image_styles: StyleBudget::default(),
         }
     }
 
@@ -166,6 +173,37 @@ impl<'a> Layout<'a> {
             let line = wrapped.to_line();
             self.note_width(line.width());
             self.lines.push(self.styles.line(source, &line));
+        }
+    }
+
+    /// Append one row of diagram artwork together with its clickable runs.
+    ///
+    /// The row has already been clipped to the target width, so `wrap_spans`
+    /// yields exactly one display line. The links are attached only in that
+    /// case: wrapping would split the byte ranges across rows, and a diagram
+    /// row is never meant to wrap. A caller that ever passes an unclipped row
+    /// gets the text without links rather than links pointing at the wrong
+    /// bytes.
+    fn push_diagram_line(
+        &mut self,
+        source: u32,
+        text: &str,
+        style: Style,
+        links: Vec<WireLink>,
+    ) {
+        let source = source.min(self.max_source);
+        let line = Line::from(Span::styled(text, style));
+        let wrapped = wrap_spans(&line.spans, self.width);
+        let single = wrapped.len() == 1;
+        let mut links = links;
+        for (i, wrapped) in wrapped.into_iter().enumerate() {
+            let line = wrapped.to_line();
+            self.note_width(line.width());
+            let mut wire = self.styles.line(Some(source), &line);
+            if single && i == 0 {
+                wire.links = std::mem::take(&mut links);
+            }
+            self.lines.push(wire);
         }
     }
 
@@ -197,18 +235,30 @@ impl<'a> Layout<'a> {
             width: self.width,
             height: self.images.max_height,
         };
+        // Braille draws ink on a page, and the page is whatever is behind the
+        // artwork. A caller that named one — the plugin passes the terminal's
+        // own background — is believed; otherwise the selected theme's
+        // background stands in for it.
+        let theme_paper = match self.palette.background {
+            crate::style::Color::Rgb(r, g, b) => [r, g, b],
+            _ => [0, 0, 0],
+        };
+        let images = ImageOptions {
+            paper: Some(self.images.paper.unwrap_or(theme_paper)),
+            ..self.images
+        };
         if self.images.animation
             && let Some(art) = animated_artwork(
                 dest,
                 bounds,
-                self.images.encoding,
-                self.images.base,
+                &images,
+                &mut self.image_styles,
             )
         {
             self.push_artwork(source_line, art);
             return;
         }
-        match artwork(dest, bounds, self.images.encoding, self.images.base) {
+        match artwork(dest, bounds, &images, &mut self.image_styles) {
             Some(lines) => {
                 for line in &lines {
                     self.push(Some(source_line), line);
@@ -305,15 +355,20 @@ impl<'a> Layout<'a> {
 
         // `max_width` is a hint the layout backend uses to pick an orientation,
         // not a clamp: a diagram can still come back wider than the budget.
-        match render_text(source, Some(self.width as usize), MermaidTextBackend::Auto) {
+        match render_artwork(source, Some(self.width as usize), MermaidTextBackend::Auto) {
             Ok(art) => {
-                for line in art.lines() {
+                let no_links: &[MermaidLink] = &[];
+                for (i, line) in art.text.lines().enumerate() {
                     // Measured before the clip, so a caller can tell that this
-                    // line was cut down. `push` then measures the clipped line
-                    // too, which can only be narrower.
+                    // line was cut down. `push_diagram_line` then measures the
+                    // clipped line too, which can only be narrower.
                     self.note_width(line.width());
                     let line = clip_to_width(line, self.width as usize);
-                    self.push(Some(source_line), &Line::from(Span::styled(line, art_style)));
+                    let links = clamp_links(
+                        art.links.get(i).map_or(no_links, Vec::as_slice),
+                        line.len(),
+                    );
+                    self.push_diagram_line(source_line, line, art_style, links);
                 }
             }
             Err(_) => {
@@ -343,6 +398,32 @@ fn clip_to_width(line: &str, max: usize) -> &str {
         used += width;
     }
     line
+}
+
+/// Clip diagram link ranges to a line that was cut to `max_bytes`.
+///
+/// The ranges are byte offsets into the row before clipping, so a link that
+/// lay partly past the cut has to end where the line now ends, and one that
+/// lay wholly past it disappears. Dropping rather than keeping a stale range
+/// matters: the plugin tests the cursor's byte column against these, and the
+/// bytes a clipped row does not show must not be clickable.
+fn clamp_links(links: &[MermaidLink], max_bytes: usize) -> Vec<WireLink> {
+    let mut out = Vec::new();
+    for link in links {
+        let start = link.start as usize;
+        if start >= max_bytes {
+            continue;
+        }
+        let end = (link.end as usize).min(max_bytes);
+        if end > start {
+            out.push(WireLink(
+                crate::cast::u32_sat(start),
+                crate::cast::u32_sat(end),
+                link.target.clone(),
+            ));
+        }
+    }
+    out
 }
 
 /// The number of source lines `content` occupies.
@@ -807,16 +888,22 @@ mod tests {
         let doc = layout(&content, 80);
         let text: Vec<String> = doc.lines.iter().map(line_text).collect();
 
-        // The 4x2 fixture is one cell row: three opaque cells and a transparent
-        // one, so the exact glyphs are known.
+        // The 4x2 fixture is one cell row: red, red-over-blue, white and
+        // transparent. Braille inks what is away from the page, and the page
+        // here is the default theme's dark background, so the three coloured
+        // cells are solid and only the transparent one stays blank.
         assert!(
-            text.contains(&"\u{2580}\u{2580}\u{2580} ".to_string()),
-            "the image did not render as artwork: {text:?}"
+            text.contains(&"\u{28ff}\u{28ff}\u{28ff}\u{2800}".to_string()),
+            "the image did not render as braille artwork: {text:?}"
         );
         let artwork = doc
             .lines
             .iter()
-            .find(|line| line_text(line).contains('\u{2580}'))
+            .find(|line| {
+                line_text(line)
+                    .chars()
+                    .any(|ch| ('\u{2801}'..='\u{28ff}').contains(&ch))
+            })
             .expect("an artwork line");
         assert_eq!(artwork.source, Some(2), "artwork anchors to the reference");
 
@@ -988,5 +1075,72 @@ mod tests {
             },
         );
         assert_eq!(lines_text(&doc), "cells\n");
+    }
+
+    /// A diagram row is clipped to the window; a link that reached past the cut
+    /// must end at the line's edge and one wholly past it must disappear.
+    /// Otherwise the plugin would make bytes the reader cannot see clickable.
+    #[test]
+    fn clamp_links_trims_straddlers_and_drops_ranges_past_the_clip() {
+        let links = vec![
+            MermaidLink {
+                start: 0,
+                end: 4,
+                target: "a".to_string(),
+            },
+            MermaidLink {
+                start: 2,
+                end: 9,
+                target: "b".to_string(),
+            },
+            MermaidLink {
+                start: 8,
+                end: 12,
+                target: "c".to_string(),
+            },
+        ];
+        assert_eq!(
+            clamp_links(&links, 6),
+            vec![
+                WireLink(0, 4, "a".to_string()),
+                WireLink(2, 6, "b".to_string()),
+            ]
+        );
+    }
+
+    /// End to end: a `click` directive produces a link range on the rendered
+    /// label, the artwork carries no terminal escapes, and the range covers
+    /// exactly the label text.
+    #[test]
+    fn a_click_directive_becomes_a_byte_ranged_link_on_the_label() {
+        let content = "```mermaid\n\
+                       graph LR\n\
+                       A[Alpha] --> B[Beta]\n\
+                       click A href \"linked.md\" \"Alpha\"\n\
+                       ```\n";
+        let doc = layout(content, 80);
+
+        assert!(
+            doc.lines
+                .iter()
+                .all(|line| line.spans.iter().all(|span| !span.1.contains('\x1b'))),
+            "terminal escapes must never reach the buffer"
+        );
+
+        let line = doc
+            .lines
+            .iter()
+            .find(|line| !line.links.is_empty())
+            .expect("the clicked node's row must carry a link");
+        assert_eq!(line.source, Some(0), "artwork anchors to the fence line");
+
+        let text: String = line.spans.iter().map(|span| span.1.as_str()).collect();
+        let link = &line.links[0];
+        assert_eq!(link.2, "linked.md");
+        assert_eq!(
+            &text[link.0 as usize..link.1 as usize],
+            "Alpha",
+            "the range must cover exactly the label"
+        );
     }
 }

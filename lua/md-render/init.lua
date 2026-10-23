@@ -196,7 +196,14 @@ local function show_rendered(st, doc)
     line = st.source_view.lnum - 1
   end
 
-  vim.api.nvim_win_set_buf(win, buf)
+  -- `keepjumps`: swapping between the two views is not navigation. A plain
+  -- `:buffer` — which `nvim_win_set_buf` is — pushes the buffer it leaves onto
+  -- the jump list, so after a `gf` the reader's `<C-o>` would come back to this
+  -- document's other view before the file they came from, and every toggle
+  -- would add an entry of its own.
+  vim.api.nvim_win_call(win, function()
+    vim.cmd('keepjumps buffer ' .. buf)
+  end)
 
   -- Its own rendered buffer is in the window now, so the one inherited from the
   -- window it was split off is no longer what this state is entitled to.
@@ -257,7 +264,10 @@ local function show_source(st)
   end
 
   if vim.api.nvim_win_get_buf(win) ~= source then
-    vim.api.nvim_win_set_buf(win, source)
+    -- Same reason as `show_rendered`: crossing views must not become a jump.
+    vim.api.nvim_win_call(win, function()
+      vim.cmd('keepjumps buffer ' .. source)
+    end)
   end
   st.inherited = nil
 
@@ -359,8 +369,9 @@ local function request(st, opts)
   -- on an image, or the popup opening one. With the option off they are never
   -- asked for, whatever the caller wants.
   local animation = (opts.animate and config.options.image_animation) and true or false
+  local image = config.image_options()
 
-  local cached = state.cached(source, tick, width, height, encoding, theme, animation)
+  local cached = state.cached(source, tick, width, height, encoding, theme, animation, image)
   if cached then
     st.reported = nil
     if st.want == 'R' then
@@ -376,13 +387,13 @@ local function request(st, opts)
   st.generation = generation
 
   local content = table.concat(vim.api.nvim_buf_get_lines(source, 0, -1, false), '\n')
-  local view = {
+  local view = vim.tbl_extend('force', {
     width = width,
     height = height,
     encoding = encoding,
     base = image_base(source),
     animation = animation,
-  }
+  }, image)
 
   if opts.animate then
     status('md-render: decoding image frames…')
@@ -424,7 +435,7 @@ local function request(st, opts)
     end
 
     st.reported = nil
-    state.store(source, tick, width, height, encoding, theme, animation, doc)
+    state.store(source, tick, width, height, encoding, theme, animation, image, doc)
     if opts.animate and st.doc and st.want == 'R' then
       -- Adopted, not applied. The engine guarantees an animated document's
       -- `lines` are the static document's, so swapping the document under the
@@ -886,22 +897,30 @@ local function jump_anchor(st, fragment)
   return true
 end
 
+--- True while `M.follow` is running its `:edit`, so the `BufWinEnter` attach
+--- that would otherwise fire mid-jump stays out of the way. `M.follow` does
+--- its own attach once the destination's cursor is placed.
+local following = false
+
 --- Open what the link under the cursor points at.
 ---
 --- A file opens in the window, a URL opens in whatever the desktop opens URLs
 --- with, and an anchor scrolls to the heading it names — in this document, or
 --- in the one just opened.
 ---
---- In R there is no link to read: the engine drops link targets, so the
---- rendered text holds the link's text and nothing else. The display row is
---- therefore mapped back to the source line it came from — the same step the
---- toggle makes — and the link is read from the source. That is what lets a
---- reader follow a link without leaving the reading view first.
+--- In R two kinds of link can be under the cursor. A rendered diagram can
+--- carry links of its own — a mermaid `click` directive names a URL, and the
+--- engine reports the label bytes it covers — and those are resolved from the
+--- document by the cursor's byte column. Everything else is a layout of a
+--- source line: the display row is mapped back to the source line it came from
+--- — the same step the toggle makes — and the link is read from the source.
+--- That is what lets a reader follow a link without leaving the reading view
+--- first, whether it was written in prose or drawn in a diagram.
 ---
 --- A source line holding more than one link resolves to the first of them when
---- it is followed from R, because the rendered line is a layout of the source
---- rather than a copy of it and a display column has no byte column in the
---- source to be compared against. From S the cursor's own column decides.
+--- it is followed from R, because a display column has no byte column in the
+--- source to be compared against. From S the cursor's own column decides, and
+--- so does a rendered line's own `links` table.
 ---
 --- With no link under the cursor the key goes back to Vim, so `gf` keeps its
 --- ordinary meaning on a path written as plain text.
@@ -920,17 +939,21 @@ function M.follow(win)
 
   local cursor = vim.api.nvim_win_get_cursor(win)
   local row, col = cursor[1] - 1, cursor[2]
-  local lnum = row
+  local found
 
   if buf == st.rendered then
-    lnum = st.doc and render.source_line_for(st.doc, row)
-    if not lnum then
-      return feed(key)
+    found = link.rendered_at(st.doc, row, col)
+    if not found then
+      local lnum = st.doc and render.source_line_for(st.doc, row)
+      if not lnum then
+        return feed(key)
+      end
+      found = link.at(lines, lnum, nil)
     end
-    col = nil
+  else
+    found = link.at(lines, row, col)
   end
 
-  local found = link.at(lines, lnum, col)
   if not found then
     return feed(key)
   end
@@ -958,7 +981,41 @@ function M.follow(win)
     return
   end
 
-  vim.cmd('edit ' .. vim.fn.fnameescape(path))
+  -- `<C-o>` should come back here, and `:edit` records no jump of its own —
+  -- changing files is not a motion. R cannot be the entry's target either: it
+  -- is `bufhidden=wipe` and gone the moment `:edit` takes the window. So the
+  -- source buffer's line under the cursor is recorded while the source is on
+  -- screen. Switching views is `keepjumps`, so a real jump motion (`gg`) is
+  -- what writes the entry; the cursor is put back on the line it recorded.
+  local line = row
+  if buf == st.rendered then
+    line = render.source_line_for(st.doc, row)
+  end
+  vim.api.nvim_win_call(win, function()
+    if vim.api.nvim_win_get_buf(win) ~= st.source then
+      vim.cmd('keepjumps buffer ' .. st.source)
+    end
+    if line then
+      vim.api.nvim_win_set_cursor(win, { line + 1, 0 })
+      vim.cmd('normal! gg')
+      vim.api.nvim_win_set_cursor(win, { line + 1, 0 })
+    end
+  end)
+
+  -- `:edit` enters the destination's buffer before the cursor can be placed on
+  -- the fragment it may name, and `BufWinEnter` would attach — and possibly
+  -- swap R in on a cache hit — in the middle of that. The attach below is the
+  -- one that runs, after the cursor is where it belongs.
+  following = true
+  local ok, err = pcall(vim.cmd, 'edit ' .. vim.fn.fnameescape(path))
+  following = false
+  if not ok then
+    -- The window was crossed to S only to record the jump. A refused `:edit`
+    -- — an unsaved source with 'hidden' off is the usual one — must leave the
+    -- reader where they were, so the rendered view is asked for again.
+    M.show_rendered(win)
+    error(err, 0)
+  end
 
   -- Placed before the attach rather than after it. The attach renders the new
   -- document from the source buffer, so moving the cursor now is what makes R
@@ -1102,13 +1159,61 @@ function M.setup_autocmds()
   vim.api.nvim_create_autocmd('FileType', {
     group = group,
     callback = function(args)
-      if config.manages(vim.bo[args.buf].filetype) then
-        vim.schedule(function()
-          if vim.api.nvim_buf_is_valid(args.buf) then
-            M.attach(args.buf, vim.api.nvim_get_current_win())
-          end
-        end)
+      if not config.manages(vim.bo[args.buf].filetype) then
+        return
       end
+      -- The window is captured now and re-checked when the callback runs. A
+      -- `:edit` to another file can replace this buffer in the window before
+      -- the scheduled work starts — following a link does exactly that, and a
+      -- `<C-o>` back can happen in between — and attaching the old document
+      -- then would take the window from the one now on screen.
+      local win = vim.api.nvim_get_current_win()
+      vim.schedule(function()
+        if not vim.api.nvim_buf_is_valid(args.buf)
+          or not vim.api.nvim_win_is_valid(win)
+          or vim.api.nvim_win_get_buf(win) ~= args.buf then
+          return
+        end
+        local st = state.windows[win]
+        if st and st.source == args.buf then
+          return
+        end
+        M.attach(args.buf, win)
+      end)
+    end,
+  })
+
+  -- A window can come to show a managed buffer without `FileType` firing:
+  -- `<C-o>` does exactly that after `gf` followed a link, because R is
+  -- `bufhidden=wipe` and the jump list can only bring back the source buffer;
+  -- `:buffer` on an already-loaded file does the same. The window's state then
+  -- names the document it left, so the view would stay on source and every key
+  -- would act on the wrong file.
+  --
+  -- Only a window whose state already names a *different* document is
+  -- re-attached. A window with no state is `FileType`'s to set up, and one
+  -- whose state names this buffer is in an R↔S transition — asking for R here
+  -- would undo a toggle to S.
+  vim.api.nvim_create_autocmd('BufWinEnter', {
+    group = group,
+    callback = function(args)
+      if following or not config.manages(vim.bo[args.buf].filetype) then
+        return
+      end
+      -- A rendered buffer is not a document, even if its filetype says
+      -- otherwise: it belongs to the window that owns it.
+      if state.by_rendered[args.buf] then
+        return
+      end
+      local win = vim.api.nvim_get_current_win()
+      if vim.api.nvim_win_get_buf(win) ~= args.buf then
+        return
+      end
+      local st = state.windows[win]
+      if not st or not st.source or st.source == args.buf or st.rendered == args.buf then
+        return
+      end
+      M.attach(args.buf, win)
     end,
   })
 

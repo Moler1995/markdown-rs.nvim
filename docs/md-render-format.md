@@ -114,6 +114,7 @@ The display lines, top to bottom. Each has:
 |---|---|---|
 | `source` | integer or null | The 0-indexed source line this display line came from. `null` for a line with no source counterpart. |
 | `spans` | array of `[int, string]` | The line's styled text, left to right. |
+| `links` | array, omitted when empty | Clickable runs of the line: `[start_byte, end_byte, target]`. |
 
 A span is a two-element array — `[style_index, text]` — rather than an object.
 Spans are the bulk of the payload and their shape never varies, so field names
@@ -122,6 +123,22 @@ would be pure overhead on both the writing and the reading side.
 Adjacent spans that resolve to the same style index are already merged, so a
 line of uniform styling carries exactly one span. A line with no spans is
 empty: it occupies a row and paints nothing.
+
+`links` names the parts of a line a reader can follow. Only rendered diagrams
+supply them today: a mermaid `click NODE href "…"` directive names a URL, and
+the engine reports the cells of the node's label so the link travels with the
+picture rather than being parsed again by the reader. `start` and `end` are
+0-based **byte** offsets into the line's text — the concatenated span text —
+with `end` exclusive; bytes rather than display columns because that is what an
+editor's cursor reports. A target is opened exactly like a markdown link
+destination: a scheme is a URL, a leading `#` is an anchor, and anything else is
+a path relative to the document holding the diagram.
+
+The field is omitted when a line has no links, so an ordinary document's lines
+keep the shape they had before the field existed. When a diagram row is clipped
+to the requested width, a link that reached past the cut ends at the line's
+edge and one that lay wholly past it is dropped: the columns the reader cannot
+see are not clickable.
 
 ### `source_map`
 

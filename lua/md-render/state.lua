@@ -26,7 +26,7 @@ M.windows = {}
 --- S cannot invalidate the buffer the other is showing.
 M.by_rendered = {}
 
---- Source buffer -> { tick, width, height, encoding, theme, doc }.
+--- Source buffer -> { tick, width, height, encoding, theme, animation, image, doc }.
 M.cache = {}
 
 --- The state for `win`, created empty on first use.
@@ -76,29 +76,33 @@ function M.forget(win)
 end
 
 --- The cached document for this exact (buffer, width, height, encoding, theme,
---- animation, changedtick), or nil.
+--- animation, image, changedtick), or nil.
 ---
 --- `changedtick` covers the document's *contents*: it changes on every edit and
 --- on nothing else. Everything else in the key is a reason the same contents
 --- could render differently — the width and height the page has, the encoding
---- images are drawn with, the theme, and whether frames were asked for. A
---- height-only resize, or flipping `image_mode`, changes what the engine would
---- produce without touching the buffer, so those have to be part of the key
---- rather than assumed constant. `animation` is in the key because an animated
---- render and an ordinary one differ in their payload while agreeing about
---- every line: without it, asking for frames after a plain render would be
---- answered by the cache with the very document that has none.
-function M.cached(buf, tick, width, height, encoding, theme, animation)
+--- images are drawn with, the theme, whether frames were asked for, and the
+--- palette, background, dithering, minimum height and sharpening that decide
+--- how an image is drawn. A height-only resize, or flipping `image_mode`,
+--- changes what the engine would produce without touching the buffer, so those
+--- have to be part of the key rather than assumed constant. `animation` is in
+--- the key because an animated render and an ordinary one differ in their
+--- payload while agreeing about every line: without it, asking for frames after
+--- a plain render would be answered by the cache with the very document that
+--- has none. `image` is compared as a whole, so a new option is one field in
+--- the table below rather than another positional argument.
+function M.cached(buf, tick, width, height, encoding, theme, animation, image)
   local entry = M.cache[buf]
   if entry and entry.tick == tick and entry.width == width and entry.height == height
     and entry.encoding == encoding and entry.theme == theme
-    and entry.animation == (animation and true or false) then
+    and entry.animation == (animation and true or false)
+    and vim.deep_equal(entry.image, image) then
     return entry.doc
   end
   return nil
 end
 
-function M.store(buf, tick, width, height, encoding, theme, animation, doc)
+function M.store(buf, tick, width, height, encoding, theme, animation, image, doc)
   M.cache[buf] = {
     tick = tick,
     width = width,
@@ -106,6 +110,7 @@ function M.store(buf, tick, width, height, encoding, theme, animation, doc)
     encoding = encoding,
     theme = theme,
     animation = animation and true or false,
+    image = image and vim.deepcopy(image) or nil,
     doc = doc,
   }
 end

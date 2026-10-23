@@ -120,7 +120,28 @@ pub struct WireLine {
     /// a blank spacer the layout inserted.
     pub source: Option<u32>,
     pub spans: Vec<WireSpan>,
+    /// Clickable runs of this line, when the engine knows some.
+    ///
+    /// Only a rendered diagram produces them today: a mermaid `click` directive
+    /// names a URL, and the engine reports the label cells it covers so the
+    /// reader can follow the node. Omitted entirely when there are none, so an
+    /// ordinary document's lines keep their original shape.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<WireLink>,
 }
+
+/// A clickable run of a display line: `[start, end, target]`.
+///
+/// `start` and `end` are 0-based **byte** offsets into the line's text (the
+/// concatenated span texts), with `end` exclusive. Bytes rather than display
+/// columns because an editor cursor reports its column in bytes, and because a
+/// reader slicing the line works in bytes too.
+///
+/// A target is opened the way a markdown link destination is: a scheme is a
+/// URL, a leading `#` is an anchor, anything else is a path relative to the
+/// document holding the diagram.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WireLink(pub u32, pub u32, pub String);
 
 /// One frame of an animated image.
 ///
@@ -236,7 +257,11 @@ impl StyleTable {
             }
             spans.push(WireSpan(style_idx, span.content.clone()));
         }
-        WireLine { source, spans }
+        WireLine {
+            source,
+            spans,
+            links: Vec::new(),
+        }
     }
 
     /// Finish the table, returning the deduplicated styles.
@@ -433,11 +458,11 @@ mod tests {
     #[test]
     fn source_map_points_at_the_first_line_at_or_after_each_source_line() {
         let lines = vec![
-            WireLine { source: Some(0), spans: Vec::new() },
-            WireLine { source: Some(0), spans: Vec::new() },
-            WireLine { source: None, spans: Vec::new() }, // synthetic
-            WireLine { source: Some(2), spans: Vec::new() },
-            WireLine { source: Some(5), spans: Vec::new() },
+            WireLine { source: Some(0), spans: Vec::new(), links: Vec::new() },
+            WireLine { source: Some(0), spans: Vec::new(), links: Vec::new() },
+            WireLine { source: None, spans: Vec::new(), links: Vec::new() }, // synthetic
+            WireLine { source: Some(2), spans: Vec::new(), links: Vec::new() },
+            WireLine { source: Some(5), spans: Vec::new(), links: Vec::new() },
         ];
 
         // Source lines 0..=6; source lines 1, 3 and 4 have no display line of
@@ -450,7 +475,7 @@ mod tests {
 
     #[test]
     fn source_map_tail_clamps_to_the_last_line() {
-        let lines = vec![WireLine { source: Some(0), spans: Vec::new() }];
+        let lines = vec![WireLine { source: Some(0), spans: Vec::new(), links: Vec::new() }];
         let map = build_source_map(&lines, 3);
         // Every entry is a valid index into `lines`, which has length 1.
         assert_eq!(map, vec![0, 0, 0]);
@@ -459,9 +484,9 @@ mod tests {
     #[test]
     fn every_source_map_entry_is_a_valid_line_index() {
         let lines = vec![
-            WireLine { source: Some(0), spans: Vec::new() },
-            WireLine { source: None, spans: Vec::new() },
-            WireLine { source: Some(4), spans: Vec::new() },
+            WireLine { source: Some(0), spans: Vec::new(), links: Vec::new() },
+            WireLine { source: None, spans: Vec::new(), links: Vec::new() },
+            WireLine { source: Some(4), spans: Vec::new(), links: Vec::new() },
         ];
         let map = build_source_map(&lines, 9);
         assert_eq!(map.len(), 9);
@@ -489,6 +514,7 @@ mod tests {
             lines: vec![WireLine {
                 source: Some(0),
                 spans: Vec::new(),
+                links: Vec::new(),
             }],
             source_map: vec![0],
             animations,
@@ -550,6 +576,40 @@ mod tests {
         assert!(
             json.get("animations_limited").is_none(),
             "a document that refused nothing must not carry the field: {json}"
+        );
+    }
+
+    #[test]
+    fn a_line_without_links_omits_the_field() {
+        let json = serde_json::to_value(WireLine {
+            source: Some(0),
+            spans: Vec::new(),
+            links: Vec::new(),
+        })
+        .expect("serialise");
+        assert!(
+            json.get("links").is_none(),
+            "an ordinary line must not carry the field at all: {json}"
+        );
+    }
+
+    #[test]
+    fn a_linked_line_carries_byte_ranges_and_the_version_stays_one() {
+        let json = serde_json::to_value(WireLine {
+            source: Some(3),
+            spans: vec![WireSpan(0, "L2 Prefill LB".to_string())],
+            links: vec![WireLink(0, 13, "https://example.com".to_string())],
+        })
+        .expect("serialise");
+
+        assert_eq!(
+            json["links"],
+            serde_json::json!([[0, 13, "https://example.com"]]),
+            "a link is `[start_byte, end_byte, target]`"
+        );
+        assert_eq!(
+            WIRE_VERSION, 1,
+            "adding an optional field must not bump the version"
         );
     }
 }
