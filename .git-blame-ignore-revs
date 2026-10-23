@@ -1,0 +1,7 @@
+# Formatting-only commits. Blame skips them so the last real change is shown.
+#
+# Enable locally with:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# cargo fmt over the engine
+c542f49bcbd4b4abb72942cc8b9d7ae068d3df40
