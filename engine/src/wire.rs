@@ -316,7 +316,10 @@ mod tests {
             color_to_wire(Color::Rgb(0xcb, 0xa6, 0xf7)).as_deref(),
             Some("#cba6f7")
         );
-        assert_eq!(color_to_wire(Color::Rgb(0, 0, 0)).as_deref(), Some("#000000"));
+        assert_eq!(
+            color_to_wire(Color::Rgb(0, 0, 0)).as_deref(),
+            Some("#000000")
+        );
         assert_eq!(
             color_to_wire(Color::Rgb(255, 255, 255)).as_deref(),
             Some("#ffffff")
@@ -325,10 +328,19 @@ mod tests {
 
     #[test]
     fn indexed_and_named_colours_round_trip_their_identity() {
-        assert_eq!(color_to_wire(Color::Indexed(5)).as_deref(), Some("indexed:5"));
-        assert_eq!(color_to_wire(Color::Indexed(0)).as_deref(), Some("indexed:0"));
+        assert_eq!(
+            color_to_wire(Color::Indexed(5)).as_deref(),
+            Some("indexed:5")
+        );
+        assert_eq!(
+            color_to_wire(Color::Indexed(0)).as_deref(),
+            Some("indexed:0")
+        );
         assert_eq!(color_to_wire(Color::Red).as_deref(), Some("red"));
-        assert_eq!(color_to_wire(Color::LightBlue).as_deref(), Some("lightblue"));
+        assert_eq!(
+            color_to_wire(Color::LightBlue).as_deref(),
+            Some("lightblue")
+        );
         // Two different colours must not collide on one wire string.
         assert_ne!(color_to_wire(Color::Indexed(1)), color_to_wire(Color::Red));
     }
@@ -370,7 +382,9 @@ mod tests {
     #[test]
     fn false_modifiers_are_omitted_from_the_json() {
         let json = serde_json::to_string(&WireStyle::from(
-            Style::default().fg(Color::Rgb(1, 2, 3)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Rgb(1, 2, 3))
+                .add_modifier(Modifier::BOLD),
         ))
         .expect("serialise");
         assert_eq!(json, r##"{"fg":"#010203","bg":null,"bold":true}"##);
@@ -389,7 +403,11 @@ mod tests {
         }
 
         let styles = table.into_styles();
-        assert_eq!(styles.len(), 1, "fifty identical spans must intern to one style");
+        assert_eq!(
+            styles.len(),
+            1,
+            "fifty identical spans must intern to one style"
+        );
         for line in &indices {
             assert_eq!(line.spans[0].0, 0);
         }
@@ -422,7 +440,11 @@ mod tests {
         ]);
 
         let wire = table.line(Some(0), &line);
-        assert_eq!(wire.spans.len(), 1, "a uniform line must emit a single span");
+        assert_eq!(
+            wire.spans.len(),
+            1,
+            "a uniform line must emit a single span"
+        );
         assert_eq!(wire.spans[0].1, "Hello, world");
     }
 
@@ -458,11 +480,31 @@ mod tests {
     #[test]
     fn source_map_points_at_the_first_line_at_or_after_each_source_line() {
         let lines = vec![
-            WireLine { source: Some(0), spans: Vec::new(), links: Vec::new() },
-            WireLine { source: Some(0), spans: Vec::new(), links: Vec::new() },
-            WireLine { source: None, spans: Vec::new(), links: Vec::new() }, // synthetic
-            WireLine { source: Some(2), spans: Vec::new(), links: Vec::new() },
-            WireLine { source: Some(5), spans: Vec::new(), links: Vec::new() },
+            WireLine {
+                source: Some(0),
+                spans: Vec::new(),
+                links: Vec::new(),
+            },
+            WireLine {
+                source: Some(0),
+                spans: Vec::new(),
+                links: Vec::new(),
+            },
+            WireLine {
+                source: None,
+                spans: Vec::new(),
+                links: Vec::new(),
+            }, // synthetic
+            WireLine {
+                source: Some(2),
+                spans: Vec::new(),
+                links: Vec::new(),
+            },
+            WireLine {
+                source: Some(5),
+                spans: Vec::new(),
+                links: Vec::new(),
+            },
         ];
 
         // Source lines 0..=6; source lines 1, 3 and 4 have no display line of
@@ -475,7 +517,11 @@ mod tests {
 
     #[test]
     fn source_map_tail_clamps_to_the_last_line() {
-        let lines = vec![WireLine { source: Some(0), spans: Vec::new(), links: Vec::new() }];
+        let lines = vec![WireLine {
+            source: Some(0),
+            spans: Vec::new(),
+            links: Vec::new(),
+        }];
         let map = build_source_map(&lines, 3);
         // Every entry is a valid index into `lines`, which has length 1.
         assert_eq!(map, vec![0, 0, 0]);
@@ -484,9 +530,21 @@ mod tests {
     #[test]
     fn every_source_map_entry_is_a_valid_line_index() {
         let lines = vec![
-            WireLine { source: Some(0), spans: Vec::new(), links: Vec::new() },
-            WireLine { source: None, spans: Vec::new(), links: Vec::new() },
-            WireLine { source: Some(4), spans: Vec::new(), links: Vec::new() },
+            WireLine {
+                source: Some(0),
+                spans: Vec::new(),
+                links: Vec::new(),
+            },
+            WireLine {
+                source: None,
+                spans: Vec::new(),
+                links: Vec::new(),
+            },
+            WireLine {
+                source: Some(4),
+                spans: Vec::new(),
+                links: Vec::new(),
+            },
         ];
         let map = build_source_map(&lines, 9);
         assert_eq!(map.len(), 9);
@@ -544,7 +602,10 @@ mod tests {
         };
         let json = serde_json::to_value(doc_with(vec![animation])).expect("serialise");
 
-        assert_eq!(json["version"], 1, "adding a field must not bump the version");
+        assert_eq!(
+            json["version"], 1,
+            "adding a field must not bump the version"
+        );
         assert_eq!(
             json["animations"],
             serde_json::json!([

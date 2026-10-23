@@ -92,7 +92,10 @@ fn artwork_respects_the_height_bound() {
 #[test]
 fn artwork_maps_back_to_the_reference_line() {
     // The reference is on source line 2, between two paragraphs.
-    let content = format!("before\n\n![art]({})\n\nafter\n", fixture("image_sample.png"));
+    let content = format!(
+        "before\n\n![art]({})\n\nafter\n",
+        fixture("image_sample.png")
+    );
     let doc = render(&content, 80, ImageOptions::default());
 
     let artwork: Vec<&WireLine> = doc

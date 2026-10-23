@@ -131,7 +131,9 @@ fn a_span_is_a_style_index_and_a_string() {
         for span in line["spans"].as_array().expect("spans must be an array") {
             let pair = span.as_array().expect("a span must be a two-element array");
             assert_eq!(pair.len(), 2, "span {span} in line {i} is not a pair");
-            let index = pair[0].as_u64().expect("a span's first element is an index");
+            let index = pair[0]
+                .as_u64()
+                .expect("a span's first element is an index");
             assert!(
                 (index as usize) < style_count,
                 "line {i} references style {index}, but only {style_count} are defined"
@@ -175,7 +177,9 @@ fn every_style_always_carries_fg_and_bg() {
 fn source_map_is_one_valid_index_per_source_line() {
     let real = render(DOC_INPUT, DOC_WIDTH);
     let line_count = real["lines"].as_array().expect("lines").len();
-    let map = real["source_map"].as_array().expect("source_map must be an array");
+    let map = real["source_map"]
+        .as_array()
+        .expect("source_map must be an array");
 
     assert_eq!(
         map.len(),

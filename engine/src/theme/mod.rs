@@ -305,11 +305,26 @@ mod tests {
             ("h2", p.h2, rgb(0xfa, 0xb3, 0x87), "peach"),
             ("h3", p.h3, rgb(0xf9, 0xe2, 0xaf), "yellow"),
             ("inline_code", p.inline_code, rgb(0xa6, 0xe3, 0xa1), "green"),
-            ("table_header", p.table_header, rgb(0xb4, 0xbe, 0xfe), "lavender"),
-            ("list_marker", p.list_marker, rgb(0x74, 0xc7, 0xec), "sapphire"),
+            (
+                "table_header",
+                p.table_header,
+                rgb(0xb4, 0xbe, 0xfe),
+                "lavender",
+            ),
+            (
+                "list_marker",
+                p.list_marker,
+                rgb(0x74, 0xc7, 0xec),
+                "sapphire",
+            ),
             ("task_marker", p.task_marker, rgb(0xa6, 0xe3, 0xa1), "green"),
             ("git_new", p.git_new, rgb(0xa6, 0xe3, 0xa1), "green"),
-            ("git_modified", p.git_modified, rgb(0xf9, 0xe2, 0xaf), "yellow"),
+            (
+                "git_modified",
+                p.git_modified,
+                rgb(0xf9, 0xe2, 0xaf),
+                "yellow",
+            ),
         ] {
             assert_eq!(actual, expected, "catppuccin_mocha {slot} should be {name}");
         }

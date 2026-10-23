@@ -220,7 +220,11 @@ fn hard_line_count(spans: &[Span]) -> usize {
 ///      character-by-character. Combining marks (zero-width chars) stay
 ///      attached to their base char for free: a wrap boundary only fires when
 ///      `chunk_w + cw > max_width`, and that is never true for `cw == 0`.
-fn emit_wrapped_hard_line(chars: &[(char, usize, Style)], max_width: usize, out: &mut Vec<WrappedLine>) {
+fn emit_wrapped_hard_line(
+    chars: &[(char, usize, Style)],
+    max_width: usize,
+    out: &mut Vec<WrappedLine>,
+) {
     // Short-circuit: if the whole line already fits, emit it verbatim (no
     // whitespace splitting). Word-splitting collapses multi-space gaps to
     // single spaces — fine for prose, wrong for pre-formatted ASCII art inside

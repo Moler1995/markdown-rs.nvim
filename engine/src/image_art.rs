@@ -133,12 +133,7 @@ const DITHER_AMPLITUDE: f32 = 32.0;
 /// Fixed and position-indexed, so the same input renders the same bytes on
 /// every run. The 4 × 4 size repeats every four sub-cells, which is coarse
 /// enough to read as texture rather than as per-cell noise.
-const BAYER4: [[u8; 4]; 4] = [
-    [0, 8, 2, 10],
-    [12, 4, 14, 6],
-    [3, 11, 1, 9],
-    [15, 7, 13, 5],
-];
+const BAYER4: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
 /// The signed dither offset for a sub-cell at `(x, y)`, in `[-0.5, 0.5)`.
 fn dither_offset(x: u32, y: u32) -> f32 {
@@ -149,18 +144,12 @@ fn dither_offset(x: u32, y: u32) -> f32 {
 /// `rgb` shifted by the ordered dither at `(x, y)`.
 fn dithered([r, g, b]: [u8; 3], x: u32, y: u32) -> [u8; 3] {
     let offset = dither_offset(x, y) * DITHER_AMPLITUDE;
-    [
-        shift(r, offset),
-        shift(g, offset),
-        shift(b, offset),
-    ]
+    [shift(r, offset), shift(g, offset), shift(b, offset)]
 }
 
 /// One channel plus `offset`, clamped to 0–255.
 fn shift(channel: u8, offset: f32) -> u8 {
-    (f32::from(channel) + offset)
-        .round()
-        .clamp(0.0, 255.0) as u8
+    (f32::from(channel) + offset).round().clamp(0.0, 255.0) as u8
 }
 
 /// The sixty-four colours every image is drawn from.
@@ -595,7 +584,12 @@ fn resolves_dither(mode: DitherMode, encoding: ImageEncoding, palette: ImagePale
 /// reduced to a subset rather than refused. Both bounds are inclusive.
 #[must_use]
 pub fn animation_within_bounds(frame_count: usize, pixels: u64) -> bool {
-    within_bounds(frame_count, pixels, MAX_DECODED_FRAMES, MAX_ANIMATION_PIXELS)
+    within_bounds(
+        frame_count,
+        pixels,
+        MAX_DECODED_FRAMES,
+        MAX_ANIMATION_PIXELS,
+    )
 }
 
 /// [`animation_within_bounds`] against explicit limits, so the cap can be
@@ -764,7 +758,9 @@ fn resolve(dest: &str, base: Option<&Path>) -> Option<PathBuf> {
         return None;
     }
     let scheme = trimmed.to_ascii_lowercase();
-    if scheme.starts_with("http://") || scheme.starts_with("https://") || scheme.starts_with("data:")
+    if scheme.starts_with("http://")
+        || scheme.starts_with("https://")
+        || scheme.starts_with("data:")
     {
         return None;
     }
@@ -856,12 +852,7 @@ fn load(path: &Path) -> Option<Pixels> {
 /// Returns the grid and the whole enlargement factor that was applied. The
 /// factor is 1 unless `min_rows` asks for more rows than the image has at
 /// natural size, and it never takes the image past the width or height bound.
-fn cell_grid(
-    src_w: u32,
-    src_h: u32,
-    bounds: Bounds,
-    min_rows: u16,
-) -> Option<(u32, u32, u32)> {
+fn cell_grid(src_w: u32, src_h: u32, bounds: Bounds, min_rows: u16) -> Option<(u32, u32, u32)> {
     if src_w == 0 || src_h == 0 || bounds.width == 0 {
         return None;
     }
@@ -1012,7 +1003,10 @@ fn band(src: u32, out: u32, i: u32) -> (u32, u32) {
     // an image with an odd number of rows.
     let start = (i * src / out).min(src - 1);
     let end = ((i + 1) * src / out).clamp(start + 1, src);
-    (u32::try_from(start).unwrap_or(0), u32::try_from(end).unwrap_or(0))
+    (
+        u32::try_from(start).unwrap_or(0),
+        u32::try_from(end).unwrap_or(0),
+    )
 }
 
 /// The mean colour of a rectangle, if any of its pixels carry colour.
@@ -1063,11 +1057,7 @@ fn average_region<const N: usize>(
         return None;
     }
     Some(Average {
-        linear: [
-            sums[0] / coverage,
-            sums[1] / coverage,
-            sums[2] / coverage,
-        ],
+        linear: [sums[0] / coverage, sums[1] / coverage, sums[2] / coverage],
         alpha: coverage / count as f32,
     })
 }
@@ -1079,8 +1069,7 @@ fn resolve_sample(average: Average, backdrop: Option<[f32; 3]>) -> Option<[u8; 3
         // No compositing without a named background: a cell that is mostly
         // transparent is left to the terminal, and one that is mostly opaque
         // keeps its own colour rather than a guess at what is behind it.
-        None => (average.alpha >= ALPHA_COVERAGE)
-            .then(|| average.linear.map(delinearize)),
+        None => (average.alpha >= ALPHA_COVERAGE).then(|| average.linear.map(delinearize)),
         Some(backdrop) => {
             let alpha = average.alpha;
             Some(std::array::from_fn(|i| {
@@ -1153,9 +1142,7 @@ fn sharpen_samples(samples: &mut [Option<[u8; 3]>], cols: u32, rows: u32) {
             let sharpened = std::array::from_fn(|channel| {
                 let blur = blurred[channel] / weight;
                 let value = f32::from(centre[channel]);
-                (value + AMOUNT * (value - blur))
-                    .round()
-                    .clamp(0.0, 255.0) as u8
+                (value + AMOUNT * (value - blur)).round().clamp(0.0, 255.0) as u8
             });
             out[(y * cols + x) as usize] = Some(sharpened);
         }
@@ -1455,10 +1442,7 @@ fn luminance([r, g, b]: [u8; 3]) -> f32 {
 /// half that should be empty, not leave it alone.
 fn half_block(upper: Option<Color>, lower: Option<Color>) -> (char, Style) {
     match (upper, lower) {
-        (Some(upper), Some(lower)) => (
-            '\u{2580}',
-            Style::default().fg(upper).bg(lower),
-        ),
+        (Some(upper), Some(lower)) => ('\u{2580}', Style::default().fg(upper).bg(lower)),
         (Some(upper), None) => ('\u{2580}', Style::default().fg(upper)),
         (None, Some(lower)) => ('\u{2584}', Style::default().fg(lower)),
         (None, None) => (' ', Style::default()),
@@ -1687,10 +1671,7 @@ fn partition_means(present: &[[u8; 3]; 4], partition: u8) -> ([u8; 3], [u8; 3]) 
         }
         counts[side] += 1;
     }
-    (
-        average(sums[0], counts[0]),
-        average(sums[1], counts[1]),
-    )
+    (average(sums[0], counts[0]), average(sums[1], counts[1]))
 }
 
 /// How badly `partition`'s two colours explain the four samples.
@@ -1788,12 +1769,7 @@ fn encode_ascii(
 ///
 /// The standard braille numbering: dots 1–3 and 7 down the left column, 4–6
 /// and 8 down the right. U+2800 plus these bits is the glyph.
-const BRAILLE_BITS: [[u8; 2]; 4] = [
-    [0x01, 0x08],
-    [0x02, 0x10],
-    [0x04, 0x20],
-    [0x40, 0x80],
-];
+const BRAILLE_BITS: [[u8; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
 
 /// Draw the sampled grid as braille dot patterns.
 ///
@@ -2036,7 +2012,15 @@ mod tests {
     #[test]
     fn a_wide_image_is_scaled_to_the_width() {
         assert_eq!(
-            cell_grid(1200, 600, Bounds { width: 80, height: None }, 0),
+            cell_grid(
+                1200,
+                600,
+                Bounds {
+                    width: 80,
+                    height: None
+                },
+                0
+            ),
             Some((80, 20, 1))
         );
     }
@@ -2044,7 +2028,15 @@ mod tests {
     #[test]
     fn a_narrow_image_is_not_enlarged_by_default() {
         assert_eq!(
-            cell_grid(16, 8, Bounds { width: 80, height: None }, 0),
+            cell_grid(
+                16,
+                8,
+                Bounds {
+                    width: 80,
+                    height: None
+                },
+                0
+            ),
             Some((16, 4, 1))
         );
     }
@@ -2052,8 +2044,16 @@ mod tests {
     #[test]
     fn the_height_bound_binds_first() {
         // 400x2000 at width 80 would be 100 rows; the page has 40.
-        let (cols, rows, _) =
-            cell_grid(400, 2000, Bounds { width: 80, height: Some(40) }, 0).unwrap();
+        let (cols, rows, _) = cell_grid(
+            400,
+            2000,
+            Bounds {
+                width: 80,
+                height: Some(40),
+            },
+            0,
+        )
+        .unwrap();
         assert_eq!(rows, 40);
         assert!(cols <= 80);
         // The aspect ratio survives: cols/rows ≈ 2 * 400/2000.
@@ -2063,37 +2063,110 @@ mod tests {
     #[test]
     fn a_short_image_keeps_its_natural_height_on_a_tall_page() {
         assert_eq!(
-            cell_grid(20, 10, Bounds { width: 80, height: Some(40) }, 0),
+            cell_grid(
+                20,
+                10,
+                Bounds {
+                    width: 80,
+                    height: Some(40)
+                },
+                0
+            ),
             Some((20, 5, 1))
         );
     }
 
     #[test]
     fn no_room_for_a_cell_is_a_fallback() {
-        assert_eq!(cell_grid(10, 10, Bounds { width: 0, height: None }, 0), None);
         assert_eq!(
-            cell_grid(10, 10, Bounds { width: 80, height: Some(0) }, 0),
+            cell_grid(
+                10,
+                10,
+                Bounds {
+                    width: 0,
+                    height: None
+                },
+                0
+            ),
             None
         );
-        assert_eq!(cell_grid(0, 10, Bounds { width: 80, height: None }, 0), None);
-        assert_eq!(cell_grid(10, 0, Bounds { width: 80, height: None }, 0), None);
+        assert_eq!(
+            cell_grid(
+                10,
+                10,
+                Bounds {
+                    width: 80,
+                    height: Some(0)
+                },
+                0
+            ),
+            None
+        );
+        assert_eq!(
+            cell_grid(
+                0,
+                10,
+                Bounds {
+                    width: 80,
+                    height: None
+                },
+                0
+            ),
+            None
+        );
+        assert_eq!(
+            cell_grid(
+                10,
+                0,
+                Bounds {
+                    width: 80,
+                    height: None
+                },
+                0
+            ),
+            None
+        );
     }
 
     #[test]
     fn a_minimum_height_enlarges_by_the_smallest_whole_factor() {
         // 16x16 is 8 natural rows; a minimum of 10 takes factor 2 (16 rows).
         assert_eq!(
-            cell_grid(16, 16, Bounds { width: 80, height: None }, 10),
+            cell_grid(
+                16,
+                16,
+                Bounds {
+                    width: 80,
+                    height: None
+                },
+                10
+            ),
             Some((32, 16, 2))
         );
         // A minimum already met changes nothing.
         assert_eq!(
-            cell_grid(16, 16, Bounds { width: 80, height: None }, 8),
+            cell_grid(
+                16,
+                16,
+                Bounds {
+                    width: 80,
+                    height: None
+                },
+                8
+            ),
             Some((16, 8, 1))
         );
         // 16 rows at factor 2 would cross the height bound, so it is not taken.
         assert_eq!(
-            cell_grid(16, 16, Bounds { width: 80, height: Some(8) }, 10),
+            cell_grid(
+                16,
+                16,
+                Bounds {
+                    width: 80,
+                    height: Some(8)
+                },
+                10
+            ),
             Some((16, 8, 1))
         );
     }
@@ -2101,7 +2174,12 @@ mod tests {
     // ── Sampling ───────────────────────────────────────────────────────────
 
     /// One sub-cell grid of `cols` × `rows` samples over `img`.
-    fn sample_grid(img: RgbaImage, cols: u32, rows: u32, background: ImageBackground) -> Vec<Option<[u8; 3]>> {
+    fn sample_grid(
+        img: RgbaImage,
+        cols: u32,
+        rows: u32,
+        background: ImageBackground,
+    ) -> Vec<Option<[u8; 3]>> {
         sample(&Pixels::Rgba(img), cols, rows, 1, background)
     }
 
@@ -2123,12 +2201,16 @@ mod tests {
     fn a_half_transparent_region_averages_only_its_opaque_pixels() {
         // Two pixels: one red and opaque, one green and transparent. The
         // average must be red, not a blend with the transparent pixel.
-        let img = image(2, 2, &[
-            [255, 0, 0, 255],
-            [0, 255, 0, 0],
-            [255, 0, 0, 255],
-            [0, 255, 0, 0],
-        ]);
+        let img = image(
+            2,
+            2,
+            &[
+                [255, 0, 0, 255],
+                [0, 255, 0, 0],
+                [255, 0, 0, 255],
+                [0, 255, 0, 0],
+            ],
+        );
         let samples = sample_grid(img, 1, 2, ImageBackground::Terminal);
         assert_eq!(samples, [Some([255, 0, 0]), Some([255, 0, 0])]);
     }
@@ -2200,7 +2282,10 @@ mod tests {
                 rgb_of(quantizer.colour(*rgb, x, y))
             })
             .collect();
-        assert!(colours.len() > 1, "a dithered flat grey must use more than one colour");
+        assert!(
+            colours.len() > 1,
+            "a dithered flat grey must use more than one colour"
+        );
 
         // The same run again, byte for byte.
         let mut budget = StyleBudget::default();
@@ -2327,7 +2412,11 @@ mod tests {
         samples.extend(vec![Some(blue); 64]);
 
         let adaptive = ColourSet::adaptive(&samples);
-        assert_eq!(adaptive.colours.len(), 2, "two distinct samples make two boxes");
+        assert_eq!(
+            adaptive.colours.len(),
+            2,
+            "two distinct samples make two boxes"
+        );
         assert!(adaptive.colours.contains(&red));
         assert!(adaptive.colours.contains(&blue));
 
@@ -2343,7 +2432,10 @@ mod tests {
             assert_eq!(adaptive.nearest_index(rgb), index);
             let theme_distance =
                 squared_distance(&lab(rgb), &lab(rgb_of(theme_colours().nearest(rgb))));
-            assert!(theme_distance > 0.0, "{rgb:?} must not be already in the cube");
+            assert!(
+                theme_distance > 0.0,
+                "{rgb:?} must not be already in the cube"
+            );
         }
     }
 
@@ -2373,10 +2465,7 @@ mod tests {
         };
         assert_eq!(quantizer.colour([12, 34, 56], 0, 0), Color::Rgb(12, 34, 56));
         quantizer.note(Style::default().fg(Color::Rgb(12, 34, 56)));
-        assert!(
-            !quantizer.exact(),
-            "one style exhausted a budget of one"
-        );
+        assert!(!quantizer.exact(), "one style exhausted a budget of one");
         // The fallback is the adaptive palette's nearest entry, not the
         // sample itself.
         assert_eq!(
@@ -2413,7 +2502,10 @@ mod tests {
         // line is identical to an uncapped render.
         let mut unlimited = StyleBudget::new(usize::MAX);
         let exact = draw(&pixels, 126, 100, 1, true, &options, &mut unlimited);
-        assert_eq!(capped[0], exact[0], "the first line must keep its exact colours");
+        assert_eq!(
+            capped[0], exact[0],
+            "the first line must keep its exact colours"
+        );
         assert!(unlimited.len() > MAX_IMAGE_STYLES);
     }
 
@@ -2803,7 +2895,14 @@ mod tests {
             ascii_cell(Some([0, 0, 0]), Some([0, 0, 0]), quantizer, 0, 0).0
         });
         let light = exact_quantizer(|quantizer| {
-            ascii_cell(Some([255, 255, 255]), Some([255, 255, 255]), quantizer, 0, 0).0
+            ascii_cell(
+                Some([255, 255, 255]),
+                Some([255, 255, 255]),
+                quantizer,
+                0,
+                0,
+            )
+            .0
         });
         assert_eq!(dark, ASCII_RAMP[0]);
         assert_eq!(light, ASCII_RAMP[ASCII_RAMP.len() - 1]);
@@ -2834,7 +2933,10 @@ mod tests {
         let mut budget = StyleBudget::default();
         let lines = artwork(
             path.to_str().unwrap(),
-            Bounds { width: 80, height: None },
+            Bounds {
+                width: 80,
+                height: None,
+            },
             &options(ImageEncoding::Blocks),
             &mut budget,
         )
@@ -2851,7 +2953,10 @@ mod tests {
         let mut budget = StyleBudget::default();
         let lines = artwork(
             path.to_str().unwrap(),
-            Bounds { width: 80, height: Some(3) },
+            Bounds {
+                width: 80,
+                height: Some(3),
+            },
             &options(ImageEncoding::Blocks),
             &mut budget,
         )
@@ -2863,7 +2968,10 @@ mod tests {
     #[test]
     fn repeated_rendering_is_identical() {
         let path = fixture("image_sample.png");
-        let bounds = Bounds { width: 40, height: Some(10) };
+        let bounds = Bounds {
+            width: 40,
+            height: Some(10),
+        };
         let mut budget = StyleBudget::default();
         let first = artwork(
             path.to_str().unwrap(),
@@ -2892,7 +3000,10 @@ mod tests {
         let mut budget = StyleBudget::default();
         let lines = artwork(
             path.to_str().unwrap(),
-            Bounds { width: 40, height: None },
+            Bounds {
+                width: 40,
+                height: None,
+            },
             &ImageOptions::default(),
             &mut budget,
         )
@@ -2912,15 +3023,32 @@ mod tests {
             base,
             ..options(ImageEncoding::Blocks)
         };
-        artwork(dest, Bounds { width: 80, height: None }, &options, budget).is_none()
+        artwork(
+            dest,
+            Bounds {
+                width: 80,
+                height: None,
+            },
+            &options,
+            budget,
+        )
+        .is_none()
     }
 
     #[test]
     fn an_unsupported_or_missing_reference_falls_back() {
         let mut budget = StyleBudget::default();
-        assert!(falls_back("image_missing.png", Some(&fixture("")), &mut budget));
+        assert!(falls_back(
+            "image_missing.png",
+            Some(&fixture("")),
+            &mut budget
+        ));
         assert!(falls_back("https://example.com/a.png", None, &mut budget));
-        assert!(falls_back("image_corrupt.png", Some(&fixture("")), &mut budget));
+        assert!(falls_back(
+            "image_corrupt.png",
+            Some(&fixture("")),
+            &mut budget
+        ));
     }
 
     #[test]
@@ -2930,7 +3058,10 @@ mod tests {
         assert!(
             artwork(
                 path.to_str().unwrap(),
-                Bounds { width: 80, height: None },
+                Bounds {
+                    width: 80,
+                    height: None
+                },
                 &options(ImageEncoding::Off),
                 &mut budget,
             )
@@ -2950,7 +3081,10 @@ mod tests {
         };
         animated_artwork(
             path.to_str().unwrap(),
-            Bounds { width: 80, height: None },
+            Bounds {
+                width: 80,
+                height: None,
+            },
             &options,
             &mut budget,
         )
@@ -3093,7 +3227,11 @@ mod tests {
             art.frames[0].lines, art.lines,
             "the subset is anchored at the first frame"
         );
-        let total: u64 = art.frames.iter().map(|frame| u64::from(frame.delay_ms)).sum();
+        let total: u64 = art
+            .frames
+            .iter()
+            .map(|frame| u64::from(frame.delay_ms))
+            .sum();
         assert_eq!(
             total, 20_470,
             "the delays of the dropped frames are folded into the kept ones"
@@ -3148,7 +3286,10 @@ mod tests {
             Collected::Frames(ref frames) if frames.len() == 3
         ));
         assert!(
-            matches!(collect(2, u64::MAX, MAX_ANIMATION_FRAMES), Collected::TooLarge),
+            matches!(
+                collect(2, u64::MAX, MAX_ANIMATION_FRAMES),
+                Collected::TooLarge
+            ),
             "one frame past the decoded-frame ceiling"
         );
         assert!(

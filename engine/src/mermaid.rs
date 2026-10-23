@@ -431,8 +431,8 @@ mod tests {
     fn max_width_narrows_output() {
         let natural =
             render_text(GRAPH_LR_2, None, MermaidTextBackend::Auto).expect("natural render");
-        let narrow = render_text(GRAPH_LR_2, Some(40), MermaidTextBackend::Auto)
-            .expect("narrow render");
+        let narrow =
+            render_text(GRAPH_LR_2, Some(40), MermaidTextBackend::Auto).expect("narrow render");
 
         let natural_width = natural
             .lines()
@@ -655,8 +655,7 @@ mod tests {
     /// rather than swallowing the next one.
     #[test]
     fn link_ranges_are_per_line() {
-        let art =
-            strip_escape_sequences("a\x1b]8;;u1\x1b\\b\x1b]8;;\x1b\\c\nd\x1b]8;;u2\x1b\\e");
+        let art = strip_escape_sequences("a\x1b]8;;u1\x1b\\b\x1b]8;;\x1b\\c\nd\x1b]8;;u2\x1b\\e");
         assert_eq!(art.text, "abc\nde");
         assert_eq!(
             art.links,

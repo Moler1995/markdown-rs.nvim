@@ -198,7 +198,11 @@ pub fn layout_table(
             "[ table — too narrow to render ]".to_string(),
             dim_style,
         ));
-        return (Text::from(vec![placeholder]), 1, vec![Some(table.source_line)]);
+        return (
+            Text::from(vec![placeholder]),
+            1,
+            vec![Some(table.source_line)],
+        );
     }
 
     // Available content width after removing all borders (num_cols+1) and
@@ -598,7 +602,13 @@ mod tests {
     fn mixed_height_rows_top_aligned() {
         // 2-col table: col 0 has a very short cell, col 1 has a long cell that wraps.
         let long = "word ".repeat(20);
-        let table = make_table(&["Short", "Long Header"], &[&["A", long.trim()]], &[], 0, &[]);
+        let table = make_table(
+            &["Short", "Long Header"],
+            &[&["A", long.trim()]],
+            &[],
+            0,
+            &[],
+        );
         let (text, _h, _p2s) = layout_table(&table, 40, &palette());
 
         let body_start = {
