@@ -70,7 +70,7 @@ jobs:
           cp LICENSE README.md "dist/$name/"
           tar -C dist -czf "$name.tar.gz" "$name"
           mv "$name.tar.gz" artifacts/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-musl
           path: artifacts/*.tar.gz
@@ -100,7 +100,7 @@ jobs:
           Copy-Item LICENSE, README.md "dist/$name/"
           Compress-Archive -Path "dist/$name" -DestinationPath "$name.zip"
           Move-Item "$name.zip" artifacts/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows-msvc
           path: artifacts/*.zip
@@ -133,7 +133,7 @@ jobs:
           cp LICENSE README.md "dist/$name/"
           tar -C dist -czf "$name.tar.gz" "$name"
           mv "$name.tar.gz" artifacts/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos-universal
           path: artifacts/*.tar.gz
@@ -153,7 +153,7 @@ jobs:
           cd artifacts
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: checksums
           path: artifacts/SHA256SUMS
