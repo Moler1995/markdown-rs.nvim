@@ -106,6 +106,8 @@ Both suites are retained because they test different things: the headless suite 
 
 **Alternative considered:** separate macOS runners for arm64 and x86_64 plus a merge job. Rejected as the primary approach because a single `macos-latest` (arm64) runner can cross-build and `lipo` both targets. If the cross-link fails on the first run, the fallback is `macos-13` (x86_64) plus a merge job.
 
+**Verification record.** The development host has neither a musl sysroot nor an MSVC linker, and only the `x86_64-pc-windows-gnu` and `x86_64-pc-windows-gnullvm` targets installed, so the Linux and Windows release builds could not be produced or smoke-tested locally. The release workflow supplied that verification instead: the dry run (39925461403) built all three archives and wrote `SHA256SUMS`, the published run for `v0.1.0` (39927596622) did the same and created the release, and the downloaded Windows archive was run on this host with `--version`. The macOS build has no local counterpart at all and is verified only by these runs.
+
 ### Dependency and vulnerability monitoring
 
 - `.github/dependabot.yml` with two ecosystems: `cargo` and `github-actions`, both weekly. Patch and minor Cargo updates are grouped into one PR; major updates stay individual.
