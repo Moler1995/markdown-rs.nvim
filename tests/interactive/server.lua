@@ -147,9 +147,10 @@ function M.goto(src, offset)
       error('no display row for source line ' .. src)
     end
     local doc = s.doc
-    vim.api.nvim_win_set_cursor(s.win, { row + 1 + (offset or 0), 0 })
+    local line = row + 1 + (offset or 0)
+    vim.api.nvim_win_set_cursor(s.win, { line, 0 })
     quiescent()
-    if s.doc == doc then
+    if s.doc == doc and vim.api.nvim_win_get_cursor(s.win)[1] == line then
       break
     end
   end
@@ -337,11 +338,20 @@ end
 --- popup takes focus: at the moment this runs the current window may be the
 --- popup, which has no state of its own.
 function M.preview_report(tag, want_open)
+  local win = M.watched or vim.api.nvim_get_current_win()
+  local before = (state.windows[win] or {}).reported
   vim.wait(8000, function()
-    return preview.is_open() == want_open
+    if preview.is_open() == want_open then
+      return true
+    end
+    -- A render that failed is never going to open a popup. Stop waiting for
+    -- one: the report says so, and the check that wanted it open fails with
+    -- the plugin's own message instead of an unexplained `open=false` eight
+    -- seconds later.
+    local s = state.windows[win]
+    return want_open and s ~= nil and s.reported ~= nil and s.reported ~= before
   end)
 
-  local win = M.watched or vim.api.nvim_get_current_win()
   local s = state.windows[win]
   if not s then
     error('no md-render state for the watched window')
@@ -365,6 +375,10 @@ function M.preview_report(tag, want_open)
     -- what the popup's own budget was without re-deriving the cap. `inner` does
     -- not depend on the kind; the budget does, and is what 5.4 is about.
     'popup_inner=' .. tostring(preview.geometry('table', 0).inner),
+    -- The last error the plugin reported for this window, if any: a preview
+    -- that did not open because the engine refused the block looks exactly
+    -- like one that did not open yet, and only this tells them apart.
+    'reported=' .. tostring(s.reported or ''),
     'popup_width=0',
     'popup_widest=0',
   }

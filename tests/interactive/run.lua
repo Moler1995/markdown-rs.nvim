@@ -249,6 +249,23 @@ local function truthy(name, got, detail)
   check(name, got and true or false, detail or string.format('got %s', vim.inspect(got)))
 end
 
+--- Check `preview.open`, naming the plugin's own message when it has one.
+---
+--- A popup that did not open because the engine refused the block and one that
+--- had not opened yet are the same `false` in the report; the plugin's last
+--- error is the only thing that tells them apart, and it is worth having in the
+--- log of the run that failed rather than in the next investigation.
+local function expect_open(name, report, want)
+  local reported = report.reported or ''
+  check(name, report.open == tostring(want),
+    string.format('got %s, want %s%s%s', vim.inspect(report.open), tostring(want),
+      reported ~= '' and ('; the plugin reported: ' .. reported) or '',
+      -- The row under the cursor says whether the key fell through to Vim's
+      -- own `<CR>` instead of finding a block: it is the row *below* the one
+      -- the check put the cursor on when it did.
+      report.cursor_text and ('; cursor on ' .. report.cursor_text) or ''))
+end
+
 --- `  - nested item` is source line 5, counted from zero.
 local NESTED = 5
 
@@ -439,7 +456,7 @@ local function body()
   step('<CR>')
   local prose_after = preview_report('prose_after')
 
-  expect('4.3 <CR> on prose opens no popup', prose_after.open, 'false')
+  expect_open('4.3 <CR> on prose opens no popup', prose_after, false)
   expect('4.3 and leaves the window in R', prose_after.state, 'R')
   expect('4.3 and still showing the rendered buffer', prose_after.showing_rendered, 'true')
   expect('4.3 the cursor moves down one display row',
@@ -467,7 +484,7 @@ local function body()
   md_call('goto(6)')
   local narrow_table = preview_key('narrow_table', true)
 
-  expect('5.1 the table preview opens', narrow_table.open, 'true')
+  expect_open('5.1 the table preview opens', narrow_table, true)
   expect('5.1 in a window narrower than the cap', narrow_table.window_width, '40')
   truthy('5.1 and the popup shows columns the window clipped',
     tonumber(narrow_table.popup_widest) > tonumber(narrow_table.window_width),
@@ -475,12 +492,12 @@ local function body()
       narrow_table.popup_widest, narrow_table.window_width))
 
   local closed = preview_key('narrow_closed', false)
-  expect('5.1 and the key closes it again', closed.open, 'false')
+  expect_open('5.1 and the key closes it again', closed, false)
 
   md_call('goto(12)')
   local narrow_diagram = preview_key('narrow_diagram', true)
 
-  expect('5.1 the diagram preview opens', narrow_diagram.open, 'true')
+  expect_open('5.1 the diagram preview opens', narrow_diagram, true)
   expect('5.1 in the same narrow window', narrow_diagram.window_width, '40')
   truthy('5.1 and the popup shows columns the window clipped',
     tonumber(narrow_diagram.popup_widest) > tonumber(narrow_diagram.window_width),
@@ -506,12 +523,12 @@ local function body()
     tonumber(view_before.topline) > 1, view_before.topline)
 
   local view_open = preview_key('view_open', true)
-  expect('5.2 the preview opens over the wide table', view_open.open, 'true')
+  expect_open('5.2 the preview opens over the wide table', view_open, true)
   expect('5.2 and the window underneath is still in R', view_open.state, 'R')
 
   local view_after = preview_key('view_after', false)
 
-  expect('5.2 the key closes it again', view_after.open, 'false')
+  expect_open('5.2 the key closes it again', view_after, false)
   expect('5.2 and the window is still in R', view_after.state, 'R')
   expect('5.2 on the same buffer', view_after.buffer, view_before.buffer)
   expect('5.2 with the same cursor line', view_after.cursor_line, view_before.cursor_line)
@@ -531,7 +548,7 @@ local function body()
   md_call('goto(6)')
   local full_table = preview_key('full_table', true)
 
-  expect('5.3 the table preview opens', full_table.open, 'true')
+  expect_open('5.3 the table preview opens', full_table, true)
   expect('5.3 in a window as wide as the editor',
     full_table.window_width, full_table.columns)
   truthy('5.3 and the popup holds no fewer columns than the window did',
@@ -563,7 +580,7 @@ local function body()
   md_call('goto(9)')
   local wide_diagram = preview_key('wide_diagram', true)
 
-  expect('5.4 the diagram preview opens', wide_diagram.open, 'true')
+  expect_open('5.4 the diagram preview opens', wide_diagram, true)
   expect('5.4 in the narrow window', wide_diagram.window_width, '40')
   truthy('5.4 and the popup holds more of it than the popup\'s own width',
     tonumber(wide_diagram.popup_widest) > tonumber(wide_diagram.popup_inner),
