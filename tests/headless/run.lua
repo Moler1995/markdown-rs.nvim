@@ -1713,6 +1713,26 @@ section('12.2', function()
     return true
   end
 
+  --- Put R's cursor on `label` in the display row for source line `src`.
+  local function goto_label(src, label)
+    local st = current_state()
+    local row = render.row_for_source(st.doc, src)
+    local line = row and st.doc.lines[row + 1]
+    if not line then
+      return false
+    end
+    local parts = {}
+    for _, span in ipairs(line.spans) do
+      parts[#parts + 1] = span[2]
+    end
+    local at = table.concat(parts):find(label, 1, true)
+    if not at then
+      return false
+    end
+    vim.api.nvim_win_set_cursor(st.win, { row + 1, at - 1 })
+    return true
+  end
+
   truthy('12.2 in R on the links fixture', reset_to_links())
   local st = current_state()
   truthy('12.2 R maps gf', maps(st.rendered, 'gf'))
@@ -1780,6 +1800,21 @@ section('12.2', function()
   vim.api.nvim_win_set_cursor(st.win, { 19, 15 })
   md.follow()
   truthy('12.2 the cursor on the first link follows the first link',
+    wait_for_source('linked.md'))
+
+  -- The same line from R, where there is no source byte column to compare
+  -- against: the label under the cursor decides. This is what makes a line of
+  -- links — a README's badge row, say — followable from the reading view.
+  truthy('12.2 in R on the two-link line', reset_to_links())
+  truthy('12.2 the second label has a place in R', goto_label(18, 'second'))
+  md.follow()
+  truthy('12.2 from R the second label follows the second link',
+    wait_for_source('other.md'))
+
+  truthy('12.2 in R on the two-link line again', reset_to_links())
+  truthy('12.2 the first label has a place in R', goto_label(18, 'first'))
+  md.follow()
+  truthy('12.2 from R the first label follows the first link',
     wait_for_source('linked.md'))
 
   -- And from S an anchor moves the cursor within this document, to source line

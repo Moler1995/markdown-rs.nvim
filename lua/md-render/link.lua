@@ -114,6 +114,11 @@ local function parse_at(line, i, refs)
   if not close then
     return nil
   end
+  -- The text between the brackets is what the renderer puts on the line, so it
+  -- is also what maps a link back to its source construct from the rendered
+  -- view. Kept as written: inline markup inside a label is the caller's
+  -- problem, and the mapping treats a label it cannot find as no match.
+  local text = line:sub(i + 1, close - 1)
 
   local after = line:sub(close + 1, close + 1)
   if after == '(' then
@@ -126,6 +131,7 @@ local function parse_at(line, i, refs)
       to = endp,
       raw = clean_target(line:sub(close + 2, endp - 1)),
       image = image,
+      text = text,
     }
   end
 
@@ -134,18 +140,18 @@ local function parse_at(line, i, refs)
     if not endb then
       return nil
     end
-    local label = line:sub(close + 2, endb - 1)
-    if label == '' then
+    local ref = line:sub(close + 2, endb - 1)
+    if ref == '' then
       -- `[text][]` refers to itself.
-      label = line:sub(i + 1, close - 1)
+      ref = text
     end
-    local raw = refs[label:lower()]
-    return raw and { from = start, to = endb, raw = raw, image = image } or nil
+    local raw = refs[ref:lower()]
+    return raw and { from = start, to = endb, raw = raw, image = image, text = text } or nil
   end
 
   -- A shortcut reference: `[text]` with the definition elsewhere.
-  local raw = refs[line:sub(i + 1, close - 1):lower()]
-  return raw and { from = start, to = close, raw = raw, image = image } or nil
+  local raw = refs[text:lower()]
+  return raw and { from = start, to = close, raw = raw, image = image, text = text } or nil
 end
 
 --- A URL written as itself rather than as a link's destination.
@@ -171,7 +177,7 @@ local function autolinks(line)
         target = trimmed
       end
       if target ~= '' then
-        raw[#raw + 1] = { from = s, to = e, raw = target }
+        raw[#raw + 1] = { from = s, to = e, raw = target, text = target }
       end
       init = e + 1
     end
@@ -221,6 +227,7 @@ local function finish(parsed)
     from = parsed.from,
     to = parsed.to,
     raw = raw,
+    text = parsed.text,
     target = target,
     fragment = fragment,
     kind = kind,
@@ -228,8 +235,9 @@ local function finish(parsed)
   }
 end
 
---- Every link on line `lnum` (0-based), as `{ from, to, raw, target, fragment,
---- kind }` with `from` and `to` 1-based byte columns, `to` exclusive.
+--- Every link on line `lnum` (0-based), as `{ from, to, raw, text, target,
+--- fragment, kind }` with `from` and `to` 1-based byte columns, `to`
+--- exclusive, and `text` the label as written between the brackets.
 ---
 --- A destination is looked for first, and a bare URL only when the line holds
 --- no link at all: the URL inside `[text](https://…)` is that link's
@@ -273,9 +281,11 @@ end
 
 --- The link covering byte column `col` (0-based) on line `lnum`, or nil.
 ---
---- `col` may be nil, which means "any link on this line" and yields the first.
---- That is the R case: the rendered line is a layout of the source, so a
---- display column has no byte column in the source to be compared against.
+--- This is the source view's resolution: the cursor's column is a byte column
+--- in the same line the links were parsed from, so it decides directly. `col`
+--- may be nil, which means "any link on this line" and yields the first; the
+--- rendered view does not use that any more, since `M.source_line_at` resolves
+--- its columns against a layout (see below).
 function M.at(lines, lnum, col)
   local found = M.links(lines, lnum)
   if col == nil then
@@ -287,6 +297,67 @@ function M.at(lines, lnum, col)
     end
   end
   return nil
+end
+
+--- The text of one display line, its spans concatenated.
+local function display_text(line)
+  local parts = {}
+  for _, span in ipairs(line.spans or {}) do
+    parts[#parts + 1] = span[2]
+  end
+  return table.concat(parts)
+end
+
+--- The link on display row `row` (0-based) under byte column `col`, resolved
+--- by matching the source line's link labels against the rendered text.
+---
+--- The rendered view is a layout of the source, so a display column has no byte
+--- column in the source to compare against — but a link's *label* survives the
+--- layout: `[快速上手](#使用-deepseek-recipe) · [流式响应](docs/streaming.zh.md)`
+--- is drawn as `快速上手 · 流式响应`, one label after the other. Matching the
+--- labels, in order, against the rows this source line produced is what tells
+--- two links on one line apart without the engine having to report them.
+---
+--- The rows are joined before searching, because a label can wrap across two
+--- of them; the cursor's offset is counted in the same joined text. A label
+--- whose rendered form differs from its source (inline markup inside the
+--- brackets, an image drawn as artwork) is simply not found, and a cursor that
+--- is in no found label falls back to the first link — the behaviour of a line
+--- with one link, which is what such a line usually is.
+function M.source_line_at(doc, row, col, lines, lnum)
+  local found = M.links(lines, lnum)
+  if #found <= 1 then
+    return found[1]
+  end
+
+  local chunks, starts, offset = {}, {}, 0
+  for i, line in ipairs(doc.lines) do
+    if line.source == lnum then
+      local text = display_text(line)
+      starts[i - 1] = offset
+      chunks[#chunks + 1] = text
+      offset = offset + #text
+    end
+  end
+  if starts[row] == nil then
+    return found[1]
+  end
+
+  local text = table.concat(chunks)
+  local at = starts[row] + col
+  local init = 1
+  for _, link in ipairs(found) do
+    if link.text and link.text ~= '' then
+      local from, to = text:find(link.text, init, true)
+      if from then
+        if at >= from - 1 and at < to then
+          return link
+        end
+        init = to + 1
+      end
+    end
+  end
+  return found[1]
 end
 
 --- The engine-reported link covering byte column `col` (0-based) on display

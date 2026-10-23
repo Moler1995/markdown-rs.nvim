@@ -296,7 +296,12 @@ Insert-entry keys (R only, not configurable)~
 
 In R the link is read from the source text: the display row is first mapped
 back to the source line it came from, so the engine's output does not need to
-carry link targets. A rendered mermaid diagram can carry links of its own — a
+carry link targets. A source line that holds more than one link is resolved by
+the label under the cursor — the labels are matched, in order, against the text
+of the rows that line produced, which survives wrapping. A label whose rendered
+form differs from its source (inline markup inside the brackets) is not matched;
+the first link on the line is used then.
+A rendered mermaid diagram can carry links of its own — a
 `click NODE href "..."` directive — and the node's label is underlined (the
 `MdRenderLink` group) so it is visible. The hint follows the follow keys: with
 both set to `false` there is nothing to follow and no underline.

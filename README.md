@@ -34,7 +34,8 @@ buffer.
 - **A rendered view in the window.** Every normal-mode motion, search and yank
   works in it. The source buffer is never modified; the toggle puts it back.
 - **Links that work from the reading view.** `gf` follows files, URLs and
-  anchors, reads the source text, and follows mermaid `click` directives.
+  anchors, reads the source text, tells apart several links on one line, and
+  follows mermaid `click` directives.
 - **Block preview and zoom.** `<CR>` on a table or diagram re-renders that
   block at a budget of its own, so none of a clipped diagram is unreachable.
 - **Image artwork.** PNG, JPEG, GIF, WebP, BMP, TIFF and ICO are drawn as

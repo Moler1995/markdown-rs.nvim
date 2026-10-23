@@ -960,10 +960,11 @@ local following = false
 --- That is what lets a reader follow a link without leaving the reading view
 --- first, whether it was written in prose or drawn in a diagram.
 ---
---- A source line holding more than one link resolves to the first of them when
---- it is followed from R, because a display column has no byte column in the
---- source to be compared against. From S the cursor's own column decides, and
---- so does a rendered line's own `links` table.
+--- A source line holding more than one link is resolved from R by matching the
+--- cursor's position against the rendered labels (see `link.source_line_at`),
+--- because a display column has no byte column in the source to compare
+--- against. From S the cursor's own column decides, and so does a rendered
+--- line's own `links` table.
 ---
 --- With no link under the cursor the key goes back to Vim, so `gf` keeps its
 --- ordinary meaning on a path written as plain text.
@@ -997,7 +998,7 @@ function M.follow(win, opts)
       if not lnum then
         return feed(key)
       end
-      found = link.at(lines, lnum, nil)
+      found = link.source_line_at(st.doc, row, col, lines, lnum)
     end
   else
     found = link.at(lines, row, col)
