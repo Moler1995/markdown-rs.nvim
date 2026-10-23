@@ -307,8 +307,14 @@ function M.narrow(cols)
   vim.cmd('wincmd p')
   vim.api.nvim_win_set_width(vim.api.nvim_get_current_win(), cols)
   local s = st()
+  -- The buffer's width is not enough on its own: a document laid out for the
+  -- wide window and applied after the resize carries that layout's rows, and
+  -- the buffer it paints is as wide as that layout. `width` is the budget the
+  -- document was laid out at, which is the question `goto` is about to ask.
   vim.wait(8000, function()
-    return s.rendered ~= nil and widest(s.rendered, s.win) <= cols
+    return s.rendered ~= nil
+      and s.doc ~= nil and (s.doc.width or cols) <= cols
+      and widest(s.rendered, s.win) <= cols
   end)
   -- The width is one render; a burst of resize events can schedule another, so
   -- the step is not over when the first lands.
@@ -379,6 +385,13 @@ function M.preview_report(tag, want_open)
     -- that did not open because the engine refused the block looks exactly
     -- like one that did not open yet, and only this tells them apart.
     'reported=' .. tostring(s.reported or ''),
+    -- Which layout the window is showing, and which source line the cursor's
+    -- row came from. A press that finds no block is a cursor on a row that
+    -- belongs to no block, and these two numbers say which layout put it there
+    -- — a row number alone reads the same in every layout.
+    'doc_width=' .. tostring(s.doc and s.doc.width or ''),
+    'source_at_cursor=' .. tostring(
+      (s.doc and render.source_line_for(s.doc, cursor[1] - 1)) or ''),
     'popup_width=0',
     'popup_widest=0',
   }

@@ -262,8 +262,11 @@ local function expect_open(name, report, want)
       reported ~= '' and ('; the plugin reported: ' .. reported) or '',
       -- The row under the cursor says whether the key fell through to Vim's
       -- own `<CR>` instead of finding a block: it is the row *below* the one
-      -- the check put the cursor on when it did.
-      report.cursor_text and ('; cursor on ' .. report.cursor_text) or ''))
+      -- the check put the cursor on when it did. The layout and the source line
+      -- the row came from say whether the row was resolved against the layout
+      -- that was on screen when the key was pressed.
+      report.cursor_text and string.format('; cursor on %s (layout %s, source %s)',
+        report.cursor_text, report.doc_width or '?', report.source_at_cursor or '?') or ''))
 end
 
 --- `  - nested item` is source line 5, counted from zero.
@@ -601,20 +604,6 @@ else
 end
 server:wait()
 
--- An error raised inside the server — a step that failed, a key that did not
--- exist — arrives as a missing report rather than as a message, because a `:lua`
--- call cannot return to the driver. Its output is kept for exactly this reason,
--- and without printing it the cause is a report that never appeared and nothing
--- else. Printed before the results so it reads as the explanation of them.
-if not ok then
-  for _, name in ipairs({ 'server.err', 'server.out' }) do
-    local text = table.concat(server_output[name])
-    if #text > 0 then
-      io.stdout:write(string.format('\n--- %s ---\n%s\n', name, text))
-    end
-  end
-end
-
 --------------------------------------------------------------------------------
 -- Report
 --------------------------------------------------------------------------------
@@ -633,4 +622,20 @@ io.stdout:write(string.format('\n%d checks, %d failed\n', #results, failed))
 if not ok then
   io.stdout:write(string.format('\nthe run stopped early: %s\n', err))
 end
+
+-- An error raised inside the server — a step that failed, a key that did not
+-- exist — never comes back to the driver, because a `:lua` call cannot return
+-- to it. Key handlers raise there too: a mapping that fails prints to the
+-- server's stderr and nothing else, and the only sign here is the check that
+-- key was driving. Printed after the results, and whenever anything went
+-- wrong, so a failed check is followed by whatever the server said about it.
+if not ok or failed > 0 then
+  for _, name in ipairs({ 'server.err', 'server.out' }) do
+    local text = table.concat(server_output[name])
+    if #text > 0 then
+      io.stdout:write(string.format('\n--- %s ---\n%s\n', name, text))
+    end
+  end
+end
+
 os.exit((ok and failed == 0) and 0 or 1)
