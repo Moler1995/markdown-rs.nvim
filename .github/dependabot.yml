@@ -16,3 +16,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # `dtolnay/rust-toolchain@1.92` names a Rust release, not a version of
+      # the action: the ref is the toolchain to install. Dependabot reads it as
+      # a version and offers to bump it, which would silently move the MSRV job
+      # off the version the workspace declares (1.120 does not exist, so the
+      # bump only failed loudly by luck).
+      - dependency-name: "dtolnay/rust-toolchain"
