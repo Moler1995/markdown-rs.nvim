@@ -2,11 +2,6 @@ MIT License
 
 Copyright (c) 2026 markdown-rs.nvim contributors
 
-Portions of this software are derived from markdown-reader
-(https://github.com/leboiko/markdown-reader), revision 4f0f635,
-Copyright (c) 2026 leboiko, and are used under the same MIT terms.
-Ported files name their origin in a header comment.
-
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights

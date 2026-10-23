@@ -7,8 +7,21 @@
 local M = {}
 
 M.defaults = {
-  -- Path to the engine binary. `nil` means "resolve it": `md-render` on PATH
-  -- first, then `<repo>/bin/md-render.exe`. See `engine.resolve`.
+  -- Path to the engine binary. When set, it is used as given and must be
+  -- executable: a path that is missing or cannot run is an error, not a reason
+  -- to search elsewhere, so a typo cannot silently run a different engine.
+  --
+  -- `nil` (or the empty string) means "resolve it", in this order:
+  --
+  --   1. `md-render` on `PATH`;
+  --   2. `<plugin-root>/bin/md-render[.exe]`, a build copied next to the
+  --      checkout;
+  --   3. `<stdpath('data')>/md-render/md-render[.exe]`, where a downloaded
+  --      release goes.
+  --
+  -- The repository's `bin/` stays ahead of the data directory so a fresh local
+  -- build is not shadowed by an older download. See `engine.resolve`, and
+  -- `:checkhealth md-render` for which step matched.
   engine = nil,
 
   -- Theme handed to the engine with `--theme`. The default matches the

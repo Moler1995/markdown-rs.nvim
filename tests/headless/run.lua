@@ -70,6 +70,7 @@ vim.cmd('source ' .. vim.fn.fnameescape(repo .. '/plugin/md-render.lua'))
 
 local md = require('md-render')
 local config = require('md-render.config')
+local engine_mod = require('md-render.engine')
 local link = require('md-render.link')
 local preview = require('md-render.preview')
 local render = require('md-render.render')
@@ -134,6 +135,19 @@ local function with_leader(lhs)
   return (lhs:gsub('<[Ll]eader>', function()
     return leader
   end))
+end
+
+--- Compare two paths as files, not as strings.
+---
+--- The plugin builds some paths from `debug.getinfo` (a native path, with the
+--- host's separators) and the test builds its from `MDRN_REPO`; the same file
+--- must not fail a check because one side wrote `\` and the other `/`.
+local function same_path(got, want)
+  if not got then
+    return false
+  end
+  return vim.fs.normalize(vim.fn.fnamemodify(got, ':p'))
+    == vim.fs.normalize(vim.fn.fnamemodify(want, ':p'))
 end
 
 --- Feed `keys` as if typed, then let the loop act on them.
@@ -1615,6 +1629,13 @@ section('12.1', function()
   -- The heading an anchor names, and the slug it is matched by.
   expect('12.1 a slug', link.slug('Target Section'), 'target-section')
   expect('12.1 punctuation is dropped from a slug', link.slug('A, B!'), 'a-b')
+  -- GitHub keeps a hyphen and an underscore in the anchor it generates, so a
+  -- heading that has one must be found by the anchor the document links to.
+  expect('12.1 a hyphen survives a slug', link.slug('使用 deepseek-recipe'),
+    '使用-deepseek-recipe')
+  expect('12.1 an underscore survives a slug', link.slug('snake_case'), 'snake_case')
+  expect('12.1 a hyphenated heading matches its anchor',
+    link.anchor_line({ '# Top', '## 使用 deepseek-recipe' }, '使用-deepseek-recipe'), 1)
   expect('12.1 the line of an anchor', link.anchor_line(lines, 'tail'), 30)
   expect('12.1 an anchor no heading matches', link.anchor_line(lines, 'nope'), nil)
 
@@ -3475,14 +3496,6 @@ section('4.1', function()
     return notifications[#notifications] or {}
   end
 
-  local function same_path(got, want)
-    if not got then
-      return false
-    end
-    return vim.fs.normalize(vim.fn.fnamemodify(got, ':p'))
-      == vim.fs.normalize(vim.fn.fnamemodify(want, ':p'))
-  end
-
   -- Relative: resolved against the document's directory.
   truthy('4.1 in R on the animated fixture', reset_to(animated_fixture))
   local st = current_state()
@@ -4029,6 +4042,619 @@ section('5.8', function()
   expect('5.8 and no timer', popup.timer, nil)
   preview.close()
   config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 8.3 Setup attaches the buffer already on screen
+--------------------------------------------------------------------------------
+
+--- Run `body` in a fresh Neovim and return its `vim.system` result.
+---
+--- A startup-order check cannot be written in this process: its plugin has been
+--- sourced and its autocmds are already installed, so "FileType fired before
+--- the plugin loaded" is no longer a state this instance can be in. A second
+--- Neovim whose runtimepath names the checkout is the only honest way to test
+--- the order.
+local function run_nested(body)
+  local lines = {
+    'local repo = ' .. vim.inspect((repo:gsub('\\', '/'))),
+    'vim.opt.runtimepath:prepend(repo)',
+    'vim.opt.swapfile = false',
+    'vim.opt.hidden = true',
+    'vim.o.columns = 80',
+    'vim.o.lines = 24',
+  }
+  vim.list_extend(lines, body)
+  local script = vim.fn.tempname() .. '.lua'
+  vim.fn.writefile(lines, script)
+  -- `real_system`: the spawn counter around `vim.system` counts engine calls,
+  -- and a second Neovim is not one. The nested instance's own spawns happen in
+  -- its process and are invisible here either way.
+  local res = real_system({ 'nvim', '--headless', '-u', 'NONE', '-l', script },
+    { text = true, timeout = 60000 }):wait()
+  vim.fn.delete(script)
+  return res
+end
+
+--- The lines that wait for R and leave the exit code to the caller.
+local nested_wait_for_r = {
+  'local function rendered()',
+  '  local win = vim.api.nvim_get_current_win()',
+  '  local st = require("md-render.state").windows[win]',
+  '  return st ~= nil and st.mode == "R" and st.rendered ~= nil',
+  '    and vim.api.nvim_buf_is_valid(st.rendered)',
+  '    and vim.api.nvim_win_get_buf(win) == st.rendered',
+  'end',
+  'os.exit(vim.wait(8000, rendered, 10) and 0 or 1)',
+}
+
+local fixture_rel = 'tests/fixtures/plugin.md'
+
+section('8.3', function()
+  -- The ordinary startup: the plugin is loaded before the file is edited, so
+  -- `FileType` does the attaching. The helper must not attach a second time —
+  -- one source, one render, one attach call.
+  local startup_script = {
+    'vim.cmd("filetype plugin indent on")',
+    'local md = require("md-render")',
+    'local attaches = 0',
+    'local real_attach = md.attach',
+    'md.attach = function(...)',
+    '  attaches = attaches + 1',
+    '  return real_attach(...)',
+    'end',
+    'vim.cmd("runtime! plugin/md-render.lua")',
+    'vim.cmd("edit " .. vim.fn.fnameescape(repo .. "/' .. fixture_rel .. '"))',
+    'local function rendered()',
+    '  local win = vim.api.nvim_get_current_win()',
+    '  local st = require("md-render.state").windows[win]',
+    '  return st ~= nil and st.mode == "R" and st.rendered ~= nil',
+    '    and vim.api.nvim_win_get_buf(win) == st.rendered',
+    'end',
+    'assert(vim.wait(8000, rendered, 10), "the first buffer never reached R")',
+    'vim.wait(100)',
+    'assert(attaches == 1, "attach ran " .. attaches .. " times, not once")',
+    'os.exit(0)',
+  }
+  local res = run_nested(startup_script)
+  check('8.2 a normal startup attaches the file once', res.code == 0,
+    (res.stderr or '') .. (res.stdout or ''))
+
+  -- A markdown buffer is current and setup{} is called with no plugin
+  -- autocmds installed: the helper is the only thing that can attach it.
+  local setup_script = {
+    'vim.cmd("filetype plugin indent on")',
+    'vim.cmd("edit " .. vim.fn.fnameescape(repo .. "/' .. fixture_rel .. '"))',
+    'assert(vim.bo.filetype == "markdown", "the fixture has no markdown filetype")',
+    'assert(not pcall(vim.api.nvim_get_autocmds, { group = "MdRender" }),',
+    '  "the autocmds were already installed")',
+    'local md = require("md-render")',
+    'md.setup{}',
+  }
+  vim.list_extend(setup_script, nested_wait_for_r)
+  local res = run_nested(setup_script)
+  check('8.3 setup{} attaches the current markdown buffer', res.code == 0,
+    (res.stderr or '') .. (res.stdout or ''))
+
+  -- With no filetype yet there is nothing to attach; the helper must not guess.
+  local late_script = {
+    'vim.cmd("edit " .. vim.fn.fnameescape(repo .. "/' .. fixture_rel .. '"))',
+    'assert(vim.bo.filetype == "", "filetype detection should be off")',
+    'local md = require("md-render")',
+    'md.setup{}',
+    'vim.wait(100)',
+    'local win = vim.api.nvim_get_current_win()',
+    'assert(require("md-render.state").windows[win] == nil,',
+    '  "the helper attached a buffer with no filetype")',
+    'vim.bo.filetype = "markdown"',
+  }
+  vim.list_extend(late_script, nested_wait_for_r)
+  res = run_nested(late_script)
+  check('8.3 setup{} before filetype detection waits for FileType', res.code == 0,
+    (res.stderr or '') .. (res.stdout or ''))
+
+  -- Sourcing the plugin after FileType: no event will fire again, so the
+  -- startup call is what attaches the buffer on screen.
+  local source_after_script = {
+    'vim.cmd("filetype plugin indent on")',
+    'vim.cmd("edit " .. vim.fn.fnameescape(repo .. "/' .. fixture_rel .. '"))',
+    'assert(vim.bo.filetype == "markdown", "the fixture has no markdown filetype")',
+    'vim.wait(50)',
+    'local win = vim.api.nvim_get_current_win()',
+    'assert(require("md-render.state").windows[win] == nil,',
+    '  "something attached before the plugin was sourced")',
+    'vim.cmd("source " .. vim.fn.fnameescape(repo .. "/plugin/md-render.lua"))',
+  }
+  vim.list_extend(source_after_script, nested_wait_for_r)
+  res = run_nested(source_after_script)
+  check('8.3 sourcing the plugin after FileType attaches that buffer', res.code == 0,
+    (res.stderr or '') .. (res.stdout or ''))
+
+  -- Two setup() calls must not double the autocmds or the buffer maps.
+  truthy('8.3 in R on the fixture', reset_to_r())
+  local st = current_state()
+  local before = #vim.api.nvim_get_autocmds({ group = 'MdRender' })
+  md.setup({})
+  md.setup({})
+  expect('8.3 two setup{} calls leave one autocmd group',
+    #vim.api.nvim_get_autocmds({ group = 'MdRender' }), before)
+
+  local toggle = with_leader(config.options.keymaps.toggle)
+  local maps = 0
+  for _, m in ipairs(vim.api.nvim_buf_get_keymap(st.source, 'n')) do
+    if m.lhs == toggle then
+      maps = maps + 1
+    end
+  end
+  expect('8.3 and one set of buffer maps', maps, 1)
+end)
+
+--------------------------------------------------------------------------------
+-- 8.4 A lazy `ft = 'markdown'` load still reaches the first buffer
+--------------------------------------------------------------------------------
+
+section('8.4', function()
+  -- lazy.nvim with `ft` sources the plugin from FileType. BufWinEnter has
+  -- already fired too, so the source is the only thing that runs afterwards.
+  local script = {
+    'vim.cmd("filetype plugin indent on")',
+    'local saw_buf_win_enter = false',
+    'vim.api.nvim_create_autocmd("BufWinEnter", {',
+    '  callback = function() saw_buf_win_enter = true end,',
+    '})',
+    'vim.cmd("edit " .. vim.fn.fnameescape(repo .. "/' .. fixture_rel .. '"))',
+    'assert(vim.bo.filetype == "markdown", "the fixture has no markdown filetype")',
+    'assert(saw_buf_win_enter, "BufWinEnter did not fire")',
+    'vim.wait(50)',
+    'local win = vim.api.nvim_get_current_win()',
+    'assert(require("md-render.state").windows[win] == nil,',
+    '  "the buffer was attached before the plugin loaded")',
+    'vim.cmd("source " .. vim.fn.fnameescape(repo .. "/plugin/md-render.lua"))',
+  }
+  vim.list_extend(script, nested_wait_for_r)
+  local res = run_nested(script)
+  check('8.4 a lazy ft load shows R without :e', res.code == 0,
+    (res.stderr or '') .. (res.stdout or ''))
+end)
+
+--------------------------------------------------------------------------------
+-- 8.5 The attach helper leaves other windows alone
+--------------------------------------------------------------------------------
+
+section('8.5', function()
+  -- A buffer the plugin does not manage is not attached and costs no engine.
+  --
+  -- A split rather than an `:edit` in the attached window: a window's state
+  -- outlives an edit to an unmanaged file (the plugin keeps it so that going
+  -- back to the document is a toggle, not a re-render), so the helper needs a
+  -- window that has no state yet to test.
+  truthy('8.5 in R on the fixture', reset_to_r())
+  md.toggle()
+  truthy('8.5 in S on the fixture', wait_until(showing_source))
+  vim.cmd('vsplit ' .. vim.fn.fnameescape(plain))
+  local plain_win = vim.api.nvim_get_current_win()
+  vim.bo.filetype = ''
+  local before = engine_calls
+  md.attach_current()
+  vim.wait(50)
+  expect('8.5 a non-managed buffer gets no state', state.windows[plain_win], nil)
+  expect('8.5 and starts no render', engine_calls, before)
+  vim.cmd('close')
+
+  -- A window that has moved to another buffer is not attached to the buffer
+  -- the caller named: it is showing something else now.
+  md.show_rendered()
+  truthy('8.5 back in R', wait_until(showing_rendered))
+  local st = current_state()
+  local source = st.source
+  local other = vim.api.nvim_create_buf(false, true)
+  md.attach_current(other, st.win)
+  vim.wait(50)
+  expect('8.5 a window showing another buffer is not attached', st.source, source)
+  vim.api.nvim_buf_delete(other, { force = true })
+
+  -- A window already attached to this buffer is left exactly as it is. S is
+  -- the sharper case: forcing R here would undo a toggle.
+  md.toggle()
+  truthy('8.5 in S on the fixture', wait_until(showing_source))
+  before = engine_calls
+  md.attach_current()
+  vim.wait(100)
+  expect('8.5 an attached window is left in S', current_state().mode, 'S')
+  expect('8.5 and nothing was rendered', engine_calls, before)
+
+  md.toggle()
+  truthy('8.5 back in R', wait_until(showing_rendered))
+end)
+
+--------------------------------------------------------------------------------
+-- 9.1 The health module's two halves
+--------------------------------------------------------------------------------
+
+section('9.1', function()
+  local health = require('md-render.health')
+  expect('9.1 probe is a function', type(health.probe), 'function')
+  expect('9.1 check is a function', type(health.check), 'function')
+
+  -- `check()` is presentation only; stubbing the health API is what lets the
+  -- check see what it would have printed without opening a health buffer.
+  local calls = {}
+  local saved = {}
+  for _, name in ipairs({ 'start', 'ok', 'warn', 'error', 'info' }) do
+    saved[name] = vim.health[name]
+    vim.health[name] = function(msg)
+      calls[#calls + 1] = { kind = name, msg = msg }
+    end
+  end
+  local ok, err = pcall(health.check)
+  for name, fn in pairs(saved) do
+    vim.health[name] = fn
+  end
+
+  check('9.1 check() renders without raising', ok, tostring(err))
+  truthy('9.1 it starts an md-render section',
+    calls[1] ~= nil and calls[1].kind == 'start' and calls[1].msg:find('md%-render') ~= nil,
+    vim.inspect(calls[1]))
+
+  local printed = {}
+  for _, call in ipairs(calls) do
+    printed[#printed + 1] = call.msg
+  end
+  local all = table.concat(printed, '\n')
+  for _, name in ipairs({
+    'Neovim', 'engine', '--version', 'wire format', "'termguicolors'", 'filetypes',
+  }) do
+    truthy('9.1 it reports ' .. name, all:find(name, 1, true) ~= nil, all)
+  end
+end)
+
+--------------------------------------------------------------------------------
+-- 9.2 :checkhealth leaves the document and the window alone
+--------------------------------------------------------------------------------
+
+section('9.2', function()
+  local health = require('md-render.health')
+  truthy('9.2 in R on the fixture', reset_to_r())
+  local win = vim.api.nvim_get_current_win()
+  local st = current_state()
+  local source, rendered = st.source, st.rendered
+  local lines = vim.api.nvim_buf_get_lines(source, 0, -1, false)
+  local tick = vim.api.nvim_buf_get_changedtick(source)
+
+  -- Two engine calls, never a render of the buffer on screen.
+  local before = engine_calls
+  local report = health.probe()
+  expect('9.2 probe runs the engine twice', engine_calls - before, 2)
+  expect('9.2 and leaves the source unchanged',
+    vim.api.nvim_buf_get_changedtick(source), tick)
+  expect('9.2 and the window in R', vim.api.nvim_win_get_buf(win), rendered)
+  expect('9.2 reading the wire version', report.wire, 1)
+
+  -- `:checkhealth` opens a health buffer of its own. Whatever it does to the
+  -- layout, the document and the window's mode have to survive it.
+  local ok, err = pcall(vim.cmd, 'checkhealth md-render')
+  check('9.2 :checkhealth md-render opens', ok, tostring(err))
+  vim.wait(100)
+  local health_buf = vim.api.nvim_get_current_buf()
+  if vim.api.nvim_get_current_win() ~= win then
+    vim.cmd('close')
+  end
+  md.show_rendered(win)
+  truthy('9.2 the window returns to R', wait_until(function()
+    return vim.api.nvim_win_get_buf(win) == rendered
+  end))
+  eq_table('9.2 the source still holds its lines',
+    vim.api.nvim_buf_get_lines(source, 0, -1, false), lines)
+  if vim.api.nvim_buf_is_valid(health_buf) and health_buf ~= source
+    and health_buf ~= rendered then
+    pcall(vim.api.nvim_buf_delete, health_buf, { force = true })
+  end
+end)
+
+--------------------------------------------------------------------------------
+-- 9.3 Healthy, missing, mismatched and without truecolor
+--------------------------------------------------------------------------------
+
+section('9.3', function()
+  local health = require('md-render.health')
+  local saved_engine = config.options.engine
+
+  local function find(report, name)
+    for _, item in ipairs(report.checks) do
+      if item.name == name then
+        return item
+      end
+    end
+  end
+
+  -- Healthy: whatever step the local checkout resolves on.
+  config.options.engine = saved_engine
+  local report = health.probe()
+  truthy('9.3 a healthy engine reports ok', report.ok, vim.inspect(report.checks))
+  truthy('9.3 and names the resolution step',
+    type(report.step) == 'string' and report.step ~= '', tostring(report.step))
+  truthy('9.3 and its path', type(report.engine) == 'string' and report.engine ~= '',
+    tostring(report.engine))
+  expect('9.3 and the wire version', report.wire, 1)
+  truthy('9.3 and the --version output',
+    type(report.version) == 'string' and report.version ~= '', tostring(report.version))
+  eq_table('9.3 and the configured filetypes', report.filetypes, config.options.filetypes)
+
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, 'p')
+
+  -- Missing: the report fails and says where the path came from.
+  config.options.engine = dir .. '/not-here'
+  report = health.probe()
+  check('9.3 a missing engine fails the report', report.ok == false, vim.inspect(report))
+  local engine_check = find(report, 'engine')
+  truthy('9.3 the engine check explains the path',
+    engine_check ~= nil and engine_check.ok == false
+      and engine_check.detail:find('not%-here') ~= nil,
+    engine_check and engine_check.detail)
+  truthy('9.3 and offers remediation',
+    engine_check ~= nil and type(engine_check.remediation) == 'string',
+    engine_check and engine_check.remediation)
+
+  -- Wire mismatch: the engine runs but speaks a different format.
+  local wire2 = stand_in_engine(dir, 'wire2', {
+    '@echo off',
+    'if "%1"=="--version" (',
+    '  echo md-render 9.9.9',
+    '  exit /b 0',
+    ')',
+    'echo {"version":2,"lines":[],"styles":[]}',
+    'exit /b 0',
+  }, {
+    'if [ "$1" = "--version" ]; then',
+    '  echo "md-render 9.9.9"',
+    '  exit 0',
+    'fi',
+    "echo '{\"version\":2,\"lines\":[],\"styles\":[]}'",
+    'exit 0',
+  })
+  config.options.engine = wire2
+  report = health.probe()
+  check('9.3 a wire mismatch fails the report', report.ok == false, vim.inspect(report))
+  local wire_check = find(report, 'wire format')
+  truthy('9.3 and names both versions',
+    wire_check ~= nil and wire_check.detail:find('2', 1, true) ~= nil
+      and wire_check.detail:find('expects 1', 1, true) ~= nil,
+    wire_check and wire_check.detail)
+  truthy('9.3 and offers remediation',
+    wire_check ~= nil and type(wire_check.remediation) == 'string'
+      and wire_check.remediation:find('Rebuild', 1, true) ~= nil,
+    wire_check and wire_check.remediation)
+
+  -- No truecolor: a warning with a remedy, not a failure. CI runs headless,
+  -- where `'termguicolors'` is off, and the plugin still works there.
+  config.options.engine = saved_engine
+  local saved_tgc = vim.o.termguicolors
+  vim.o.termguicolors = false
+  report = health.probe()
+  expect('9.3 without truecolor the report says so', report.termguicolors, false)
+  expect('9.3 and images resolve to ascii', report.image_encoding, 'ascii')
+  local tgc = find(report, "'termguicolors'")
+  expect('9.3 as a warning', tgc and tgc.severity, 'warn')
+  truthy('9.3 with remediation', tgc ~= nil and type(tgc.remediation) == 'string',
+    tgc and tgc.remediation)
+  truthy('9.3 which does not fail the report', report.ok, vim.inspect(report.checks))
+
+  vim.o.termguicolors = saved_tgc
+  config.options.engine = saved_engine
+  pcall(vim.fn.delete, dir, 'd')
+end)
+
+--------------------------------------------------------------------------------
+-- 10.3 `:help md-render` resolves
+--------------------------------------------------------------------------------
+
+section('10.3', function()
+  local help_file = repo .. '/doc/md-render.txt'
+  truthy('10.3 the help file exists', vim.uv.fs_stat(help_file) ~= nil, help_file)
+  truthy('10.3 and the tags file is tracked',
+    vim.uv.fs_stat(repo .. '/doc/tags') ~= nil, repo .. '/doc/tags')
+
+  local function resolves(tag)
+    local before = #vim.api.nvim_list_wins()
+    local ok, err = pcall(vim.cmd, 'help ' .. tag)
+    local name = vim.api.nvim_buf_get_name(0)
+    while #vim.api.nvim_list_wins() > before do
+      vim.cmd('close')
+    end
+    return ok and name:find('md%-render%.txt$') ~= nil, tostring(err)
+  end
+
+  for _, tag in ipairs({
+    'md-render',
+    ':MdRenderToggle',
+    ':MdRenderShow',
+    ':MdRenderSource',
+    ':MdRenderReset',
+    'md-render.setup()',
+    'md-render-options',
+    'md-render-commands',
+    'md-render-keymaps',
+  }) do
+    check('10.3 :help ' .. tag .. ' resolves', resolves(tag), 'did not open md-render.txt')
+  end
+end)
+
+--------------------------------------------------------------------------------
+-- 10.4 The help covers the public surface
+--------------------------------------------------------------------------------
+
+section('10.4', function()
+  local text = table.concat(vim.fn.readfile(repo .. '/doc/md-render.txt'), '\n')
+
+  local function between(start_tag, end_tag)
+    local body = text:match('%*' .. start_tag .. '%*(.-)%*' .. end_tag .. '%*')
+    return body or ''
+  end
+
+  -- The options section runs from its heading to the commands heading; the
+  -- keymaps section likewise. Searching only there is what makes "documented"
+  -- mean "documented as an option", not "mentioned somewhere".
+  local options = between('md%-render%-options', 'md%-render%-commands')
+  local keymaps = between('md%-render%-keymaps', 'md%-render%-links')
+  truthy('10.4 the options section is found', options ~= '', 'no *md-render-options* section')
+  truthy('10.4 the keymaps section is found', keymaps ~= '', 'no *md-render-keymaps* section')
+
+  for key in pairs(config.defaults) do
+    truthy('10.4 option ' .. key .. ' is documented',
+      options:find(key, 1, true) ~= nil, key .. ' is missing from *md-render-options*')
+  end
+  for key in pairs(config.defaults.keymaps) do
+    truthy('10.4 keymap ' .. key .. ' is documented',
+      keymaps:find(key, 1, true) ~= nil, key .. ' is missing from *md-render-keymaps*')
+  end
+
+  local plugin = table.concat(vim.fn.readfile(repo .. '/plugin/md-render.lua'), '\n')
+  local commands = 0
+  for name in plugin:gmatch("nvim_create_user_command%(%s*'([%w]+)'") do
+    commands = commands + 1
+    truthy('10.4 command :' .. name .. ' is documented',
+      text:find(name, 1, true) ~= nil, name .. ' is missing from the help file')
+  end
+  expect('10.4 the commands were found', commands, 4)
+end)
+
+--------------------------------------------------------------------------------
+-- 7.3 Engine resolution order
+--------------------------------------------------------------------------------
+
+section('7.3', function()
+  local bin_dir = repo .. '/bin'
+  local bin_name = is_windows and 'md-render.exe' or 'md-render'
+  local bin_engine = bin_dir .. '/' .. bin_name
+  local data_dir = vim.fn.stdpath('data') .. '/md-render'
+  local data_engine = data_dir .. '/' .. bin_name
+
+  if not vim.uv.fs_stat(bin_engine) then
+    -- A data-directory-only run (no bin/): the step this section owns is the
+    -- data-directory fallback, so check that and leave the bin/ comparisons to
+    -- a run that has one.
+    local resolved, step = engine_mod.resolve(nil)
+    expect('7.3 with no bin/, the data directory resolves', resolved, data_engine)
+    expect('7.3 and names the data-directory step', step, 'data directory')
+    return
+  end
+
+  -- The data directory is the user's, so anything already there is put back
+  -- afterwards: a check that passes by deleting someone's engine is not a
+  -- check worth having.
+  local backup = data_engine .. '.mdrn-test-backup'
+  local had_data = vim.uv.fs_stat(data_engine) ~= nil
+  if had_data then
+    assert(vim.uv.fs_rename(data_engine, backup))
+  end
+  vim.fn.mkdir(data_dir, 'p')
+  assert(vim.uv.fs_copyfile(bin_engine, data_engine))
+
+  local hidden_bin = bin_engine .. '.mdrn-test-hidden'
+  local bin_hidden = false
+
+  local function hide_bin()
+    assert(vim.uv.fs_rename(bin_engine, hidden_bin))
+    bin_hidden = true
+  end
+
+  local function restore_bin()
+    if bin_hidden then
+      vim.uv.fs_rename(hidden_bin, bin_engine)
+      bin_hidden = false
+    end
+  end
+
+  local ok, err = pcall(function()
+    -- The repository's bin/ is ahead of the data directory, so a fresh local
+    -- build is not shadowed by an older download.
+    local resolved, step = engine_mod.resolve(nil)
+    check('7.3 bin/ wins over the data directory', same_path(resolved, bin_engine),
+      tostring(resolved))
+    expect('7.3 and names the bin/ step', step, 'bin/')
+
+    hide_bin()
+    resolved, step = engine_mod.resolve(nil)
+    check('7.3 the data directory is found when bin/ is absent', same_path(resolved, data_engine),
+      tostring(resolved))
+    expect('7.3 and names the data-directory step', step, 'data directory')
+    restore_bin()
+
+    -- A file that exists but cannot run is skipped, not reported as found and
+    -- then failed on later.
+    if not is_windows then
+      hide_bin()
+      vim.fn.setfperm(data_engine, 'rw-------')
+      resolved = engine_mod.resolve(nil)
+      expect('7.3 a non-executable candidate is skipped', resolved, nil)
+      vim.fn.setfperm(data_engine, 'rwx------')
+
+      -- A configured path is authoritative: when it cannot run, the search
+      -- must not quietly fall through to another engine.
+      resolved, step = engine_mod.resolve(data_engine)
+      expect('7.3 a configured non-executable path fails', resolved, nil)
+      truthy('7.3 and its message names the path',
+        type(step) == 'string' and step:find(data_engine, 1, true) ~= nil, tostring(step))
+      restore_bin()
+    end
+
+    -- The same rule for a path that is simply not there, which is the case a
+    -- Windows test can share.
+    resolved, step = engine_mod.resolve(data_dir .. '/not-here')
+    expect('7.3 a configured missing path fails', resolved, nil)
+    truthy('7.3 and its message names the missing path',
+      type(step) == 'string' and step:find('not%-here') ~= nil, tostring(step))
+  end)
+
+  restore_bin()
+  vim.uv.fs_unlink(data_engine)
+  if had_data then
+    vim.uv.fs_rename(backup, data_engine)
+  else
+    -- Only when this check created the directory: `:delete dir` removes an
+    -- empty one and does nothing when anything else is there.
+    pcall(vim.fn.delete, data_dir, 'd')
+  end
+
+  if not ok then
+    error(err, 0)
+  end
+end)
+
+--------------------------------------------------------------------------------
+-- 7.4 A wire version the plugin does not understand
+--------------------------------------------------------------------------------
+
+section('7.4', function()
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, 'p')
+  local wire2 = stand_in_engine(dir, 'wire2',
+    { '@echo {"version":2,"lines":[],"styles":[]}', '@exit /b 0' },
+    { 'echo \'{"version":2,"lines":[],"styles":[]}\'', 'exit 0' })
+
+  local before = #notifications
+  config.setup({ engine = wire2, theme = 'wire-mismatch' })
+  vim.cmd('edit! ' .. vim.fn.fnameescape(fixture))
+  md.attach(vim.api.nvim_get_current_buf(), vim.api.nvim_get_current_win())
+  truthy('7.4 the mismatch is reported', wait_until(function()
+    return #notifications > before
+  end))
+
+  local seen = notifications[#notifications]
+  expect('7.4 as an error', seen.level, vim.log.levels.ERROR)
+  truthy('7.4 naming the version the engine speaks',
+    seen.msg:find('format 2', 1, true) ~= nil, seen.msg)
+  truthy('7.4 and the version the plugin expects',
+    seen.msg:find('expects 1', 1, true) ~= nil, seen.msg)
+
+  local st = current_state()
+  expect('7.4 the window stays in S', st.mode, 'S')
+  truthy('7.4 showing the source',
+    vim.api.nvim_win_get_buf(st.win) == st.source)
+
+  config.setup({})
+  vim.fn.delete(dir, 'rf')
 end)
 
 --------------------------------------------------------------------------------

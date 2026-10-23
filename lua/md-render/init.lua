@@ -548,6 +548,49 @@ function M.attach(buf, win)
   sync(st)
 end
 
+--- Attach `win` when it is showing the managed buffer `buf`.
+---
+--- `setup()` and the startup file can run after `FileType` and `BufWinEnter`
+--- have already fired: a lazy.nvim `ft = 'markdown'` load is exactly that, and
+--- so is a user who calls `setup()` from an autocmd. Without this the buffer on
+--- screen would stay in S until it was reopened.
+---
+--- Everything is re-checked here rather than captured when the call was
+--- scheduled: the window may have moved to another buffer in between. A window
+--- already attached to `buf` is left alone, so the call cannot undo a toggle
+--- to S or start a second render.
+function M.attach_current(buf, win)
+  buf = buf or vim.api.nvim_get_current_buf()
+  win = win or vim.api.nvim_get_current_win()
+  if not vim.api.nvim_buf_is_valid(buf) or not vim.api.nvim_win_is_valid(win) then
+    return
+  end
+  if vim.api.nvim_win_get_buf(win) ~= buf then
+    return
+  end
+  if not config.manages(vim.bo[buf].filetype) then
+    return
+  end
+  local st = state.windows[win]
+  if st and st.source == buf then
+    return
+  end
+  M.attach(buf, win)
+end
+
+--- Attach the current window once the current event has finished.
+---
+--- Deferred because both callers run inside an autocmd or a `setup()` that may
+--- itself be inside one, and swapping the window's buffer mid-event is exactly
+--- the re-entrancy the R↔S transitions avoid elsewhere.
+function M.attach_current_soon()
+  local buf = vim.api.nvim_get_current_buf()
+  local win = vim.api.nvim_get_current_win()
+  vim.schedule(function()
+    M.attach_current(buf, win)
+  end)
+end
+
 --- Forget everything about `win`.
 function M.detach(win)
   state.forget(win)
@@ -1122,6 +1165,11 @@ end
 function M.setup(opts)
   local options = config.setup(opts)
   M.setup_autocmds()
+  -- `setup()` can run after the buffer on screen was already opened, which is
+  -- what a lazy `ft = 'markdown'` load looks like: `FileType` has fired and
+  -- nothing will fire it again. Attaching here is what makes the first buffer
+  -- show R without a reopen.
+  M.attach_current_soon()
   return options
 end
 

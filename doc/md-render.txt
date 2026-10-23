@@ -1,0 +1,420 @@
+*md-render.txt*   Rendered markdown in a Neovim buffer           *md-render*
+
+Rendered markdown in the window, with one key back to the source. The plugin
+shows a markdown file as the engine laid it out — headings, tables, diagrams,
+images and highlighted code — in a read-only buffer, and swaps the file's own
+buffer back on request. A managed window is always in one of two states:
+rendered (R) or source (S).
+
+The engine is a separate binary. The plugin never renders markdown itself; it
+spawns `md-render` and paints the JSON it writes. See
+|md-render-engine-resolution| for where the binary is looked for.
+
+==============================================================================
+CONTENTS                                              *md-render-contents*
+
+  1. Requirements ................................ |md-render-requirements|
+  2. Installation ................................ |md-render-installation|
+  3. Engine resolution ........................... |md-render-engine-resolution|
+  4. Setup ....................................... |md-render.setup()|
+  5. Options ..................................... |md-render-options|
+  6. Commands .................................... |md-render-commands|
+  7. Keymaps ..................................... |md-render-keymaps|
+  8. Links ....................................... |md-render-links|
+  9. Block preview and zoom ...................... |md-render-preview|
+ 10. Images and animation ........................ |md-render-images|
+ 11. Health ...................................... |md-render-health|
+ 12. Troubleshooting ............................. |md-render-troubleshooting|
+
+==============================================================================
+1. REQUIREMENTS                                       *md-render-requirements*
+
+  - Neovim 0.10 or newer.
+  - The `md-render` engine binary. It is shipped as a release asset; a source
+    build needs Rust 1.92 or newer.
+  - A terminal with `'termguicolors'` for image artwork in braille. Without
+    it, images fall back to the ASCII encoding and everything else is
+    unchanged.
+
+==============================================================================
+2. INSTALLATION                                       *md-render-installation*
+
+Put the plugin on 'runtimepath' with any package manager, then give it an
+engine. The engine is a separate download or build, not part of the plugin.
+
+Prebuilt engine:~
+Download the archive for your platform from
+https://github.com/Moler1995/markdown-rs.nvim/releases, unpack it, and put the
+binary at: >
+
+  <stdpath('data')>/md-render/md-render        (POSIX)
+  <stdpath('data')>/md-render/md-render.exe    (Windows)
+<
+`stdpath('data')` is `~/.local/share/nvim` on Linux and macOS and
+`~/AppData/Local/nvim-data` on Windows.
+
+Source build:~
+From a checkout of this repository: >
+
+  cargo build --release -p md-render
+  mkdir -p bin
+  cp target/release/md-render bin/md-render
+<
+PowerShell: >
+
+  cargo build --release -p md-render
+  New-Item -ItemType Directory -Force bin | Out-Null
+  Copy-Item target/release/md-render.exe bin/md-render.exe
+<
+A copy in the repository's `bin/` is what a plugin on 'runtimepath' from that
+checkout runs. Rebuild and copy after changing the engine.
+
+lazy.nvim:~
+>lua
+  {
+    'Moler1995/markdown-rs.nvim',
+    event = { 'BufReadPre *.md', 'BufNewFile *.md' },
+    build = 'cargo build --release -p md-render && mkdir -p bin '
+      .. '&& cp target/release/md-render bin/md-render',
+    config = function()
+      require('md-render').setup({})
+    end,
+  }
+<
+vim.pack:~
+>lua
+  vim.pack.add({ 'https://github.com/Moler1995/markdown-rs.nvim' })
+  require('md-render').setup({})
+<
+mini.deps:~
+>lua
+  MiniDeps.add({ source = 'Moler1995/markdown-rs.nvim' })
+  require('md-render').setup({})
+<
+Without a build hook, download the engine as described above. The plugin does
+not fetch anything at startup.
+
+==============================================================================
+3. ENGINE RESOLUTION                              *md-render-engine-resolution*
+
+The engine is resolved in this order:
+
+  1. the `engine` option, used as given — authoritative;
+  2. `md-render` on `$PATH`;
+  3. `<plugin-root>/bin/md-render[.exe]` — a local build;
+  4. `<stdpath('data')>/md-render/md-render[.exe]` — a downloaded release.
+
+A configured `engine` that is missing or not executable is an error; the
+plugin does not fall through to another location, because that would hide a
+configuration mistake behind a different binary. The automatic steps are each
+checked with `executable()`, so a file that exists but cannot run is skipped.
+
+The repository's `bin/` is ahead of the data directory so that a fresh local
+build is not shadowed by an older download. |:checkhealth| reports which step
+matched, which is how a `PATH` shadow becomes visible.
+
+==============================================================================
+4. SETUP                                                  *md-render.setup()*
+
+>lua
+  require('md-render').setup({ })
+<
+Merges the given options over the defaults; every field is optional and the
+merge is deep. The startup file already installs the autocmds and commands, so
+`setup()` is needed only to change an option. Calling it more than once is
+safe: the autocmds and buffer keymaps are installed once.
+
+`setup()` and the startup file both attach the markdown buffer already in the
+window, so a package manager that loads the plugin from `FileType` still shows
+the first buffer rendered, without reopening it.
+
+==============================================================================
+5. OPTIONS                                              *md-render-options*
+
+Every top-level key in `config.defaults`, with its default. Set a keymap to
+`false` to leave that key alone.
+
+`engine` (default `nil`)~
+  Path to the engine binary. `nil` or the empty string means "resolve it"; see
+  |md-render-engine-resolution|. A set path must be executable.
+
+`theme` (default `'catppuccin_mocha'`)~
+  Theme passed to the engine as `--theme`. Determines the palette of the
+  rendered view.
+
+`filetypes` (default `{ 'markdown' }`)~
+  Filetypes whose buffers open in R. A buffer not listed is left alone: no
+  state, no autocmds, no keymaps.
+
+`image_mode` (default `'auto'`)~
+  How images are drawn: `'auto'` (`braille` with `'termguicolors'`, otherwise
+  `ascii`), `'braille'`, `'quads'`, `'blocks'`, `'ascii'` or `'off'`. `'off'`
+  shows every image as its alt text. See |md-render-images|.
+
+`image_palette` (default `'auto'`)~
+  Where cell colours come from: `'auto'` (`full` for one-colour cells,
+  `adaptive` for two-colour cells), `'theme'`, `'adaptive'` or `'full'`.
+
+`image_background` (default `'terminal'`)~
+  What transparent pixels are composited against: `'terminal'` (leave them to
+  the terminal), `'theme'` or an `'#rrggbb'` colour.
+
+`image_dither` (default `'auto'`)~
+  Whether quantisation is ordered-dithered: `'auto'`, `true` or `false`.
+
+`image_min_rows` (default `0`)~
+  Enlarge a small image to at least this many display rows. Zero never
+  enlarges.
+
+`image_sharpen` (default `false`)~
+  Unsharp-mask an image that was reduced to fit the page.
+
+`image_max_height` (default `20`)~
+  The most display rows one inline image may occupy. `false` removes the cap.
+  The preview popup has its own height and is not affected.
+
+`image_animation` (default `true`)~
+  Fetch an animated image's frames so |keymaps.frame_next| can step through
+  them. `false` renders every image as its first frame.
+
+`keymaps` (default below)~
+  Buffer-local maps for R, S and the preview popup. Every key is optional and
+  may be `false`; see |md-render-keymaps| for what each one does.
+>lua
+  keymaps = {
+    toggle = '<leader>mr',
+    write = '<C-s>',
+    preview = '<CR>',
+    follow = 'gf',
+    follow_tab = 'gF',
+    open_image = 'gx',
+    frame_next = '<C-n>',
+    pause = '<Space>',
+    zoom_in = '+',
+    zoom_out = '-',
+    scroll_left = '<C-h>',
+    scroll_right = '<C-l>',
+  }
+<
+`preview` (default below)~
+  The popup's caps as fractions of the editor's size. The popup is sized to
+  fit the block and only then clamped.
+>lua
+  preview = { max_width_pct = 0.9, max_height_pct = 0.9 }
+<
+`resize_debounce` (default `100`)~
+  Milliseconds to coalesce resizes and edits before re-rendering. Toggles are
+  applied immediately and are not delayed.
+
+==============================================================================
+6. COMMANDS                                            *md-render-commands*
+
+                                                        *:MdRenderToggle*
+:MdRenderToggle        Swap between R and S in the current window. The same
+                        thing |keymaps.toggle| does.
+
+                                                        *:MdRenderShow*
+:MdRenderShow          Show R in the current window, whether or not it is
+                        already showing.
+
+                                                        *:MdRenderSource*
+:MdRenderSource        Show the source buffer in the current window.
+
+                                                        *:MdRenderReset*
+:MdRenderReset         Forget every cached render and every highlight group
+                        made for a rendered style. Use it after changing the
+                        engine or the theme by hand. It does not reload the
+                        plugin; see |md-render-troubleshooting|.
+
+==============================================================================
+7. KEYMAPS                                             *md-render-keymaps*
+
+R is the rendered view, S the source. "Both" means the map is set in each.
+
+|keymaps.toggle| (both, default `<leader>mr`)~
+  Swap between R and S. In normal mode, crossing lands on the source line the
+  display line came from.
+
+|keymaps.write| (both, default `<C-s>`)~
+  Write the source buffer, even from R.
+
+|keymaps.follow| (both, default `gf`)~
+  Follow the link under the cursor. See |md-render-links|. It shadows Vim's
+  `gf` in a managed buffer and hands the key back to Vim when the cursor is
+  not on a link.
+
+|keymaps.follow_tab| (both, default `gF`)~
+  Follow a file link in a new tab, leaving R where it is. A URL or an anchor
+  still acts in place.
+
+|keymaps.preview| (R, default `<CR>`)~
+  Preview the table, mermaid fence or image under the cursor in a popup; press
+  again to close. See |md-render-preview|.
+
+|keymaps.open_image| (R, default `gx`)~
+  Open the image under the cursor with the system's default application.
+  Off an image the key goes back to Vim.
+
+|keymaps.frame_next| (R and the popup, default `<C-n>`)~
+  Show the next frame of the animated image under the cursor. In the popup it
+  steps while playback is paused.
+
+|keymaps.pause| (popup, default `<Space>`)~
+  Pause or resume an animation playing in the popup. Bound only while an
+  animated image is showing.
+
+|keymaps.zoom_in| (popup, default `+`)~
+  Restore the largest layout of a diagram. See |md-render-preview|.
+
+|keymaps.zoom_out| (popup, default `-`)~
+  Re-lay a diagram out at the popup's inner width, or at the narrowest whole
+  layout when that is still too wide.
+
+|keymaps.scroll_left| (popup, default `<C-h>`)~
+  Scroll the popup sideways by the horizontal step of 'mousescroll'.
+
+|keymaps.scroll_right| (popup, default `<C-l>`)~
+  The same to the right.
+
+Insert-entry keys (R only, not configurable)~
+  `i`, `a`, `I`, `A`, `o` and `O` cross to S with the cursor on the source
+  line the display line came from, and then hand the key to Vim. They are the
+  mode's escape hatch, not a convenience, which is why they are fixed.
+  `Esc` is deliberately not one of them: leaving insert mode is Vim's
+  business, and a view that came back on `Esc` could not be edited in.
+
+==============================================================================
+8. LINKS                                                    *md-render-links*
+
+`gf` and `gF` open what is under the cursor:
+
+  - a file, resolved relative to the document holding the link; an absolute
+    destination is used as given. `gF` opens it in a new tab;
+  - a URL, through `vim.ui.open`;
+  - an anchor — `#section` on its own or after a path — which scrolls to the
+    heading it names.
+
+In R the link is read from the source text: the display row is first mapped
+back to the source line it came from, so the engine's output does not need to
+carry link targets. A rendered mermaid diagram can carry links of its own — a
+`click NODE href "..."` directive — and the node's label is underlined (the
+`MdRenderLink` group) so it is visible. The hint follows the follow keys: with
+both set to `false` there is nothing to follow and no underline.
+
+Following a file leaves a real jumplist entry at the source line, so `<C-o>`
+comes back to the document and renders it again. The plugin's own R↔S swaps do
+not add jumplist entries.
+
+When the cursor is not on a link the key goes back to Vim, so a path written
+as plain text still opens the way `gf` always did.
+
+==============================================================================
+9. BLOCK PREVIEW AND ZOOM                               *md-render-preview*
+
+A diagram or table wider than the window is clipped: the columns the engine
+drops are not in the rendered buffer, so scrolling sideways cannot recover
+them. `<CR>` on a ` ```mermaid ` fence or a table re-renders that block at a
+budget of its own in a popup:
+
+  - a diagram is laid out at the engine's largest budget, so nothing is
+    clipped;
+  - a table is laid out at the popup's inner width floored at the window's,
+    because a table wraps rather than clips.
+
+`-` re-renders the diagram at the popup's inner width; if that is still
+clipped, it re-renders at the narrowest layout the engine can produce whole and
+adopts it only when it is whole and narrower. `+` restores the largest layout.
+A spent key returns without spawning the engine. A cropped layout is never
+shown. The title says the width a zoomed-out diagram is laid out at.
+
+`<C-h>` and `<C-l>` scroll the popup sideways by the horizontal step of
+'mousescroll' and can be held down. They work in a table's popup too.
+
+`<CR>`, `q` and `Esc` close the popup; the window underneath is untouched. On
+anything other than a diagram, table or image, `<CR>` keeps its ordinary
+meaning.
+
+==============================================================================
+10. IMAGES AND ANIMATION                                 *md-render-images*
+
+A markdown image is drawn as character-cell artwork. PNG, JPEG, GIF, WebP, BMP,
+TIFF and ICO are supported. An image that cannot be drawn — a URL, a missing
+file, an unsupported format, one over the engine's limits — is shown as its alt
+text and nothing is reported: a picture the reader cannot see is not an error
+in the document. Images inside a table cell or a heading stay as alt text.
+
+Fitting~
+  The image is fitted to the window's text width and height, and to
+  |image_max_height| when that is smaller. It is never enlarged unless
+  |image_min_rows| asks for it. Resizing the window redraws it at the new size.
+  The preview popup is not capped by |image_max_height|.
+
+Animation~
+  An animated GIF or WebP is drawn on its first frame and does not play by
+  itself. |keymaps.frame_next| advances it one frame, wrapping at the end, and
+  goes back to Vim off an animated image. Frames are fetched the first time the
+  key is pressed, so a document that is never stepped through never pays for
+  decoding them. An animation over 256 frames is sampled down, keeping the
+  loop's duration. One that would decode more than 4,096 frames or past the
+  engine's pixel budget is refused, drawn on its first frame, and reported once
+  when the step key is pressed. |image_animation| = `false` turns the frames
+  off entirely.
+
+  In the preview popup the image plays: each frame is shown for its own delay,
+  with a 100 ms floor, and the loop repeats until the popup closes.
+  |keymaps.pause| pauses and resumes; stepping works while paused.
+
+`gx`~
+  Opens the image's file with the operating system's default application.
+  Relative destinations resolve against the document's directory. A remote
+  URL, a `data:` URI or a missing file is reported, not fetched.
+
+==============================================================================
+11. HEALTH                                                 *md-render-health*
+
+`:checkhealth md-render` reports:
+
+  - whether Neovim is new enough;
+  - the resolved engine path and the step that matched;
+  - the engine's `--version` output;
+  - the wire format version from a minimal render, and whether this plugin
+    understands it;
+  - `'termguicolors'` and the image encoding it implies (a warning, not a
+    failure);
+  - the configured filetypes.
+
+It runs the engine twice, with a timeout, and never renders the buffer you are
+looking at. A failure names the value and the remedy.
+
+==============================================================================
+12. TROUBLESHOOTING                              *md-render-troubleshooting*
+
+Engine not found~
+  `:checkhealth md-render` prints every location searched. Build the engine
+  into the plugin's `bin/`, or download a release into
+  `<stdpath('data')>/md-render/`. A configured `engine` path is authoritative,
+  so an old path in your config wins over everything else.
+
+Wire format mismatch~
+  The message "speaks wire format N, but this plugin expects M" means the
+  plugin and the engine are from different revisions. Rebuild the engine from
+  the checkout (`cargo build --release -p md-render`) or upgrade both together.
+
+No truecolor~
+  Without `'termguicolors'`, images use the ASCII encoding. Enable it
+  (`vim.o.termguicolors = true`) for braille artwork. Text, tables and
+  diagrams are unaffected.
+
+Lazy loading~
+  Loading the plugin from `FileType` is supported: the buffer that triggered
+  the event is attached and rendered without reopening it. If a buffer stays
+  in S, check that its filetype is in |filetypes|.
+
+Stale modules after an edit~
+  Editing `lua/md-render/` while Neovim runs does not reload the module:
+  restart Neovim. `:MdRenderReset` only clears cached renders and highlight
+  groups, which is what to use after changing the engine binary or the
+  colourscheme.
+
+==============================================================================
+vim:tw=78:ts=8:noet:ft=help:norl:

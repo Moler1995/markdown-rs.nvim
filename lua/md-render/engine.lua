@@ -6,39 +6,101 @@
 
 local M = {}
 
-local uv = vim.uv or vim.loop
 local unpack = table.unpack or unpack
+
+--- The wire format this plugin understands.
+---
+--- The engine writes it into every document as `version`. A binary from a
+--- different revision can still parse a markdown file, so without this check a
+--- stale engine would render into a format the plugin reads wrongly rather than
+--- fail loudly. Bump it in the engine's `wire.rs` when the shape changes, and
+--- bump it here at the same time.
+M.WIRE_VERSION = 1
+
+--- The names the engine is installed under, in the order to try them.
+---
+--- Windows needs the `.exe`; POSIX does not. Trying the platform's name first
+--- keeps the other name from winning on a file that happens to be executable
+--- there too.
+local function engine_names()
+  if vim.fn.has('win32') == 1 then
+    return { 'md-render.exe', 'md-render' }
+  end
+  return { 'md-render', 'md-render.exe' }
+end
+
+--- The directory the plugin's own files live in: `<repo>`, or a package's root.
+local function plugin_root()
+  local here = debug.getinfo(1, 'S').source:sub(2)
+  return vim.fn.fnamemodify(here, ':h:h:h')
+end
+
+--- The directory a downloaded engine goes in.
+local function data_dir()
+  return vim.fn.stdpath('data') .. '/md-render'
+end
 
 --- Resolve the engine binary.
 --
---- An explicit path in the config wins. Otherwise `md-render` on PATH, and
---- failing that `<repo>/bin/md-render.exe` — a build copied into the repository
---- so that it works with no PATH edit. That binary is not committed, so a
---- fresh clone has to build it; see `docs/porting.md`.
+--- Four steps, in order:
+--
+---   1. the configured `engine` path, used as given;
+---   2. `md-render` on `PATH`;
+---   3. `<plugin-root>/bin/md-render[.exe]`, a build copied next to the
+---      checkout;
+---   4. `<stdpath('data')>/md-render/md-render[.exe]`, where a downloaded
+---      release goes.
+--
+--- The configured path is authoritative: when it is missing or not executable
+--- the search stops there, because falling through would silently run a
+--- different engine than the one the user named. The remaining steps are
+--- automatic, and each candidate is checked with `vim.fn.executable` so a file
+--- that exists but cannot run is skipped instead of failing later with EACCES.
 ---
---- Returns `nil` when neither exists; the caller reports that.
+--- Returns `path, step` on success, where `step` names the step that matched
+--- (`'engine option'`, `'PATH'`, `'bin/'` or `'data directory'`). Returns
+--- `nil, message` on failure, where the message names every location searched
+--- and both ways of obtaining the engine.
 function M.resolve(explicit)
   if explicit and explicit ~= '' then
-    return explicit
+    if vim.fn.executable(explicit) == 1 then
+      return explicit, 'engine option'
+    end
+    return nil, table.concat({
+      'the configured engine is not executable: ' .. explicit,
+      'Set `engine` to an executable path, or set it to nil to search PATH,',
+      "the plugin's bin/ directory and " .. data_dir() .. '.',
+    }, '\n')
   end
 
-  local on_path = vim.fn.exepath('md-render')
-  if on_path ~= '' then
-    return on_path
+  if vim.fn.executable('md-render') == 1 then
+    return vim.fn.exepath('md-render'), 'PATH'
   end
 
-  -- This file is <repo>/lua/md-render/engine.lua, so three `:h` steps reach
-  -- the repository root.
-  local here = debug.getinfo(1, 'S').source:sub(2)
-  local repo = vim.fn.fnamemodify(here, ':h:h:h')
-  for _, name in ipairs({ 'md-render.exe', 'md-render' }) do
-    local candidate = repo .. '/bin/' .. name
-    if uv.fs_stat(candidate) then
-      return candidate
+  local dirs = {
+    { plugin_root() .. '/bin', 'bin/' },
+    { data_dir(), 'data directory' },
+  }
+
+  local searched = { '  PATH' }
+  for _, dir in ipairs(dirs) do
+    for _, name in ipairs(engine_names()) do
+      local candidate = dir[1] .. '/' .. name
+      searched[#searched + 1] = '  ' .. candidate
+      if vim.fn.executable(candidate) == 1 then
+        return candidate, dir[2]
+      end
     end
   end
 
-  return nil
+  return nil, table.concat({
+    'the md-render engine was not found. Searched:',
+    unpack(searched),
+    '',
+    'Build it from a checkout with `cargo build --release -p md-render` and copy',
+    'the binary to ' .. plugin_root() .. '/bin, or download a release and put the',
+    'binary in ' .. data_dir() .. '.',
+  }, '\n')
 end
 
 --- Render `content` as `view` describes.
@@ -66,9 +128,10 @@ end
 --- touch buffers from it. `err` is a human-readable string; there is no case
 --- where both are set, and none where neither is.
 function M.render(opts, content, view, cb)
-  local exe = M.resolve(opts.engine)
+  local exe, step = M.resolve(opts.engine)
   if not exe then
-    cb('the md-render engine was not found: it is not on PATH and not in bin/')
+    -- `step` is the failure message when resolution fails.
+    cb(step)
     return
   end
 
@@ -159,6 +222,19 @@ function M.render(opts, content, view, cb)
         end
         if type(doc) ~= 'table' or type(doc.lines) ~= 'table' or type(doc.styles) ~= 'table' then
           cb('the engine produced a document with no lines or styles')
+          return
+        end
+
+        -- The document's shape is only safe to read when it is the shape this
+        -- plugin was written for. A stale binary is the common cause, so the
+        -- message names both versions and both remedies.
+        if doc.version ~= M.WIRE_VERSION then
+          local speaks = doc.version == nil and 'no wire version' or tostring(doc.version)
+          cb(string.format(
+            'the engine at %s speaks wire format %s, but this plugin expects %d. '
+              .. 'Rebuild the engine from this checkout (`cargo build --release -p md-render`), '
+              .. 'or upgrade the plugin and the engine together.',
+            exe, speaks, M.WIRE_VERSION))
           return
         end
 

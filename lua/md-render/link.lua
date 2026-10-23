@@ -352,9 +352,17 @@ end
 --- The GitHub-style anchor a heading line produces.
 ---
 --- `%p` is ASCII punctuation in Lua's default locale, so a CJK heading keeps
---- its characters rather than slugging to nothing.
+--- its characters rather than slugging to nothing. A hyphen and an underscore
+--- are punctuation too, but GitHub keeps both in the anchor it generates, so
+--- `## 使用 deepseek-recipe` is reachable as `#使用-deepseek-recipe` and
+--- dropping the inner hyphen would make that link resolve to nothing.
 function M.slug(text)
-  text = text:lower():gsub('%p', '')
+  text = text:lower():gsub('%p', function(c)
+    if c == '-' or c == '_' then
+      return c
+    end
+    return ''
+  end)
   text = vim.trim(text)
   return (text:gsub('%s+', '-'))
 end
