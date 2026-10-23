@@ -141,6 +141,10 @@ function M.goto(src, offset)
   -- key pressed after this step resolves its block from the row it finds
   -- (`M.preview` does), which is how a press once landed on the row above the
   -- table and fell through to Vim's own `<CR>`.
+  -- Named here as well as in `watch`, because every preview check moves the
+  -- cursor to its block before pressing the key.
+  M.watched = s.win
+  M.misplaced = nil
   for _ = 1, 20 do
     local row = render.row_for_source(s.doc, src)
     if not row then
@@ -150,13 +154,22 @@ function M.goto(src, offset)
     local line = row + 1 + (offset or 0)
     vim.api.nvim_win_set_cursor(s.win, { line, 0 })
     quiescent()
-    if s.doc == doc and vim.api.nvim_win_get_cursor(s.win)[1] == line then
-      break
+    -- Where the press is concerned, the document being the same is not the
+    -- whole of it: what `M.preview` resolves is the block under the cursor's
+    -- row, so the row has to be one that still names `src` in the layout the
+    -- window is showing. That is the frame in which a row placed against an
+    -- older layout is caught even if nothing else moved. An `offset` names a
+    -- row the construct does not own — a border above it — so the check is only
+    -- meaningful without one.
+    local placed = vim.api.nvim_win_get_cursor(s.win)[1]
+    local names = offset ~= nil or render.source_line_for(s.doc, placed - 1) == src
+    if s.doc == doc and placed == line and names then
+      return
     end
+    M.misplaced = string.format(
+      'wanted row %d for source %d, ended on row %d (layout %s)',
+      line - 1, src, placed - 1, tostring(s.doc and s.doc.width))
   end
-  -- Named here as well as in `watch`, because every preview check moves the
-  -- cursor to its block before pressing the key.
-  M.watched = s.win
 end
 
 --- Write what the window looks like now, for the driver to read.
@@ -289,7 +302,7 @@ function M.reset_wide_diagram()
   M.reset_wide(wide_diagram)
 end
 
---- Narrow the window showing R to `cols` columns, and wait for the re-render.
+--- Narrow the window showing R to `cols` columns.
 ---
 --- A split is the only way to make a window narrower than the editor, and that
 --- is the arrangement the preview's budget floor exists for: with a single
@@ -297,20 +310,32 @@ end
 --- A diagram's budget does not depend on the window at all, so the split is
 --- needed only to keep the window from being the wider of the two.
 ---
---- The wait is not for the resize but for what it schedules. The width change
---- fires `WinResized`, which debounces a re-render; `goto` resolves a source
---- line against the document, so a `goto` before that render lands would be
---- reading the old layout. The rendered buffer having come in to the new width
---- is the signal that it did.
+--- The resize is all this step does, and deliberately so. The re-render is not
+--- started by the resize but by `WinResized`, and Neovim delivers that event
+--- from its main loop rather than from inside `vim.wait`: measured on v0.10.4,
+--- the event arrived only once the wait that was waiting for it had returned.
+--- A step that resizes *and* waits for the result therefore waits for
+--- something that cannot happen until it stops waiting, times out after eight
+--- seconds, and reports the wide layout still in force — which on a slow runner
+--- left `goto` resolving a row against the old layout and the preview press
+--- falling through to Vim's own `<CR>`. The wait is `settled`, a step of its
+--- own: by the time its `:lua` reaches the server, the main loop has delivered
+--- the event and the debounced render is on its way.
 function M.narrow(cols)
   vim.cmd('vsplit')
   vim.cmd('wincmd p')
   vim.api.nvim_win_set_width(vim.api.nvim_get_current_win(), cols)
+end
+
+--- Wait until the window showing R is laid out for `cols` columns, and calm.
+---
+--- The rendered buffer's width is not enough on its own: a document laid out
+--- for the wide window and applied after the resize paints a buffer exactly as
+--- wide as that layout, so both have to agree before the layout is the one a
+--- row number means anything in. `width` is the budget the document was laid
+--- out at, which is the question `goto` is about to ask.
+function M.settled(cols)
   local s = st()
-  -- The buffer's width is not enough on its own: a document laid out for the
-  -- wide window and applied after the resize carries that layout's rows, and
-  -- the buffer it paints is as wide as that layout. `width` is the budget the
-  -- document was laid out at, which is the question `goto` is about to ask.
   vim.wait(8000, function()
     return s.rendered ~= nil
       and s.doc ~= nil and (s.doc.width or cols) <= cols
@@ -392,6 +417,11 @@ function M.preview_report(tag, want_open)
     'doc_width=' .. tostring(s.doc and s.doc.width or ''),
     'source_at_cursor=' .. tostring(
       (s.doc and render.source_line_for(s.doc, cursor[1] - 1)) or ''),
+    -- Whether the cursor the key was pressed with is where `goto` put it. A
+    -- press that falls through looks the same whether the cursor was placed on
+    -- prose or placed on a block and then left behind by a layout change, and
+    -- only this tells them apart.
+    'misplaced=' .. tostring(M.misplaced or ''),
     'popup_width=0',
     'popup_widest=0',
   }

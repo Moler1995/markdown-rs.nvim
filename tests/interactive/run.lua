@@ -483,7 +483,12 @@ local function body()
   -- single-kind check. Which budget each kind gets, and how far above the
   -- window's it is, is 5.3 and 5.4.
   md_call('reset_wide()')
+  -- Two steps, not one: the resize and the wait for the layout it causes
+  -- cannot be the same `:lua` call. Neovim delivers `WinResized` from the main
+  -- loop, not from inside `vim.wait`, so a step that waited for its own resize
+  -- would wait for an event only it could release (see `M.narrow`).
   md_call('narrow(40)')
+  md_call('settled(40)')
   md_call('goto(6)')
   local narrow_table = preview_key('narrow_table', true)
 
@@ -580,6 +585,7 @@ local function body()
   -- width would not tell the two budgets apart.
   md_call('reset_wide_diagram()')
   md_call('narrow(40)')
+  md_call('settled(40)')
   md_call('goto(9)')
   local wide_diagram = preview_key('wide_diagram', true)
 
