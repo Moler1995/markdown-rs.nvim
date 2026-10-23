@@ -4588,14 +4588,14 @@ section('7.3', function()
       vim.fn.setfperm(data_engine, 'rw-------')
       resolved = engine_mod.resolve(nil)
       expect('7.3 a non-executable candidate is skipped', resolved, nil)
-      vim.fn.setfperm(data_engine, 'rwx------')
 
-      -- A configured path is authoritative: when it cannot run, the search
-      -- must not quietly fall through to another engine.
+      -- A configured path is authoritative: while the file still cannot run,
+      -- the search must not quietly fall through to another engine.
       resolved, step = engine_mod.resolve(data_engine)
       expect('7.3 a configured non-executable path fails', resolved, nil)
       truthy('7.3 and its message names the path',
         type(step) == 'string' and step:find(data_engine, 1, true) ~= nil, tostring(step))
+      vim.fn.setfperm(data_engine, 'rwx------')
       restore_bin()
     end
 
