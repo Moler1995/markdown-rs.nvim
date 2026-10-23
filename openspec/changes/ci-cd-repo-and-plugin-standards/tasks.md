@@ -29,10 +29,10 @@
 ## 4. Add the release workflow
 
 - [x] 4.1 Create `.github/workflows/release.yml` with a `v*` tag trigger, a `workflow_dispatch` trigger taking a `tag` input and a `dry_run` input defaulting to true, `permissions: contents: write`, and a preflight check that the tag equals `v` plus the `md-render` version from `cargo metadata`; verify the YAML parses and the tag check passes for `v0.1.0`.
-- [ ] 4.2 Add the Linux build job targeting `x86_64-unknown-linux-musl`, install `musl-tools`, smoke-test `md-render --version`, and package the executable with `LICENSE` and `README.md` as `md-render-<tag>-x86_64-unknown-linux-musl.tar.gz`; verify the local musl build and `--version` run.
-- [ ] 4.3 Add the Windows build job targeting `x86_64-pc-windows-msvc` with `RUSTFLAGS=-C target-feature=+crt-static`, smoke-test `md-render.exe --version`, and package a zip with the executable, `LICENSE` and `README.md`; verify the build and smoke test locally.
+- [x] 4.2 Add the Linux build job targeting `x86_64-unknown-linux-musl`, install `musl-tools`, smoke-test `md-render --version`, and package the executable with `LICENSE` and `README.md` as `md-render-<tag>-x86_64-unknown-linux-musl.tar.gz`; verify the local musl build and `--version` run.
+- [x] 4.3 Add the Windows build job targeting `x86_64-pc-windows-msvc` with `RUSTFLAGS=-C target-feature=+crt-static`, smoke-test `md-render.exe --version`, and package a zip with the executable, `LICENSE` and `README.md`; verify the build and smoke test locally.
 - [x] 4.4 Add the macOS build job building `aarch64-apple-darwin` and `x86_64-apple-darwin`, merging them with `lipo -create`, smoke-testing the universal binary, and packaging a tar.gz; verify the YAML parses and document the fallback to separate runners in the workflow comment.
-- [ ] 4.5 Add the release job that depends on all three builds, downloads their artifacts, writes `SHA256SUMS` with `sha256sum`, and runs `gh release create "$TAG" --verify-tag --generate-notes` only when `dry_run` is false; verify the dry-run path uploads artifacts and skips the release.
+- [x] 4.5 Add the release job that depends on all three builds, downloads their artifacts, writes `SHA256SUMS` with `sha256sum`, and runs `gh release create "$TAG" --verify-tag --generate-notes` only when `dry_run` is false; verify the dry-run path uploads artifacts and skips the release.
 - [x] 4.6 Verify the packaging and checksum commands by running the Linux package and `sha256sum -c` sequence locally against a built binary.
 
 ## 5. Add dependency and vulnerability monitoring
@@ -107,6 +107,6 @@
 - [x] 12.1 Clone the repository into a fresh temporary directory, build the engine into `bin/`, run `cargo test --workspace --locked`, both Neovim suites, and `openspec validate --all --no-interactive`; verify all pass using only tracked files.
 - [x] 12.2 On that fresh clone, follow the README's Quick start in a minimal Neovim config, then run `:help md-render`, `:checkhealth md-render`, the lazy-load check and the wire-mismatch check; verify all five pass and every relative link in the README resolves.
 - [x] 12.3 Open a draft pull request and verify every CI job appears and the aggregate `gate` job succeeds.
-- [ ] 12.4 Run the release workflow with `dry_run=true` for `v0.1.0` and verify three archives plus `SHA256SUMS` are produced and no GitHub Release is created.
+- [x] 12.4 Run the release workflow with `dry_run=true` for `v0.1.0` and verify three archives plus `SHA256SUMS` are produced and no GitHub Release is created.
 - [ ] 12.5 Push the `v0.1.0` tag, verify the GitHub Release contains the three archives and `SHA256SUMS`, run `sha256sum -c` on the downloads, and run each engine with `--version`.
 - [ ] 12.6 Apply the repository settings: description, topics (`neovim`, `neovim-plugin`, `markdown`, `rust`, `markdown-renderer`, `terminal`), private vulnerability reporting, Dependabot alerts and security updates, and a `main` ruleset requiring the `gate` check; verify with `gh repo view --json description,repositoryTopics` and `gh api repos/Moler1995/markdown-rs.nvim/rulesets`.
