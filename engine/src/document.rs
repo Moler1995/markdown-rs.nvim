@@ -969,7 +969,7 @@ mod tests {
 
     #[test]
     fn an_animation_over_the_caps_is_named_and_carries_no_frames() {
-        let content = format!("text\n\n![big]({})\n", fixture("image_257.gif"));
+        let content = format!("text\n\n![big]({})\n", fixture("image_4097.gif"));
         let doc = animated_layout(&content, 40);
 
         assert!(
@@ -984,6 +984,26 @@ mod tests {
         assert!(
             !doc.lines.is_empty(),
             "the first frame is still drawn as ordinary artwork"
+        );
+    }
+
+    #[test]
+    fn a_sampled_animation_carries_frames_without_being_named() {
+        let content = format!("text\n\n![big]({})\n", fixture("image_513.gif"));
+        let doc = animated_layout(&content, 40);
+
+        assert_eq!(doc.animations.len(), 1);
+        assert_eq!(
+            doc.animations[0].source, 2,
+            "the animation is placed at the reference's line"
+        );
+        assert!(
+            doc.animations[0].frames.len() <= 256,
+            "the carried frames fit the budget"
+        );
+        assert!(
+            doc.animations_limited.is_empty(),
+            "a sampled animation is not a refused one"
         );
     }
 

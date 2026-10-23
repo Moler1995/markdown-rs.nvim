@@ -656,10 +656,12 @@ end
 
 --- True when the engine refused the animation for the reference on `lnum`.
 ---
---- The image is a GIF or WebP that does animate, but the whole frame set was
---- over the engine's frame or pixel cap. The document still draws its first
---- frame; only the frames are missing, and the reader is told so rather than
---- left pressing the step key at a picture that never moves.
+--- The image is a GIF or WebP that does animate, but decoding it would pass the
+--- engine's decoded-frame ceiling or its cumulative pixel budget. An animation
+--- over the carried-frame budget is sampled instead and is not refused. The
+--- document still draws its first frame; only the frames are missing, and the
+--- reader is told so rather than left pressing the step key at a picture that
+--- never moves.
 local function animation_limited(doc, lnum)
   for _, source in ipairs(doc.animations_limited or {}) do
     if source == lnum then
@@ -924,13 +926,19 @@ local following = false
 ---
 --- With no link under the cursor the key goes back to Vim, so `gf` keeps its
 --- ordinary meaning on a path written as plain text.
-function M.follow(win)
+---
+--- `opts.tab` opens a file destination in a new tab instead of the window,
+--- which leaves the reading view exactly where it was. A URL or an anchor
+--- still acts in place: neither is a file that could be put in a tab.
+function M.follow(win, opts)
   win = win or vim.api.nvim_get_current_win()
   if not vim.api.nvim_win_is_valid(win) then
     return
   end
+  local tab = opts and opts.tab
   local st = state.get(win)
-  local key = config.options.keymaps.follow
+  local key = (tab and config.options.keymaps.follow_tab)
+    or config.options.keymaps.follow
   local lines = source_lines(st)
   local buf = vim.api.nvim_win_get_buf(win)
   if not lines or (buf ~= st.source and buf ~= st.rendered) then
@@ -978,6 +986,33 @@ function M.follow(win)
   local path = vim.fn.fnamemodify(base .. '/' .. found.target, ':p')
   if vim.fn.filereadable(path) == 0 then
     vim.notify('md-render: no such file: ' .. found.target, vim.log.levels.WARN)
+    return
+  end
+
+  -- A tab is the other way to open a file: the document being read stays in
+  -- its window, and the destination gets a window of its own. Nothing in the
+  -- current window changes, so there is no jumplist entry to record and no
+  -- state to keep: `:tabedit` makes the new window current, and the attach
+  -- below is what brings it up in R. The reader comes back by closing the tab
+  -- (`:tabclose`, `g<Tab>`), not with `<C-o>`.
+  if tab then
+    local ok, err = pcall(vim.cmd, 'tabedit ' .. vim.fn.fnameescape(path))
+    if not ok then
+      error(err, 0)
+    end
+    -- Placed before the attach for the same reason as below: the attach
+    -- renders from the source buffer, so moving the cursor first is what makes
+    -- R open on the named section.
+    if found.fragment then
+      local at = link.anchor_line(vim.api.nvim_buf_get_lines(0, 0, -1, false), found.fragment)
+      if at then
+        vim.api.nvim_win_set_cursor(0, { at + 1, 0 })
+      end
+    end
+    -- The `FileType` autocmd does not fire for a file that is already loaded,
+    -- so following a second link to it would leave the new tab on source. A
+    -- filetype the plugin does not manage is left alone by `attach`.
+    M.attach(vim.api.nvim_get_current_buf(), vim.api.nvim_get_current_win())
     return
   end
 
@@ -1117,6 +1152,10 @@ function M.set_keymaps(buf, insert_entry)
   map(options.keymaps.follow, function()
     M.follow()
   end, 'md-render: follow the link under the cursor')
+
+  map(options.keymaps.follow_tab, function()
+    M.follow(nil, { tab = true })
+  end, 'md-render: follow the link in a new tab')
 
   if not insert_entry then
     return

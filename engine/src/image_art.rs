@@ -62,13 +62,23 @@ pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 /// cells either way.
 pub const MAX_PIXELS: u64 = 16_000_000;
 
-/// The most frames an animated image may contribute.
+/// The most frames an animated image may carry.
 ///
-/// A frame costs a decode and a set of lines on the wire, and a resize
-/// re-renders the document, so an image with thousands of frames is not
-/// something a reading view can honour. Past this bound the image renders as
-/// its first frame with no animation data at all (see [`MAX_ANIMATION_PIXELS`]).
+/// A frame costs a set of lines on the wire and a set of styles, so an image
+/// with thousands of frames is not something a reading view can honour. An
+/// animation with more frames is reduced to a subset of this size rather than
+/// refused; the delays of the frames it stands for are folded into each kept
+/// frame, so the loop keeps its total duration.
 pub const MAX_ANIMATION_FRAMES: usize = 256;
+
+/// The most frames an animation may decode before it is refused.
+///
+/// The frame budget above bounds what is carried, not the work: a GIF's later
+/// frames are decoded as deltas, so reaching frame 4 000 still decodes 4 000
+/// frames. This ceiling bounds that work independently of
+/// [`MAX_ANIMATION_PIXELS`], which a file of tiny frames can stay under
+/// indefinitely.
+pub const MAX_DECODED_FRAMES: usize = 4_096;
 
 /// The most decoded pixels an animation may cost, cumulatively.
 ///
@@ -77,11 +87,12 @@ pub const MAX_ANIMATION_FRAMES: usize = 256;
 /// arrive, so peak memory stays at one frame — this bound is about decode CPU
 /// and the size of the render request, not memory.
 ///
-/// 64 megapixels covers a common 640 × 360 GIF of 189 frames (43.5 MP) with
-/// room to spare, while still refusing the animations whose first step would
-/// take seconds. It is twice the original 32 MP because that bound rejected a
-/// real-world GIF that was otherwise ordinary.
-pub const MAX_ANIMATION_PIXELS: u64 = 64_000_000;
+/// 128 megapixels covers a 640 × 360 GIF of 533 frames (122.8 MP) — a
+/// real-world file whose first step takes about 3.5 seconds — while still
+/// refusing animations that would take much longer. It is twice the previous
+/// 64 MP because that bound refused the 533-frame file even though frame
+/// sampling could carry it.
+pub const MAX_ANIMATION_PIXELS: u64 = 128_000_000;
 
 /// The least coverage a cell needs before it is drawn when the terminal's own
 /// background is in use.
@@ -401,13 +412,14 @@ pub struct AnimationFrame {
     pub lines: Vec<Line>,
 }
 
-/// An image drawn for animation: the first frame, plus every frame when the
-/// image animates within the caps.
+/// An image drawn for animation: the first frame, plus the frames the document
+/// carries.
 ///
 /// `frames` is empty for a still image, a reference that does not resolve, and
-/// an animation that exceeds [`MAX_ANIMATION_FRAMES`] or
+/// an animation that exceeds [`MAX_DECODED_FRAMES`] or
 /// [`MAX_ANIMATION_PIXELS`]. In every one of those cases `lines` is the same
-/// artwork an ordinary render produces, so the static view is unchanged.
+/// artwork an ordinary render produces, so the static view is unchanged. An
+/// animation over [`MAX_ANIMATION_FRAMES`] is not empty: it carries a subset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Artwork {
     pub lines: Vec<Line>,
@@ -477,8 +489,9 @@ pub fn animated_artwork(
         options,
         image.width(),
         image.height(),
-        MAX_ANIMATION_FRAMES,
+        MAX_DECODED_FRAMES,
         MAX_ANIMATION_PIXELS,
+        MAX_ANIMATION_FRAMES,
         budget,
     );
     // A single-frame "animation" is a still image, and carrying it as frames
@@ -575,14 +588,14 @@ fn resolves_dither(mode: DitherMode, encoding: ImageEncoding, palette: ImagePale
     }
 }
 
-/// True when an animation of `frame_count` frames that decodes `pixels` pixels
-/// in total is within the animation caps.
+/// True when an animation that decodes `frame_count` frames and `pixels` pixels
+/// in total is within the hard animation bounds.
 ///
-/// Both bounds are inclusive: an image of exactly [`MAX_ANIMATION_FRAMES`] or
-/// exactly [`MAX_ANIMATION_PIXELS`] still animates.
+/// The carried-frame budget is not checked here: an animation over it is
+/// reduced to a subset rather than refused. Both bounds are inclusive.
 #[must_use]
 pub fn animation_within_bounds(frame_count: usize, pixels: u64) -> bool {
-    within_bounds(frame_count, pixels, MAX_ANIMATION_FRAMES, MAX_ANIMATION_PIXELS)
+    within_bounds(frame_count, pixels, MAX_DECODED_FRAMES, MAX_ANIMATION_PIXELS)
 }
 
 /// [`animation_within_bounds`] against explicit limits, so the cap can be
@@ -595,9 +608,10 @@ fn within_bounds(frame_count: usize, pixels: u64, max_frames: usize, max_pixels:
 enum Collected {
     /// Not a GIF or animated WebP, a still one, or a file that would not decode.
     Still,
-    /// The animation exists but is past `max_frames` or `max_pixels`.
+    /// The animation exists but is past `max_decoded_frames` or `max_pixels`.
     TooLarge,
-    /// Every frame, in file order.
+    /// The frames the document carries, in file order. Within `max_kept` this
+    /// is every frame; past it, a deterministic subset.
     Frames(Vec<AnimationFrame>),
 }
 
@@ -619,8 +633,9 @@ fn collect_animation(
     options: &ImageOptions,
     width: u32,
     height: u32,
-    max_frames: usize,
+    max_decoded_frames: usize,
     max_pixels: u64,
+    max_kept: usize,
     budget: &mut StyleBudget,
 ) -> Collected {
     let Ok(reader) = image::ImageReader::open(path) else {
@@ -663,28 +678,67 @@ fn collect_animation(
         return Collected::Still;
     }
 
-    let mut out = Vec::new();
+    // Sampling is a streaming downsample: every frame is kept until the buffer
+    // would pass `max_kept`, then every second kept frame is dropped and the
+    // stride doubles. The kept frames are therefore the decoded frames whose
+    // zero-based index is a multiple of the current stride, which starts at the
+    // first frame, preserves file order and needs no knowledge of the total.
+    // A dropped frame's display time is added to the kept frame before it, so
+    // the loop runs for as long as the file says it should.
+    let mut out: Vec<AnimationFrame> = Vec::new();
     let mut pixels = 0u64;
+    let mut decoded = 0usize;
+    let mut stride = 1usize;
     for frame in frames {
         let Ok(frame) = frame else {
             return Collected::Still;
         };
-        let count = out.len() + 1;
+        let index = decoded;
+        decoded += 1;
         let Some(total) = pixels.checked_add(frame_pixels) else {
             return Collected::TooLarge;
         };
         pixels = total;
-        if !within_bounds(count, pixels, max_frames, max_pixels) {
+        if !within_bounds(decoded, pixels, max_decoded_frames, max_pixels) {
             return Collected::TooLarge;
         }
-        let delay_ms = delay_ms(frame.delay());
+        let delay = delay_ms(frame.delay());
+        if !index.is_multiple_of(stride) {
+            if let Some(last) = out.last_mut() {
+                last.delay_ms = last.delay_ms.saturating_add(delay);
+            }
+            continue;
+        }
         let image = Pixels::new(DynamicImage::ImageRgba8(frame.into_buffer()));
         out.push(AnimationFrame {
-            delay_ms,
+            delay_ms: delay,
             lines: draw(&image, cols, rows, enlarge, reduced, options, budget),
         });
+        if out.len() > max_kept {
+            out = halve_kept(out);
+            stride *= 2;
+        }
     }
     Collected::Frames(out)
+}
+
+/// Drop every second frame of `frames`, adding its delay to the kept frame
+/// before it.
+///
+/// This is the half of the streaming downsample that acts on frames already
+/// collected: dropping the odd positions leaves the even ones, which are the
+/// decoded frames the doubled stride keeps, and folding the delay preserves the
+/// interval each survivor stands for.
+fn halve_kept(frames: Vec<AnimationFrame>) -> Vec<AnimationFrame> {
+    let mut kept = Vec::with_capacity(frames.len().div_ceil(2));
+    for (index, frame) in frames.into_iter().enumerate() {
+        if index % 2 == 0 {
+            kept.push(frame);
+        } else if let Some(previous) = kept.last_mut() {
+            previous.delay_ms = previous.delay_ms.saturating_add(frame.delay_ms);
+        }
+    }
+    kept
 }
 
 /// A frame's delay in whole milliseconds.
@@ -2945,30 +2999,72 @@ mod tests {
 
     #[test]
     fn the_caps_admit_their_exact_bounds_and_refuse_one_past() {
-        assert!(animation_within_bounds(MAX_ANIMATION_FRAMES, 1));
-        assert!(!animation_within_bounds(MAX_ANIMATION_FRAMES + 1, 1));
+        assert!(animation_within_bounds(MAX_DECODED_FRAMES, 1));
+        assert!(!animation_within_bounds(MAX_DECODED_FRAMES + 1, 1));
 
-        // 16 MP per frame: four frames sit exactly on the 64 MP bound, a fifth
-        // crosses it. The per-frame cap allows the single frame (`MAX_PIXELS`
-        // is 16 MP), so only the cumulative bound can refuse the fifth.
-        assert!(animation_within_bounds(4, 4 * MAX_PIXELS));
-        assert!(!animation_within_bounds(5, 5 * MAX_PIXELS));
+        // The carried-frame budget is not a hard bound: more frames are
+        // sampled down, not refused.
+        assert!(animation_within_bounds(MAX_ANIMATION_FRAMES, 1));
+        assert!(animation_within_bounds(MAX_ANIMATION_FRAMES + 1, 1));
+
+        // 16 MP per frame: eight frames sit exactly on the 128 MP bound, a
+        // ninth crosses it. The per-frame cap allows the single frame
+        // (`MAX_PIXELS` is 16 MP), so only the cumulative bound can refuse the
+        // ninth.
+        assert!(animation_within_bounds(8, 8 * MAX_PIXELS));
+        assert!(!animation_within_bounds(9, 9 * MAX_PIXELS));
         assert!(animation_within_bounds(2, MAX_ANIMATION_PIXELS));
         assert!(!animation_within_bounds(2, MAX_ANIMATION_PIXELS + 1));
     }
 
     #[test]
-    fn a_257_frame_animation_falls_back_to_its_first_frame() {
+    fn halving_keeps_the_first_frame_and_every_other_one() {
+        let frames = |delays: &[u32]| {
+            delays
+                .iter()
+                .map(|&delay_ms| AnimationFrame {
+                    delay_ms,
+                    lines: Vec::new(),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let kept = halve_kept(frames(&[1, 2, 3, 4, 5, 6, 7]));
+        let delays: Vec<u32> = kept.iter().map(|frame| frame.delay_ms).collect();
+        // The odd positions are dropped; each survivor carries the delay of the
+        // frame after it, and the last survivor carries the trailing one.
+        assert_eq!(delays, vec![3, 7, 11, 7]);
+        assert_eq!(
+            delays.iter().sum::<u32>(),
+            1 + 2 + 3 + 4 + 5 + 6 + 7,
+            "halving preserves the loop's total duration"
+        );
+        assert_eq!(
+            halve_kept(frames(&[1, 2, 3, 4, 5, 6, 7])),
+            kept,
+            "the same frames halve the same way on every run"
+        );
+    }
+
+    #[test]
+    fn a_257_frame_animation_is_sampled_instead_of_refused() {
         let art = animated("image_257.gif");
         assert!(
-            art.frames.is_empty(),
-            "257 frames exceeds the cap, and the fallback is the first frame alone"
+            !art.frames.is_empty(),
+            "257 frames is over the budget, so the animation is sampled, not refused"
         );
         assert!(
-            art.animation_limited,
-            "the plugin needs to know the animation was refused, not absent"
+            art.frames.len() <= MAX_ANIMATION_FRAMES,
+            "a sampled animation still fits the carried-frame budget"
         );
-        assert!(!art.lines.is_empty(), "the fallback still draws the image");
+        assert_eq!(
+            art.frames[0].lines, art.lines,
+            "the subset is anchored at the first frame"
+        );
+        assert!(
+            !art.animation_limited,
+            "a sampled animation animates, so it is not a refusal"
+        );
     }
 
     #[test]
@@ -2980,11 +3076,50 @@ mod tests {
     }
 
     #[test]
+    fn a_513_frame_animation_keeps_its_recorded_duration() {
+        let art = animated("image_513.gif");
+        assert!(
+            art.frames.len() <= MAX_ANIMATION_FRAMES,
+            "the carried frames fit the budget"
+        );
+        assert!(art.frames.len() > 1, "a sampled animation still moves");
+        assert_eq!(
+            art.frames[0].lines, art.lines,
+            "the subset is anchored at the first frame"
+        );
+        let total: u64 = art.frames.iter().map(|frame| u64::from(frame.delay_ms)).sum();
+        assert_eq!(
+            total, 20_470,
+            "the delays of the dropped frames are folded into the kept ones"
+        );
+        assert!(!art.animation_limited);
+        assert_eq!(
+            art.frames,
+            animated("image_513.gif").frames,
+            "the subset is the same on every run"
+        );
+    }
+
+    #[test]
+    fn a_4097_frame_animation_is_refused() {
+        let art = animated("image_4097.gif");
+        assert!(
+            art.frames.is_empty(),
+            "4,097 frames is past the decoded-frame ceiling"
+        );
+        assert!(
+            art.animation_limited,
+            "the plugin needs to know the animation was refused, not absent"
+        );
+        assert!(!art.lines.is_empty(), "the fallback still draws the image");
+    }
+
+    #[test]
     fn the_collector_enforces_the_limits_it_is_given() {
         let path = fixture("image_animation.gif");
         // The fixture is 4x2, sampled at width 80 to one cell row of four
         // cells; three frames therefore cost 24 decoded pixels in total.
-        let collect = |max_frames, max_pixels: u64| {
+        let collect = |max_decoded_frames, max_pixels: u64, max_kept| {
             let mut budget = StyleBudget::default();
             collect_animation(
                 &path,
@@ -2995,27 +3130,36 @@ mod tests {
                 &options(ImageEncoding::Blocks),
                 4,
                 2,
-                max_frames,
+                max_decoded_frames,
                 max_pixels,
+                max_kept,
                 &mut budget,
             )
         };
 
         assert!(matches!(
-            collect(3, 24),
+            collect(3, 24, MAX_ANIMATION_FRAMES),
             Collected::Frames(ref frames) if frames.len() == 3
         ));
         assert!(
-            matches!(collect(2, u64::MAX), Collected::TooLarge),
-            "one frame past the count cap"
+            matches!(collect(2, u64::MAX, MAX_ANIMATION_FRAMES), Collected::TooLarge),
+            "one frame past the decoded-frame ceiling"
         );
         assert!(
-            matches!(collect(3, 23), Collected::TooLarge),
+            matches!(collect(3, 23, MAX_ANIMATION_FRAMES), Collected::TooLarge),
             "one pixel past the area cap"
         );
         assert!(matches!(
-            collect(3, u64::MAX),
+            collect(3, u64::MAX, MAX_ANIMATION_FRAMES),
             Collected::Frames(ref frames) if frames.len() == 3
+        ));
+
+        // The carried-frame budget samples rather than refuses: a budget of
+        // two carries the first frame plus the one it is folded into.
+        assert!(matches!(
+            collect(3, u64::MAX, 2),
+            Collected::Frames(ref frames)
+                if frames.len() == 2 && frames[0].delay_ms == 40 + 80
         ));
     }
 }

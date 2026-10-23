@@ -135,6 +135,13 @@ M.defaults = {
   -- This costs decode time and payload only for documents that contain an
   -- animated image: the engine's animation field is omitted entirely when
   -- there is nothing to animate.
+  --
+  -- Long animations still step: one over the engine's 256-frame budget is
+  -- sampled down to a bounded subset, every frame's delay folded so the loop
+  -- keeps its duration, and no warning is shown. Only an animation that would
+  -- decode past the engine's 4,096-frame ceiling or its 64-megapixel budget is
+  -- refused, drawn as its first frame, and reported when the step key is
+  -- pressed.
   image_animation = true,
 
   -- Buffer-local keymaps set in R. Set a value to `false` to leave the key
@@ -143,19 +150,27 @@ M.defaults = {
   -- The insert-entry keys are fixed and are not configurable, because they are
   -- the mode's escape hatch rather than a convenience.
   --
-  -- `follow` is the one key set in both states, because a link is followed from
-  -- wherever the reader happens to be: in S it resolves the link under the
-  -- cursor, and in R it first follows a link the engine laid into the rendered
-  -- line — a mermaid node named by a `click` directive — and otherwise maps
-  -- the display row back to its source line and resolves the link there. It
-  -- shadows `gf` in a managed buffer, and hands the key back to Vim when the
-  -- cursor is not on a link, so a bare path still opens the way it always did.
-  -- Set it to `gd` or any other key if that suits your habits better.
+  -- `follow` is set in both states, because a link is followed from wherever
+  -- the reader happens to be: in S it resolves the link under the cursor, and
+  -- in R it first follows a link the engine laid into the rendered line — a
+  -- mermaid node named by a `click` directive — and otherwise maps the display
+  -- row back to its source line and resolves the link there. It shadows `gf`
+  -- in a managed buffer, and hands the key back to Vim when the cursor is not
+  -- on a link, so a bare path still opens the way it always did. Set it to
+  -- `gd` or any other key if that suits your habits better.
+  --
+  -- `follow_tab` does the same thing in a new tab instead, leaving the
+  -- reading view where it is. A URL or an anchor still acts in place — there
+  -- is no file to put in a tab — and a filetype the plugin does not manage
+  -- opens unchanged. The jumplist is not involved: the new tab is the way
+  -- back, with `:tabclose` or `g<Tab>`. `gF` is the default because it sits
+  -- next to `gf` and does not interfere with Vim's `<C-w>` prefix.
   --
   -- A link the engine laid into a diagram is also underlined, so a reader can
   -- see the node is followable without knowing the key first. The hint is tied
-  -- to this key: set it to `false` and the underline goes away with it, since
-  -- there would be nothing left to follow.
+  -- to these keys: set both `follow` and `follow_tab` to `false` and the
+  -- underline goes away with them, since there would be nothing left to
+  -- follow.
   --
   -- `zoom_in` and `zoom_out` are set in the preview popup's buffer rather than
   -- in R or S, because they act on the block the popup is showing. In a table's
@@ -187,6 +202,7 @@ M.defaults = {
     write = '<C-s>',
     preview = '<CR>',
     follow = 'gf',
+    follow_tab = 'gF',
     open_image = 'gx',
     frame_next = '<C-n>',
     pause = '<Space>',

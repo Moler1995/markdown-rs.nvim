@@ -125,6 +125,7 @@ toggle is applied at once, so a resize cannot swallow the key that follows it.
 | `<leader>mr` | R and S | swap between the rendered view and the source |
 | `<C-s>` | R and S | write the source buffer |
 | `gf` | R and S | follow the link under the cursor |
+| `gF` | R and S | follow the link under the cursor in a new tab |
 | `gx` | R only | open the image under the cursor with the system application |
 | `<C-n>` | R and the animation popup | show the next frame of the animated image under the cursor; step one frame in the popup while paused |
 | `<CR>` | R only | preview the block or image under the cursor, or close the preview |
@@ -149,9 +150,9 @@ from, so the two states read as one document rather than two.
 
 ### Following links
 
-`gf` opens whatever is under the cursor. It is the one key besides the toggle
-and the write key that is set in both states, because a link is worth following
-from wherever you are reading:
+`gf` opens whatever is under the cursor. It and `gF` are the keys besides the
+toggle and the write key that are set in both states, because a link is worth
+following from wherever you are reading:
 
 - a **file** opens in the window, resolved relative to the document holding the
   link rather than to the working directory;
@@ -159,13 +160,19 @@ from wherever you are reading:
 - an **anchor** — `#section`, on its own or after a path — scrolls to the
   heading it names, in this document or in the one just opened.
 
+`gF` does the same but opens a **file** in a new tab, leaving the reading view
+in the window it was in. A URL or an anchor still acts in place, since neither
+is a file that could go in a tab, and a target the plugin does not manage — a
+`.txt`, say — opens unchanged. No jumplist entry is recorded: the way back is
+closing the tab, with `:tabclose` or `g<Tab>`.
+
 A rendered diagram can carry links of its own: a mermaid `click NODE href "…"`
 directive names a target for a node, and with the cursor on that node's label
 the same key follows it. The engine reports the label's byte range along with
 the artwork, so the node is clickable without leaving the reading view and
 without the plugin re-parsing the fence. The label is underlined in R so the
-target is visible rather than guessed at; the hint is tied to the `follow` key,
-since with no key bound an underline would advertise nothing. It is the
+target is visible rather than guessed at; the hint is tied to the follow keys,
+since with none bound an underline would advertise nothing. It is the
 `MdRenderLink` highlight group and sets only `underline`, so a theme can restyle
 it without touching the artwork's colours. The preview popup does not bind the
 key, so it shows the diagram without the hint.
@@ -209,11 +216,15 @@ fetch is in flight the bottom of the editor says so; pressing `<C-n>` again in
 that window does not start a second fetch — the presses are remembered and the
 image advances one frame for each of them when the frames arrive.
 
-An animation is refused when it has more than 256 frames or more than 64 million
-decoded pixels in total; the image is then drawn on its first frame, and pressing
-`<C-n>` on it warns that it is too large to animate instead of moving the cursor.
-The warning is given once per render, so pressing again neither re-renders nor
-repeats it. The popup warns on open in the same way.
+An animation longer than 256 frames is not refused: it is sampled down to at
+most 256 evenly spaced frames that start at the image's first, and each kept
+frame carries the delay of the frames it stands for, so the loop still takes as
+long as the file says. A very long animation is still bounded by decode work,
+though: one that decodes more than 4,096 frames or more than 128 million pixels
+in total is refused, drawn on its first frame, and pressing `<C-n>` on it warns
+that it is too large to animate instead of moving the cursor. The warning is
+given once per render, so pressing again neither re-renders nor repeats it. The
+popup warns on open in the same way.
 
 `<CR>` on the artwork opens the image alone in a popup, and there it plays: one
 one-shot timer is restarted with each frame's own delay, and the animation loops
@@ -331,6 +342,7 @@ require('md-render').setup({
     write = '<C-s>',
     preview = '<CR>',
     follow = 'gf',
+    follow_tab = 'gF',            -- follow a file link in a new tab
     open_image = 'gx',            -- in R, on an image
     frame_next = '<C-n>',         -- in R and in the animation popup
     pause = '<Space>',            -- in the animation popup, while it plays
@@ -351,7 +363,8 @@ require('md-render').setup({
 Every field is optional and the merge is deep, so `setup{ keymaps = { toggle =
 'gm' } }` keeps the write key. A filetype that is not listed is left alone
 entirely: no state, no autocmds, no keymaps. Setting `keymaps.toggle`,
-`keymaps.write`, `keymaps.preview`, `keymaps.follow`, `keymaps.open_image`,
+`keymaps.write`, `keymaps.preview`, `keymaps.follow`, `keymaps.follow_tab`,
+`keymaps.open_image`,
 `keymaps.frame_next` or `keymaps.pause` to `false` leaves that key alone, and so
 do `keymaps.zoom_in`, `keymaps.zoom_out`, `keymaps.scroll_left` and
 `keymaps.scroll_right`.

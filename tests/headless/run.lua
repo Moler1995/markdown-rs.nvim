@@ -211,6 +211,7 @@ section('8.1', function()
   eq_table('8.1 default filetypes', d.filetypes, { 'markdown' })
   eq_table('8.1 default keymaps', d.keymaps,
     { toggle = '<leader>mr', write = '<C-s>', preview = '<CR>', follow = 'gf',
+      follow_tab = 'gF',
       open_image = 'gx', frame_next = '<C-n>', pause = '<Space>',
       zoom_in = '+', zoom_out = '-', scroll_left = '<C-h>', scroll_right = '<C-l>' })
   eq_table('8.1 default preview caps', d.preview,
@@ -1818,6 +1819,38 @@ section('12.3', function()
   md.toggle()
   truthy('12.3 and back to R', wait_until(showing_rendered))
 
+  -- `gF` opens a file in a new tab and leaves the reading view alone. The
+  -- window that follows is not the one the reader is looking at, so the tab
+  -- count is the evidence, and the old window must still be showing R when the
+  -- new tab's render answers.
+  local tabs = vim.fn.tabpagenr('$')
+  local reading_win = vim.api.nvim_get_current_win()
+  local reading_buf = vim.api.nvim_win_get_buf(reading_win)
+  st = current_state()
+  vim.api.nvim_win_set_cursor(st.win, { row + 1, alpha[1] })
+  md.follow(nil, { tab = true })
+  expect('12.3 gF opens the target in a new tab', vim.fn.tabpagenr('$'), tabs + 1)
+  truthy('12.3 and the new tab is rendered', wait_until(showing_rendered))
+  truthy('12.3 and the link target is the tab\'s document', wait_for_source('linked.md'))
+  truthy('12.3 and the reading view keeps its window',
+    vim.api.nvim_win_is_valid(reading_win)
+      and vim.api.nvim_win_get_buf(reading_win) == reading_buf)
+  vim.cmd('tabclose')
+  expect('12.3 closing the tab comes back to the reading view',
+    vim.fn.tabpagenr('$'), tabs)
+  truthy('12.3 and that view is still R',
+    vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win()) == reading_buf)
+
+  -- A URL is not a file, so there is no tab to open; it still goes to the
+  -- system opener. An anchor is the same: it scrolls in place.
+  opened = {}
+  st = current_state()
+  vim.api.nvim_win_set_cursor(st.win, { row + 1, beta[1] })
+  md.follow(nil, { tab = true })
+  eq_table('12.3 gF on a URL still goes to vim.ui.open', opened,
+    { 'https://example.com/diagram' })
+  expect('12.3 and opens no tab', vim.fn.tabpagenr('$'), tabs)
+
   vim.ui.open = real_ui_open
 end)
 
@@ -3255,7 +3288,7 @@ section('3.6', function()
   end), vim.inspect(notifications[#notifications]))
   expect('3.6 as a warning', notifications[#notifications].level, vim.log.levels.WARN)
   truthy('3.6 naming the file',
-    notifications[#notifications].msg:find('image_257.gif', 1, true) ~= nil,
+    notifications[#notifications].msg:find('image_4097.gif', 1, true) ~= nil,
     notifications[#notifications].msg)
   expect('3.6 with no frames carried', st.doc.animations, nil)
   truthy('3.6 and the key is not passed on to Vim',
@@ -3333,6 +3366,39 @@ section('3.7', function()
 
   engine_mod.render = real_render
   vim.api.nvim_echo = real_echo
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 3.8 An animation over the carried-frame budget is sampled, not refused
+--------------------------------------------------------------------------------
+
+section('3.8', function()
+  config.setup({ image_mode = 'blocks' })
+  local path = repo .. '/tests/fixtures/sampled-animation.md'
+  truthy('3.8 in R on the sampled fixture', reset_to(path))
+  local st = current_state()
+  local row = artwork_row(st)
+  truthy('3.8 the artwork is drawn', row ~= nil)
+  vim.api.nvim_win_set_cursor(st.win, { row + 1, 0 })
+  local cursor = vim.api.nvim_win_get_cursor(st.win)
+  expect('3.8 the engine does not name it as refused', st.doc.animations_limited, nil)
+
+  local before = #notifications
+  md.frame_next(st.win)
+  truthy('3.8 the first press fetches the frames', wait_until(function()
+    return st.doc and st.doc.animations and st.doc.animations[1] ~= nil
+  end))
+  local animation = st.doc.animations[1]
+  expect('3.8 and shows the second frame', st.frames[animation.source], 1)
+  expect('3.8 without warning the reader', #notifications, before)
+  truthy('3.8 and the cursor has not moved',
+    vim.deep_equal(vim.api.nvim_win_get_cursor(st.win), cursor))
+
+  -- The sampled set is carried, so later presses are answered from memory.
+  md.frame_next(st.win)
+  expect('3.8 a later press advances', st.frames[animation.source], 2)
+
   config.setup({})
 end)
 
