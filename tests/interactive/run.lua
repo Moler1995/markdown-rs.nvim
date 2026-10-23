@@ -43,6 +43,10 @@ local ADDRESS = '127.0.0.1:7787'
 local OUT = vim.fn.tempname()
 vim.fn.mkdir(OUT, 'p')
 
+-- The same directory as a path the server can read out of a `:lua` chunk. A
+-- Windows tempname has backslashes, and those are escapes in Lua source.
+local OUT_CMD = (OUT:gsub('\\', '/'))
+
 -- How long to give the server to produce something the driver is waiting for.
 -- Only a genuine hang costs this much: every wait here is a poll, so a healthy
 -- run pays a few milliseconds each.
@@ -93,11 +97,9 @@ local function read_report(tag)
   local lines = wait_for(string.format('%s/%s.txt', OUT, tag))
   if not lines then
     error(string.format(
-      'the server wrote no report for %q.\nInsertEnter events seen: %s\n'
-        .. 'last error raised in the server: %s\n%s',
+      'the server wrote no report for %q.\nInsertEnter events seen: %s\n%s',
       tag,
       table.concat(read(OUT .. '/events.txt') or {}, ' | '),
-      table.concat(read(OUT .. '/error.txt') or { '(none)' }, ' | '),
       vim.inspect(vim.fn.readdir(OUT))
     ))
   end
@@ -111,19 +113,36 @@ local function read_report(tag)
   return out
 end
 
---- Run a call on the server's `MD` table, recording any error it raises.
+--- Run a call on the server's `MD` table, and wait until the server is done.
 ---
---- A `:lua` call cannot return a value to the driver, and an error raised inside
---- one does not reach the server's stderr either — it goes into the message area
---- of a headless server nobody is looking at. The run then goes on waiting for a
---- report that was never going to be written, and the cause is invisible: the
---- failure looks like a missing file rather than like the error that stopped it.
---- Wrapping the call is what turns that into a message.
+--- The wait is a barrier, not politeness. A step such as `reset()` blocks inside
+--- `vim.wait()` while it waits for the render, and a wait in the server's own
+--- loop reads the input queue: a key sent behind such a step is served *inside*
+--- it instead of after it. That is how a fed `i` once arrived in the middle of
+--- the next `:lua` command line, on CI only — a mangled report tag
+--- (`ciross2_0.txt`) is the signature. Waiting for the step's own marker keeps
+--- every key sent afterwards behind it.
+---
+--- The marker also carries the step's error. An error raised inside a `:lua`
+--- call does not reach the server's stderr — it goes into the message area of a
+--- headless server nobody is looking at — so an unwrapped call makes the run
+--- wait for a report that was never going to be written, and the failure looks
+--- like a missing file rather than like the error that stopped it.
+local call_count = 0
 local function md_call(call)
+  call_count = call_count + 1
+  local marker = string.format('%s/call%d.txt', OUT_CMD, call_count)
   step(string.format(
     ":lua local ok, e = pcall(function() MD.%s end) "
-      .. "if not ok then vim.fn.writefile({ tostring(e) }, MD.out .. '/error.txt') end<CR>",
-    call))
+      .. "vim.fn.writefile({ ok and 'ok' or tostring(e) }, '%s')<CR>",
+    call, marker))
+  local result = wait_for(marker)
+  if not result then
+    error(string.format('the server never finished MD.%s', call))
+  end
+  if result[1] ~= 'ok' then
+    error(string.format('MD.%s failed in the server: %s', call, table.concat(result, '\n')))
+  end
 end
 
 local function report(tag)

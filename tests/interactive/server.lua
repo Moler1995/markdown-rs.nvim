@@ -57,6 +57,47 @@ local function st()
   return state.windows[vim.api.nvim_get_current_win()]
 end
 
+--- The engine's render, counted so a step can tell one is still coming.
+---
+--- A resize is not one event: the plugin coalesces the burst with a timer and
+--- then renders asynchronously, so a step that follows a resize can arrive
+--- while a render is still in flight. The document that render applies is a
+--- new layout, and a display row is a property of the layout — which is how a
+--- cursor placed a moment too early ended up a row above the table it was put
+--- on. Counting what the plugin starts is the honest signal: the timer's delay
+--- is only 100 ms, so no work can begin without being seen for that long.
+local engine = require('md-render.engine')
+local in_flight = 0
+local engine_render = engine.render
+engine.render = function(opts, text, view, cb)
+  in_flight = in_flight + 1
+  local ok, err = pcall(engine_render, opts, text, view, function(...)
+    in_flight = in_flight - 1
+    cb(...)
+  end)
+  if not ok then
+    in_flight = in_flight - 1
+    error(err)
+  end
+end
+
+--- Wait until no render is in flight and none has started for `quiet` ms.
+---
+--- The wait is what makes the steps deterministic. Each one runs in the
+--- server's own loop, so a render that lands afterwards is invisible to it and
+--- its checks would be about a state the step never established.
+local function quiescent(quiet)
+  local calm = 0
+  vim.wait(20000, function()
+    if in_flight > 0 then
+      calm = 0
+    else
+      calm = calm + 50
+    end
+    return calm >= (quiet or 250)
+  end, 50)
+end
+
 --- Record the events that prove a mode was really entered.
 ---
 --- `InsertEnter` is the whole point of this file. Under `nvim -l` it never
@@ -80,6 +121,7 @@ function M.reset()
     local s = st()
     return s ~= nil and s.mode == 'R'
   end)
+  quiescent()
   M.markers()
 end
 
@@ -91,11 +133,26 @@ end
 --- sits on the fence's own row.
 function M.goto(src, offset)
   local s = st()
-  local row = render.row_for_source(s.doc, src)
-  if not row then
-    error('no display row for source line ' .. src)
+  -- Placed, then checked: a debounced refresh can still be in flight when a
+  -- step arrives — a resize is a burst of events that only the timer
+  -- coalesces, and the render it asks for may land after this step has begun.
+  -- A new document is a new layout, and a display row is a property of the
+  -- layout, so a row placed against the old one no longer names `src`. The
+  -- key pressed after this step resolves its block from the row it finds
+  -- (`M.preview` does), which is how a press once landed on the row above the
+  -- table and fell through to Vim's own `<CR>`.
+  for _ = 1, 20 do
+    local row = render.row_for_source(s.doc, src)
+    if not row then
+      error('no display row for source line ' .. src)
+    end
+    local doc = s.doc
+    vim.api.nvim_win_set_cursor(s.win, { row + 1 + (offset or 0), 0 })
+    quiescent()
+    if s.doc == doc then
+      break
+    end
   end
-  vim.api.nvim_win_set_cursor(s.win, { row + 1 + (offset or 0), 0 })
   -- Named here as well as in `watch`, because every preview check moves the
   -- cursor to its block before pressing the key.
   M.watched = s.win
@@ -223,6 +280,7 @@ function M.reset_wide(which)
     local s = st()
     return s ~= nil and s.mode == 'R' and s.doc ~= nil
   end)
+  quiescent()
 end
 
 --- The same, for the fixture that is one diagram wider than the popup.
@@ -251,6 +309,9 @@ function M.narrow(cols)
   vim.wait(8000, function()
     return s.rendered ~= nil and widest(s.rendered, s.win) <= cols
   end)
+  -- The width is one render; a burst of resize events can schedule another, so
+  -- the step is not over when the first lands.
+  quiescent()
 end
 
 --- Close the preview, if one is open.
