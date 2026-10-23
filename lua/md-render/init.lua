@@ -848,9 +848,7 @@ function M.open_image(win)
   local name = vim.api.nvim_buf_get_name(st.source)
   local base = name ~= '' and vim.fn.fnamemodify(name, ':h') or vim.fn.getcwd()
   local path = target
-  -- Absolute in either the POSIX or the Windows sense: a leading separator, a
-  -- drive letter, or a UNC share.
-  if not (path:match('^[/\\]') or path:match('^%a:[/\\]')) then
+  if not link.is_absolute(path) then
     path = base .. '/' .. path
   end
   path = vim.fn.fnamemodify(path, ':p')
@@ -980,10 +978,17 @@ function M.follow(win, opts)
   end
 
   -- The destination is written relative to the document holding it rather than
-  -- to the working directory, which is what Vim's own `gf` does too.
+  -- to the working directory, which is what Vim's own `gf` does too. An
+  -- absolute destination is used as given, in either the POSIX or the Windows
+  -- sense, so a drive path or a UNC share is not joined to the document's
+  -- directory.
   local name = vim.api.nvim_buf_get_name(st.source)
   local base = name ~= '' and vim.fn.fnamemodify(name, ':h') or vim.fn.getcwd()
-  local path = vim.fn.fnamemodify(base .. '/' .. found.target, ':p')
+  local path = found.target
+  if not link.is_absolute(path) then
+    path = base .. '/' .. path
+  end
+  path = vim.fn.fnamemodify(path, ':p')
   if vim.fn.filereadable(path) == 0 then
     vim.notify('md-render: no such file: ' .. found.target, vim.log.levels.WARN)
     return

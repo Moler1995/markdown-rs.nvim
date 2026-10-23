@@ -155,7 +155,8 @@ toggle and the write key that are set in both states, because a link is worth
 following from wherever you are reading:
 
 - a **file** opens in the window, resolved relative to the document holding the
-  link rather than to the working directory;
+  link rather than to the working directory; an absolute destination — a POSIX
+  path, a drive path in either slash style, or a UNC share — is used as given;
 - a **URL** goes to `vim.ui.open`, which is the desktop's browser by default;
 - an **anchor** — `#section`, on its own or after a path — scrolls to the
   heading it names, in this document or in the one just opened.

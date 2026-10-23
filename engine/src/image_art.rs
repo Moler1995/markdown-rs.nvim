@@ -1942,14 +1942,20 @@ mod tests {
 
     #[test]
     fn absolute_destinations_are_used_as_given() {
-        let resolved = resolve("C:/docs/a.png", Some(Path::new("C:/other")));
-        assert_eq!(resolved, Some(PathBuf::from("C:/docs/a.png")));
+        let (absolute, base) = if cfg!(windows) {
+            ("C:/docs/a.png", "C:/other")
+        } else {
+            ("/docs/a.png", "/other")
+        };
+        let resolved = resolve(absolute, Some(Path::new(base)));
+        assert_eq!(resolved, Some(PathBuf::from(absolute)));
     }
 
     #[test]
     fn relative_destinations_resolve_against_the_base() {
-        let resolved = resolve("img/a.png", Some(Path::new("C:/docs")));
-        assert_eq!(resolved, Some(PathBuf::from("C:/docs").join("img/a.png")));
+        let base = if cfg!(windows) { "C:/docs" } else { "/docs" };
+        let resolved = resolve("img/a.png", Some(Path::new(base)));
+        assert_eq!(resolved, Some(Path::new(base).join("img/a.png")));
     }
 
     #[test]

@@ -13,6 +13,16 @@
 
 local M = {}
 
+--- True when `path` is absolute in either the POSIX or the Windows sense.
+---
+--- A leading separator covers `/x` and `\x`, and therefore a UNC share
+--- written as `\\server\share`; the drive form covers `C:/x` and `C:\x`.
+--- A relative destination — `docs/x.md`, `./x`, `../x` — is not absolute and
+--- is resolved against the document's directory by the caller.
+function M.is_absolute(path)
+  return path:match('^[/\\]') ~= nil or path:match('^%a:[/\\]') ~= nil
+end
+
 --- The index of the character closing the group opened at `open`, or nil.
 ---
 --- `opener` and `closer` are single characters, and nesting is counted, so

@@ -10,6 +10,27 @@
 
 local repo = assert(vim.env.MDRN_REPO, 'MDRN_REPO must be set to the repository root')
 
+local is_windows = vim.fn.has('win32') == 1
+
+--- Write a stand-in engine the host platform can execute.
+---
+--- A batch file is the only script Windows will run by name, and a POSIX shell
+--- script needs its executable bit set before `vim.fn.executable` will accept
+--- it. Taking both bodies keeps the call sites about the engine's behaviour
+--- rather than about the host's shell.
+local function stand_in_engine(dir, name, windows_lines, posix_lines)
+  local path = dir .. '/' .. name .. (is_windows and '.bat' or '')
+  if is_windows then
+    vim.fn.writefile(windows_lines, path)
+  else
+    local script = { '#!/bin/sh' }
+    vim.list_extend(script, posix_lines)
+    vim.fn.writefile(script, path)
+    vim.fn.setfperm(path, 'rwx------')
+  end
+  return path
+end
+
 vim.opt.runtimepath:prepend(repo)
 vim.opt.swapfile = false
 vim.opt.hidden = true
@@ -913,9 +934,12 @@ section('10.6', function()
   -- that fails on demand is a better test than a real engine broken on purpose.
   local dir = vim.fn.tempname()
   vim.fn.mkdir(dir, 'p')
-  vim.fn.writefile({ '@echo md-render: this engine is broken 1>&2', '@exit /b 3' },
-    dir .. '/fail.bat')
-  vim.fn.writefile({ '@echo not json at all', '@exit /b 0' }, dir .. '/garbage.bat')
+  local fail_engine = stand_in_engine(dir, 'fail',
+    { '@echo md-render: this engine is broken 1>&2', '@exit /b 3' },
+    { 'echo "md-render: this engine is broken" >&2', 'exit 3' })
+  local garbage_engine = stand_in_engine(dir, 'garbage',
+    { '@echo not json at all', '@exit /b 0' },
+    { "echo 'not json at all'", 'exit 0' })
 
   --- Load the fixture afresh with the engine pointed somewhere else, and return
   --- the notification that arrives.
@@ -949,7 +973,7 @@ section('10.6', function()
   truthy('10.6 and the window shows the source', in_s())
 
   -- An engine that runs and fails, with something to say about it.
-  local failed = with_engine(dir .. '/fail.bat', 'dracula')
+  local failed = with_engine(fail_engine, 'dracula')
   expect('10.6 an engine that exits non-zero is reported as an error',
     failed.level, vim.log.levels.ERROR)
   truthy('10.6 with the engine\'s own diagnostic',
@@ -957,7 +981,7 @@ section('10.6', function()
   truthy('10.6 and the window shows the source', in_s())
 
   -- And an engine that succeeds at producing nothing usable.
-  local garbage = with_engine(dir .. '/garbage.bat', 'gruvbox_dark')
+  local garbage = with_engine(garbage_engine, 'gruvbox_dark')
   expect('10.6 an engine whose output is not a document is reported as an error',
     garbage.level, vim.log.levels.ERROR)
   truthy('10.6 naming what was wrong with it', garbage.msg:find('not JSON') ~= nil, garbage.msg)
@@ -1242,13 +1266,15 @@ section('11.2', function()
 
   local dir = vim.fn.tempname()
   vim.fn.mkdir(dir, 'p')
-  vim.fn.writefile({ '@echo md-render: broken for 11.2 1>&2', '@exit /b 3' }, dir .. '/fail.bat')
+  local fail_engine = stand_in_engine(dir, 'fail',
+    { '@echo md-render: broken for 11.2 1>&2', '@exit /b 3' },
+    { 'echo "md-render: broken for 11.2" >&2', 'exit 3' })
 
   -- The engine is pointed elsewhere only after R is on screen, so the document
   -- the preview would render is already in hand: what is under test is the
   -- preview's own failure path, not the attach's.
   local before = #notifications
-  config.setup({ engine = dir .. '/fail.bat' })
+  config.setup({ engine = fail_engine })
   feed(config.options.keymaps.preview)
   truthy('11.2 the failure is reported',
     wait_until(function() return #notifications > before end))
@@ -1591,6 +1617,16 @@ section('12.1', function()
   expect('12.1 punctuation is dropped from a slug', link.slug('A, B!'), 'a-b')
   expect('12.1 the line of an anchor', link.anchor_line(lines, 'tail'), 30)
   expect('12.1 an anchor no heading matches', link.anchor_line(lines, 'nope'), nil)
+
+  -- Absolute destinations in every form the plugin accepts. A leading
+  -- separator covers POSIX and UNC; the drive form covers either separator.
+  truthy('12.1 is_absolute accepts a POSIX path', link.is_absolute('/x'))
+  truthy('12.1 is_absolute accepts a drive path with a forward slash',
+    link.is_absolute('C:/x'))
+  truthy('12.1 is_absolute accepts a drive path with a backslash',
+    link.is_absolute('C:\\x'))
+  truthy('12.1 is_absolute accepts a UNC path', link.is_absolute('\\\\server\\share'))
+  truthy('12.1 is_absolute rejects a relative path', not link.is_absolute('docs/x.md'))
 end)
 
 --------------------------------------------------------------------------------
@@ -1720,6 +1756,25 @@ section('12.2', function()
   truthy('12.2 the bare URL has a display row', goto_source(8))
   md.follow()
   eq_table('12.2 a URL goes to vim.ui.open', opened, { 'https://example.com/docs' })
+
+  -- An absolute destination is used as given rather than joined to the
+  -- document's directory. Both files are temporary: on Unix the target is a
+  -- POSIX absolute path, on Windows it is a drive path. Angle brackets keep a
+  -- temp directory with a space in its name a single destination.
+  local abs_target = vim.fn.tempname() .. '.md'
+  local abs_source = vim.fn.tempname() .. '.md'
+  vim.fn.writefile({ '# Absolute target' }, abs_target)
+  vim.fn.writefile({ '[absolute](<' .. abs_target .. '>)' }, abs_source)
+  vim.cmd('edit! ' .. vim.fn.fnameescape(abs_source))
+  md.attach(vim.api.nvim_get_current_buf(), vim.api.nvim_get_current_win())
+  truthy('12.2 in R on the absolute-link fixture', wait_until(showing_rendered))
+  md.follow()
+  truthy('12.2 an absolute destination opens as given', wait_until(function()
+    local s = state.windows[vim.api.nvim_get_current_win()]
+    return s ~= nil and s.source ~= nil
+      and vim.fs.normalize(vim.api.nvim_buf_get_name(s.source))
+        == vim.fs.normalize(abs_target)
+  end))
 
   vim.ui.open = real_ui_open
 end)
