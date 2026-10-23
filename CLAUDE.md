@@ -18,10 +18,19 @@ The engine knows nothing about Neovim; the plugin knows nothing about markdown. 
 
 ```bash
 cargo build --release -p md-render
+mkdir -p bin
 cp target/release/md-render.exe bin/md-render.exe
 ```
 
-`bin/` is gitignored — the copy is a local install step, not a commit. The plugin resolves the engine as: configured `engine` path → `md-render` on `PATH` → `<repo>/bin/md-render[.exe]`. A `PATH` copy therefore shadows `bin/`, and nothing detects a stale binary; rebuild and copy after any engine change before running the Lua suites.
+PowerShell:
+
+```powershell
+cargo build --release -p md-render
+New-Item -ItemType Directory -Force bin | Out-Null
+Copy-Item target/release/md-render.exe bin/md-render.exe
+```
+
+`bin/` is gitignored — the copy is a local install step, not a commit. The plugin resolves the engine as: configured `engine` path (authoritative) → `md-render` on `PATH` → `<repo>/bin/md-render[.exe]` → `<stdpath('data')>/md-render/md-render[.exe]`. A `PATH` copy therefore shadows `bin/`, and nothing detects a stale binary; rebuild and copy after any engine change before running the Lua suites. `:checkhealth md-render` reports which step matched.
 
 Cross-compiling from a machine without a Windows toolchain (needs a mingw-w64 linker):
 
@@ -63,6 +72,28 @@ nvim -l tests/interactive/run.lua
 ```
 
 `MDRN_REPO` must be set for the headless suite. The interactive suite starts a real Neovim and drives it with `--remote-send`; it exists because `nvim -l` never runs the main input loop, so `nvim_feedkeys` (the insert-entry keys) is never read and `TextChanged` (the re-render trigger) never fires. Anything depending on either can only be tested there.
+
+Editing `lua/md-render/` does not reload it in a running Neovim: Lua modules are cached in `package.loaded`, so restart the editor after a plugin change. `:MdRenderReset` clears cached renders and highlight groups only — it is not a module reload.
+
+### Quality gates
+
+CI (`.github/workflows/ci.yml`) runs these, and a PR is blocked on the aggregate `gate` job:
+
+```bash
+cargo fmt -p md-render -- --check
+cargo clippy -p md-render --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo check --workspace --locked                      # MSRV 1.92
+MDRN_REPO=$PWD nvim --headless -l tests/headless/run.lua
+nvim -l tests/interactive/run.lua
+nvim --headless -u NONE -c 'helptags doc' -c q && git diff --exit-code doc/tags
+openspec validate --all --no-interactive
+bash tools/check-readme.sh
+```
+
+The plugin job also opens `:help md-render` and calls `require('md-render.health').probe()`, failing when `report.ok` is false. `doc/tags` is committed and must be regenerated when `doc/md-render.txt` changes.
+
+Formatting and clippy are scoped to `md-render` on purpose: `crates/mermaid-text` and `crates/ascii-dag` are vendored copies kept close to upstream, and formatting them would bury the patches they carry.
 
 ### Looking at output by hand
 

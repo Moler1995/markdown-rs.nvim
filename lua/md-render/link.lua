@@ -13,6 +13,16 @@
 
 local M = {}
 
+--- True when `path` is absolute in either the POSIX or the Windows sense.
+---
+--- A leading separator covers `/x` and `\x`, and therefore a UNC share
+--- written as `\\server\share`; the drive form covers `C:/x` and `C:\x`.
+--- A relative destination — `docs/x.md`, `./x`, `../x` — is not absolute and
+--- is resolved against the document's directory by the caller.
+function M.is_absolute(path)
+  return path:match('^[/\\]') ~= nil or path:match('^%a:[/\\]') ~= nil
+end
+
 --- The index of the character closing the group opened at `open`, or nil.
 ---
 --- `opener` and `closer` are single characters, and nesting is counted, so
@@ -342,9 +352,17 @@ end
 --- The GitHub-style anchor a heading line produces.
 ---
 --- `%p` is ASCII punctuation in Lua's default locale, so a CJK heading keeps
---- its characters rather than slugging to nothing.
+--- its characters rather than slugging to nothing. A hyphen and an underscore
+--- are punctuation too, but GitHub keeps both in the anchor it generates, so
+--- `## 使用 deepseek-recipe` is reachable as `#使用-deepseek-recipe` and
+--- dropping the inner hyphen would make that link resolve to nothing.
 function M.slug(text)
-  text = text:lower():gsub('%p', '')
+  text = text:lower():gsub('%p', function(c)
+    if c == '-' or c == '_' then
+      return c
+    end
+    return ''
+  end)
   text = vim.trim(text)
   return (text:gsub('%s+', '-'))
 end

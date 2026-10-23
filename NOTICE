@@ -1,0 +1,29 @@
+# NOTICE
+
+md-render.nvim is MIT-licensed; see `LICENSE`. This file records the third-party
+material the repository carries.
+
+## Ported from markdown-reader
+
+Portions of this software are derived from markdown-reader
+(<https://github.com/leboiko/markdown-reader>), revision 4f0f635,
+Copyright (c) 2026 leboiko, and are used under the same MIT terms. Each ported
+file begins with a header comment naming that revision and describing what was
+removed and why. Ports are one-time lifts; there is no upstream tracking.
+
+## Vendored: mermaid-text 0.57.4
+
+`crates/mermaid-text` is a copy of the published `mermaid-text` 0.57.4 crate
+(<https://github.com/leboiko/markdown-reader/tree/master/crates/mermaid-text>),
+MIT, Copyright (c) leboiko. It carries two local changes: a determinism fix and
+a change to how message labels are filled (no shade-block characters, which
+make full-screen repaints crawl). Re-vendoring means reapplying those changes,
+not taking the next release.
+
+## Vendored: ascii-dag 0.9.1
+
+`crates/ascii-dag` is a copy of the published `ascii-dag` 0.9.1 crate
+(<https://github.com/AshutoshMahala/ascii-dag>), MIT OR Apache-2.0, Copyright
+(c) its authors. Both licence texts are kept next to the crate as
+`LICENSE-MIT` and `LICENSE-APACHE`. It carries one backported determinism fix,
+described in `crates/ascii-dag/VENDORED.md`.

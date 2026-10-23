@@ -16,9 +16,7 @@
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::block::DocBlock;
-use crate::image_art::{
-    Artwork, Bounds, ImageOptions, StyleBudget, animated_artwork, artwork,
-};
+use crate::image_art::{Artwork, Bounds, ImageOptions, StyleBudget, animated_artwork, artwork};
 use crate::mermaid::{MermaidLink, MermaidTextBackend, render_artwork};
 use crate::style::{Line, Span, Style};
 use crate::table::layout_table;
@@ -68,7 +66,10 @@ pub fn layout_document(
                     layout.push(source, line);
                 }
             }
-            DocBlock::Mermaid { source, source_line } => {
+            DocBlock::Mermaid {
+                source,
+                source_line,
+            } => {
                 layout.push_mermaid(source, *source_line);
             }
             DocBlock::Image {
@@ -184,13 +185,7 @@ impl<'a> Layout<'a> {
     /// row is never meant to wrap. A caller that ever passes an unclipped row
     /// gets the text without links rather than links pointing at the wrong
     /// bytes.
-    fn push_diagram_line(
-        &mut self,
-        source: u32,
-        text: &str,
-        style: Style,
-        links: Vec<WireLink>,
-    ) {
+    fn push_diagram_line(&mut self, source: u32, text: &str, style: Style, links: Vec<WireLink>) {
         let source = source.min(self.max_source);
         let line = Line::from(Span::styled(text, style));
         let wrapped = wrap_spans(&line.spans, self.width);
@@ -248,12 +243,7 @@ impl<'a> Layout<'a> {
             ..self.images
         };
         if self.images.animation
-            && let Some(art) = animated_artwork(
-                dest,
-                bounds,
-                &images,
-                &mut self.image_styles,
-            )
+            && let Some(art) = animated_artwork(dest, bounds, &images, &mut self.image_styles)
         {
             self.push_artwork(source_line, art);
             return;
@@ -364,19 +354,20 @@ impl<'a> Layout<'a> {
                     // clipped line too, which can only be narrower.
                     self.note_width(line.width());
                     let line = clip_to_width(line, self.width as usize);
-                    let links = clamp_links(
-                        art.links.get(i).map_or(no_links, Vec::as_slice),
-                        line.len(),
-                    );
+                    let links =
+                        clamp_links(art.links.get(i).map_or(no_links, Vec::as_slice), line.len());
                     self.push_diagram_line(source_line, line, art_style, links);
                 }
             }
             Err(_) => {
                 for (i, line) in source.lines().enumerate() {
-                    let line_source = source_line.saturating_add(1).saturating_add(
-                        crate::cast::u32_sat(i),
+                    let line_source = source_line
+                        .saturating_add(1)
+                        .saturating_add(crate::cast::u32_sat(i));
+                    self.push(
+                        Some(line_source),
+                        &Line::from(Span::styled(line, art_style)),
                     );
-                    self.push(Some(line_source), &Line::from(Span::styled(line, art_style)));
                 }
             }
         }
@@ -466,7 +457,11 @@ mod tests {
     /// The absolute, forward-slashed path of an image fixture, as a markdown
     /// destination would spell it.
     fn fixture(name: &str) -> String {
-        format!("{}/tests/fixtures/images/{name}", env!("CARGO_MANIFEST_DIR")).replace('\\', "/")
+        format!(
+            "{}/tests/fixtures/images/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        )
+        .replace('\\', "/")
     }
 
     /// The document's text, one string per display line, joined by newlines.
@@ -502,11 +497,8 @@ mod tests {
         let paragraph = "word ".repeat(60);
         let doc = layout(&paragraph, 40);
 
-        let content_lines: Vec<&WireLine> = doc
-            .lines
-            .iter()
-            .filter(|l| !l.spans.is_empty())
-            .collect();
+        let content_lines: Vec<&WireLine> =
+            doc.lines.iter().filter(|l| !l.spans.is_empty()).collect();
         assert!(
             content_lines.len() > 1,
             "a 300-column paragraph must occupy several lines at width 40"
@@ -541,7 +533,8 @@ mod tests {
 
     #[test]
     fn every_line_anchor_is_a_real_source_line() {
-        let content = "# H\n\npara\n\n```rust\nlet x = 1;\n```\n\n```mermaid\ngraph LR\n A-->B\n```\n";
+        let content =
+            "# H\n\npara\n\n```rust\nlet x = 1;\n```\n\n```mermaid\ngraph LR\n A-->B\n```\n";
         let doc = layout(content, 60);
         let count = source_line_count(content) as u32;
         for (i, line) in doc.lines.iter().enumerate() {
@@ -613,12 +606,7 @@ mod tests {
         let text: String = doc
             .lines
             .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.1.as_str())
-                    .collect::<String>()
-            })
+            .map(|l| l.spans.iter().map(|s| s.1.as_str()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -782,10 +770,16 @@ mod tests {
         let doc = layout(&crlf, 80);
         let lines: Vec<String> = doc.lines.iter().map(line_text).collect();
         let Some(first) = lines.iter().position(|l| l.contains("fn main() {}")) else {
-            panic!("the first code line must be rendered:\n{}", lines.join("\n"));
+            panic!(
+                "the first code line must be rendered:\n{}",
+                lines.join("\n")
+            );
         };
         let Some(second) = lines.iter().position(|l| l.contains("let x = 1;")) else {
-            panic!("the second code line must be rendered:\n{}", lines.join("\n"));
+            panic!(
+                "the second code line must be rendered:\n{}",
+                lines.join("\n")
+            );
         };
         assert_eq!(
             second,
@@ -815,7 +809,10 @@ mod tests {
     fn display_math_renders_as_text_within_the_width() {
         let content = "$$\n\\frac{a}{b} = c\n$$\n";
         let doc = layout(content, 60);
-        assert!(!doc.lines.is_empty(), "a display-math block must produce lines");
+        assert!(
+            !doc.lines.is_empty(),
+            "a display-math block must produce lines"
+        );
         for line in &doc.lines {
             assert!(display_width(line) <= 60);
         }
@@ -884,7 +881,10 @@ mod tests {
 
     #[test]
     fn a_renderable_image_becomes_artwork_at_the_references_line() {
-        let content = format!("before\n\n![cells]({})\n\nafter\n", fixture("image_cells.png"));
+        let content = format!(
+            "before\n\n![cells]({})\n\nafter\n",
+            fixture("image_cells.png")
+        );
         let doc = layout(&content, 80);
         let text: Vec<String> = doc.lines.iter().map(line_text).collect();
 
@@ -969,7 +969,7 @@ mod tests {
 
     #[test]
     fn an_animation_over_the_caps_is_named_and_carries_no_frames() {
-        let content = format!("text\n\n![big]({})\n", fixture("image_257.gif"));
+        let content = format!("text\n\n![big]({})\n", fixture("image_4097.gif"));
         let doc = animated_layout(&content, 40);
 
         assert!(
@@ -984,6 +984,26 @@ mod tests {
         assert!(
             !doc.lines.is_empty(),
             "the first frame is still drawn as ordinary artwork"
+        );
+    }
+
+    #[test]
+    fn a_sampled_animation_carries_frames_without_being_named() {
+        let content = format!("text\n\n![big]({})\n", fixture("image_513.gif"));
+        let doc = animated_layout(&content, 40);
+
+        assert_eq!(doc.animations.len(), 1);
+        assert_eq!(
+            doc.animations[0].source, 2,
+            "the animation is placed at the reference's line"
+        );
+        assert!(
+            doc.animations[0].frames.len() <= 256,
+            "the carried frames fit the budget"
+        );
+        assert!(
+            doc.animations_limited.is_empty(),
+            "a sampled animation is not a refused one"
         );
     }
 
@@ -1057,7 +1077,10 @@ mod tests {
 
     #[test]
     fn two_animated_renders_are_byte_identical() {
-        let content = format!("before\n\n![anim]({})\n\nafter\n", fixture("image_animation.gif"));
+        let content = format!(
+            "before\n\n![anim]({})\n\nafter\n",
+            fixture("image_animation.gif")
+        );
         let first = serde_json::to_string(&animated_layout(&content, 40)).expect("serialise");
         let second = serde_json::to_string(&animated_layout(&content, 40)).expect("serialise");
         assert_eq!(first, second);

@@ -1,36 +1,54 @@
 # Building and shipping the engine binary
 
-The plugin does not build Rust. It looks for a prebuilt executable, and this
-document covers where that executable comes from and what happens when it is
-not there.
+The plugin does not build Rust. It looks for a prebuilt `md-render` executable,
+and this document covers where that executable comes from, where the plugin
+looks for it, and what happens when it is missing or out of step.
 
-## Building
+## Where the engine comes from
 
-A stock toolchain builds the engine for whatever platform it runs on:
+There are two routes, and neither involves the plugin fetching anything.
+
+**A release.** Each tagged release ships one archive per target:
+
+| Archive | Target |
+| --- | --- |
+| `md-render-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` | Linux, static musl |
+| `md-render-vX.Y.Z-x86_64-pc-windows-msvc.zip` | Windows, static MSVC CRT |
+| `md-render-vX.Y.Z-universal-apple-darwin.tar.gz` | macOS, Intel and Apple silicon |
+
+Unpack it and put the binary where the plugin looks (see below), most often
+`<stdpath('data')>/md-render/md-render[.exe]`.
+
+**A source build.** A stock toolchain builds the engine for whatever platform
+it runs on:
 
 ```bash
 cargo build --release -p md-render
 ```
 
-That produces `target/release/md-render` (or `md-render.exe`). This is the path
-a developer working on the engine itself should use.
-
-## The Windows binary
-
-`bin/md-render.exe` is a build artifact and is not in the repository. Copy a
-build there once and the plugin has its engine:
+That produces `target/release/md-render` (or `md-render.exe`). A plugin loaded
+from a checkout finds a copy in the repository's `bin/`:
 
 ```bash
 cargo build --release -p md-render
-cp target/release/md-render.exe bin/md-render.exe
+mkdir -p bin
+cp target/release/md-render bin/md-render
 ```
 
-It was committed for a while, on the grounds that Neovim users on Windows have
-no Rust toolchain and no build step. That is still true of the *user*, but the
-binary belongs to whoever builds the plugin, and keeping a 4.6 MB artifact in
-the history meant every rebuild showed up as a change to commit.
+PowerShell:
 
-When the only route was a Linux development machine it was cross-compiled:
+```powershell
+cargo build --release -p md-render
+New-Item -ItemType Directory -Force bin | Out-Null
+Copy-Item target/release/md-render.exe bin/md-render.exe
+```
+
+`Cargo.toml` sets `lto = "thin"`, `strip = "symbols"` and `panic = "abort"` for
+the release profile. The engine is spawned once per render, so start-up latency
+is visible to the user and a smaller binary is a faster one to page in.
+
+Cross-compiling from a machine without a Windows toolchain still works and
+needs a mingw-w64 linker:
 
 ```bash
 rustup target add x86_64-pc-windows-gnu
@@ -38,44 +56,63 @@ cargo build --release --target x86_64-pc-windows-gnu -p md-render
 cp target/x86_64-pc-windows-gnu/release/md-render.exe bin/md-render.exe
 ```
 
-The `x86_64-pc-windows-gnu` target needs a mingw-w64 linker. It links against
-the GNU C runtime rather than MSVC's, which is what makes the cross-compile
-possible from Linux without a Windows SDK — and it runs on Windows without any
-runtime to install, because the MinGW runtime is statically linked in. A native
-GNU toolchain produces the same target directly, so this is now only for a
-machine that has no Windows toolchain of its own.
+The release workflow uses the MSVC target instead, so the published Windows
+archive has no MinGW runtime to install.
 
-`Cargo.toml` sets `lto = "thin"`, `strip = "symbols"` and `panic = "abort"` for
-the release profile. The engine is spawned once per render, so start-up latency
-is visible to the user and a smaller binary is a faster one to page in.
+## Where the plugin looks
 
-## What the plugin does when the binary is missing
+The order is implemented in `lua/md-render/engine.lua` and must match this list:
 
-The plugin looks for the executable in this order:
+1. the `engine` option (`require('md-render').setup{ engine = '...' }`), used
+   as given;
+2. `md-render` on `PATH`;
+3. `<plugin-root>/bin/md-render[.exe]` — a local build;
+4. `<stdpath('data')>/md-render/md-render[.exe]` — a downloaded release.
 
-1. `g:md_render_binary`, if the user set it.
-2. `<plugin root>/bin/md-render.exe`.
+A configured `engine` is authoritative: a path that is missing or not
+executable is reported and the search stops. Falling through would silently run
+a different engine than the one the user named. The automatic candidates are
+checked with `executable()`, so a file that exists but cannot run is skipped
+rather than failing later with `EACCES`.
 
-If neither resolves, the plugin does not render. It leaves the buffer as
-source, reports that the engine was not found, and says how to build it. It
-does not fall back to a partial render or to a placeholder: showing something
-that is not the document would be worse than showing the document.
+The repository's `bin/` is ahead of the data directory so a fresh local build
+is not shadowed by an older download. `:checkhealth md-render` reports the path
+that won and the step that produced it, which is what makes a `PATH` shadow
+visible.
 
-A user who has a Rust toolchain can point `g:md_render_binary` at their own
-build, which is also how an engine change is tested against the plugin without
-installing the binary into `bin/`.
+If nothing resolves, the plugin does not render. It leaves the buffer as
+source, reports every location searched, and gives both ways of obtaining the
+engine. It does not fall back to a partial render or to a placeholder: showing
+something that is not the document would be worse than showing the document.
+
+## The wire-version check
+
+Every document carries a `version` field: the wire format the engine speaks.
+The plugin refuses a document whose version it does not know:
+
+```
+the engine at <path> speaks wire format 2, but this plugin expects 1.
+Rebuild the engine from this checkout (`cargo build --release -p md-render`),
+or upgrade the plugin and the engine together.
+```
+
+This is the only staleness the plugin can detect, and it is a hard error
+because the alternative is reading a document whose shape has changed as if it
+had not. A binary built from a revision that kept the wire format is
+indistinguishable — byte-identical output is the contract, so there is nothing
+else to compare.
 
 ## Keeping the local binary current
 
-`bin/md-render.exe` is untracked, so nothing tells you when it falls out of
-step with the sources: a stale copy is a plugin that renders with an old engine.
-When the wire format or the rendering changes, rebuild and reinstall it:
+`bin/` is untracked, so nothing tells a developer when its engine falls out of
+step with the sources. Rebuild and copy after every engine change:
 
 ```bash
 cargo build --release -p md-render
-cp target/release/md-render.exe bin/md-render.exe
+mkdir -p bin
+cp target/release/md-render bin/md-render
 ```
 
-The plugin has no way to detect a stale binary beyond the `version` field in
-the output, and a version mismatch is a hard error rather than a silent
-misrender.
+The plugin's test suites both run against the real binary, so a stale copy can
+also make a correct plugin change fail. See `CONTRIBUTING.md` for the full
+sequence.

@@ -20,8 +20,8 @@ use md_render::document::{layout_document, source_line_count};
 use md_render::image_art::{
     DitherMode, ImageBackground, ImageEncoding, ImageOptions, ImagePalette,
 };
-use md_render::style::Color;
 use md_render::renderer::render_markdown;
+use md_render::style::Color;
 use md_render::theme::{Palette, Theme};
 
 /// Render markdown to styled display lines.
@@ -79,7 +79,11 @@ struct Cli {
     ///
     /// `terminal` leaves them to the terminal (the default); `theme` uses the
     /// selected theme's background; `#rrggbb` names a colour.
-    #[arg(long, default_value = "terminal", value_name = "terminal|theme|#rrggbb")]
+    #[arg(
+        long,
+        default_value = "terminal",
+        value_name = "terminal|theme|#rrggbb"
+    )]
     image_background: String,
 
     /// The colour braille artwork is drawn on.
@@ -269,6 +273,9 @@ fn parse_theme(name: &str) -> Result<Theme, String> {
     let normalised = name.replace('-', "_");
     serde_json::from_value(serde_json::Value::String(normalised)).map_err(|_| {
         let names: Vec<String> = Theme::ALL.iter().copied().map(theme_name).collect();
-        format!("unknown theme `{name}`; expected one of: {}", names.join(", "))
+        format!(
+            "unknown theme `{name}`; expected one of: {}",
+            names.join(", ")
+        )
     })
 }

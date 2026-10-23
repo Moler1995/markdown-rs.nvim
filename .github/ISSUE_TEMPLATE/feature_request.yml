@@ -1,0 +1,39 @@
+name: Feature request
+description: Suggest a rendering option, a key, or a capability
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that the plugin does not make possible or convenient?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like
+      description: The behaviour you imagine. A sketch of the option or key is enough.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: side
+    attributes:
+      label: Which half does this belong to?
+      description: Rendering decisions live in the Rust engine; buffer and window policy lives in the plugin.
+      options:
+        - Not sure
+        - Engine (rendering and layout)
+        - Plugin (buffer, keys, windows)
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: An existing option, a different key, or an outside tool.
+    validations:
+      required: false

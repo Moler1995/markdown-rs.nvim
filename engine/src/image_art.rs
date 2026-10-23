@@ -62,13 +62,23 @@ pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 /// cells either way.
 pub const MAX_PIXELS: u64 = 16_000_000;
 
-/// The most frames an animated image may contribute.
+/// The most frames an animated image may carry.
 ///
-/// A frame costs a decode and a set of lines on the wire, and a resize
-/// re-renders the document, so an image with thousands of frames is not
-/// something a reading view can honour. Past this bound the image renders as
-/// its first frame with no animation data at all (see [`MAX_ANIMATION_PIXELS`]).
+/// A frame costs a set of lines on the wire and a set of styles, so an image
+/// with thousands of frames is not something a reading view can honour. An
+/// animation with more frames is reduced to a subset of this size rather than
+/// refused; the delays of the frames it stands for are folded into each kept
+/// frame, so the loop keeps its total duration.
 pub const MAX_ANIMATION_FRAMES: usize = 256;
+
+/// The most frames an animation may decode before it is refused.
+///
+/// The frame budget above bounds what is carried, not the work: a GIF's later
+/// frames are decoded as deltas, so reaching frame 4 000 still decodes 4 000
+/// frames. This ceiling bounds that work independently of
+/// [`MAX_ANIMATION_PIXELS`], which a file of tiny frames can stay under
+/// indefinitely.
+pub const MAX_DECODED_FRAMES: usize = 4_096;
 
 /// The most decoded pixels an animation may cost, cumulatively.
 ///
@@ -77,11 +87,12 @@ pub const MAX_ANIMATION_FRAMES: usize = 256;
 /// arrive, so peak memory stays at one frame — this bound is about decode CPU
 /// and the size of the render request, not memory.
 ///
-/// 64 megapixels covers a common 640 × 360 GIF of 189 frames (43.5 MP) with
-/// room to spare, while still refusing the animations whose first step would
-/// take seconds. It is twice the original 32 MP because that bound rejected a
-/// real-world GIF that was otherwise ordinary.
-pub const MAX_ANIMATION_PIXELS: u64 = 64_000_000;
+/// 128 megapixels covers a 640 × 360 GIF of 533 frames (122.8 MP) — a
+/// real-world file whose first step takes about 3.5 seconds — while still
+/// refusing animations that would take much longer. It is twice the previous
+/// 64 MP because that bound refused the 533-frame file even though frame
+/// sampling could carry it.
+pub const MAX_ANIMATION_PIXELS: u64 = 128_000_000;
 
 /// The least coverage a cell needs before it is drawn when the terminal's own
 /// background is in use.
@@ -122,12 +133,7 @@ const DITHER_AMPLITUDE: f32 = 32.0;
 /// Fixed and position-indexed, so the same input renders the same bytes on
 /// every run. The 4 × 4 size repeats every four sub-cells, which is coarse
 /// enough to read as texture rather than as per-cell noise.
-const BAYER4: [[u8; 4]; 4] = [
-    [0, 8, 2, 10],
-    [12, 4, 14, 6],
-    [3, 11, 1, 9],
-    [15, 7, 13, 5],
-];
+const BAYER4: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
 /// The signed dither offset for a sub-cell at `(x, y)`, in `[-0.5, 0.5)`.
 fn dither_offset(x: u32, y: u32) -> f32 {
@@ -138,18 +144,12 @@ fn dither_offset(x: u32, y: u32) -> f32 {
 /// `rgb` shifted by the ordered dither at `(x, y)`.
 fn dithered([r, g, b]: [u8; 3], x: u32, y: u32) -> [u8; 3] {
     let offset = dither_offset(x, y) * DITHER_AMPLITUDE;
-    [
-        shift(r, offset),
-        shift(g, offset),
-        shift(b, offset),
-    ]
+    [shift(r, offset), shift(g, offset), shift(b, offset)]
 }
 
 /// One channel plus `offset`, clamped to 0–255.
 fn shift(channel: u8, offset: f32) -> u8 {
-    (f32::from(channel) + offset)
-        .round()
-        .clamp(0.0, 255.0) as u8
+    (f32::from(channel) + offset).round().clamp(0.0, 255.0) as u8
 }
 
 /// The sixty-four colours every image is drawn from.
@@ -401,13 +401,14 @@ pub struct AnimationFrame {
     pub lines: Vec<Line>,
 }
 
-/// An image drawn for animation: the first frame, plus every frame when the
-/// image animates within the caps.
+/// An image drawn for animation: the first frame, plus the frames the document
+/// carries.
 ///
 /// `frames` is empty for a still image, a reference that does not resolve, and
-/// an animation that exceeds [`MAX_ANIMATION_FRAMES`] or
+/// an animation that exceeds [`MAX_DECODED_FRAMES`] or
 /// [`MAX_ANIMATION_PIXELS`]. In every one of those cases `lines` is the same
-/// artwork an ordinary render produces, so the static view is unchanged.
+/// artwork an ordinary render produces, so the static view is unchanged. An
+/// animation over [`MAX_ANIMATION_FRAMES`] is not empty: it carries a subset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Artwork {
     pub lines: Vec<Line>,
@@ -477,8 +478,9 @@ pub fn animated_artwork(
         options,
         image.width(),
         image.height(),
-        MAX_ANIMATION_FRAMES,
+        MAX_DECODED_FRAMES,
         MAX_ANIMATION_PIXELS,
+        MAX_ANIMATION_FRAMES,
         budget,
     );
     // A single-frame "animation" is a still image, and carrying it as frames
@@ -575,14 +577,19 @@ fn resolves_dither(mode: DitherMode, encoding: ImageEncoding, palette: ImagePale
     }
 }
 
-/// True when an animation of `frame_count` frames that decodes `pixels` pixels
-/// in total is within the animation caps.
+/// True when an animation that decodes `frame_count` frames and `pixels` pixels
+/// in total is within the hard animation bounds.
 ///
-/// Both bounds are inclusive: an image of exactly [`MAX_ANIMATION_FRAMES`] or
-/// exactly [`MAX_ANIMATION_PIXELS`] still animates.
+/// The carried-frame budget is not checked here: an animation over it is
+/// reduced to a subset rather than refused. Both bounds are inclusive.
 #[must_use]
 pub fn animation_within_bounds(frame_count: usize, pixels: u64) -> bool {
-    within_bounds(frame_count, pixels, MAX_ANIMATION_FRAMES, MAX_ANIMATION_PIXELS)
+    within_bounds(
+        frame_count,
+        pixels,
+        MAX_DECODED_FRAMES,
+        MAX_ANIMATION_PIXELS,
+    )
 }
 
 /// [`animation_within_bounds`] against explicit limits, so the cap can be
@@ -595,9 +602,10 @@ fn within_bounds(frame_count: usize, pixels: u64, max_frames: usize, max_pixels:
 enum Collected {
     /// Not a GIF or animated WebP, a still one, or a file that would not decode.
     Still,
-    /// The animation exists but is past `max_frames` or `max_pixels`.
+    /// The animation exists but is past `max_decoded_frames` or `max_pixels`.
     TooLarge,
-    /// Every frame, in file order.
+    /// The frames the document carries, in file order. Within `max_kept` this
+    /// is every frame; past it, a deterministic subset.
     Frames(Vec<AnimationFrame>),
 }
 
@@ -619,8 +627,9 @@ fn collect_animation(
     options: &ImageOptions,
     width: u32,
     height: u32,
-    max_frames: usize,
+    max_decoded_frames: usize,
     max_pixels: u64,
+    max_kept: usize,
     budget: &mut StyleBudget,
 ) -> Collected {
     let Ok(reader) = image::ImageReader::open(path) else {
@@ -663,28 +672,67 @@ fn collect_animation(
         return Collected::Still;
     }
 
-    let mut out = Vec::new();
+    // Sampling is a streaming downsample: every frame is kept until the buffer
+    // would pass `max_kept`, then every second kept frame is dropped and the
+    // stride doubles. The kept frames are therefore the decoded frames whose
+    // zero-based index is a multiple of the current stride, which starts at the
+    // first frame, preserves file order and needs no knowledge of the total.
+    // A dropped frame's display time is added to the kept frame before it, so
+    // the loop runs for as long as the file says it should.
+    let mut out: Vec<AnimationFrame> = Vec::new();
     let mut pixels = 0u64;
+    let mut decoded = 0usize;
+    let mut stride = 1usize;
     for frame in frames {
         let Ok(frame) = frame else {
             return Collected::Still;
         };
-        let count = out.len() + 1;
+        let index = decoded;
+        decoded += 1;
         let Some(total) = pixels.checked_add(frame_pixels) else {
             return Collected::TooLarge;
         };
         pixels = total;
-        if !within_bounds(count, pixels, max_frames, max_pixels) {
+        if !within_bounds(decoded, pixels, max_decoded_frames, max_pixels) {
             return Collected::TooLarge;
         }
-        let delay_ms = delay_ms(frame.delay());
+        let delay = delay_ms(frame.delay());
+        if !index.is_multiple_of(stride) {
+            if let Some(last) = out.last_mut() {
+                last.delay_ms = last.delay_ms.saturating_add(delay);
+            }
+            continue;
+        }
         let image = Pixels::new(DynamicImage::ImageRgba8(frame.into_buffer()));
         out.push(AnimationFrame {
-            delay_ms,
+            delay_ms: delay,
             lines: draw(&image, cols, rows, enlarge, reduced, options, budget),
         });
+        if out.len() > max_kept {
+            out = halve_kept(out);
+            stride *= 2;
+        }
     }
     Collected::Frames(out)
+}
+
+/// Drop every second frame of `frames`, adding its delay to the kept frame
+/// before it.
+///
+/// This is the half of the streaming downsample that acts on frames already
+/// collected: dropping the odd positions leaves the even ones, which are the
+/// decoded frames the doubled stride keeps, and folding the delay preserves the
+/// interval each survivor stands for.
+fn halve_kept(frames: Vec<AnimationFrame>) -> Vec<AnimationFrame> {
+    let mut kept = Vec::with_capacity(frames.len().div_ceil(2));
+    for (index, frame) in frames.into_iter().enumerate() {
+        if index % 2 == 0 {
+            kept.push(frame);
+        } else if let Some(previous) = kept.last_mut() {
+            previous.delay_ms = previous.delay_ms.saturating_add(frame.delay_ms);
+        }
+    }
+    kept
 }
 
 /// A frame's delay in whole milliseconds.
@@ -710,7 +758,9 @@ fn resolve(dest: &str, base: Option<&Path>) -> Option<PathBuf> {
         return None;
     }
     let scheme = trimmed.to_ascii_lowercase();
-    if scheme.starts_with("http://") || scheme.starts_with("https://") || scheme.starts_with("data:")
+    if scheme.starts_with("http://")
+        || scheme.starts_with("https://")
+        || scheme.starts_with("data:")
     {
         return None;
     }
@@ -802,12 +852,7 @@ fn load(path: &Path) -> Option<Pixels> {
 /// Returns the grid and the whole enlargement factor that was applied. The
 /// factor is 1 unless `min_rows` asks for more rows than the image has at
 /// natural size, and it never takes the image past the width or height bound.
-fn cell_grid(
-    src_w: u32,
-    src_h: u32,
-    bounds: Bounds,
-    min_rows: u16,
-) -> Option<(u32, u32, u32)> {
+fn cell_grid(src_w: u32, src_h: u32, bounds: Bounds, min_rows: u16) -> Option<(u32, u32, u32)> {
     if src_w == 0 || src_h == 0 || bounds.width == 0 {
         return None;
     }
@@ -958,7 +1003,10 @@ fn band(src: u32, out: u32, i: u32) -> (u32, u32) {
     // an image with an odd number of rows.
     let start = (i * src / out).min(src - 1);
     let end = ((i + 1) * src / out).clamp(start + 1, src);
-    (u32::try_from(start).unwrap_or(0), u32::try_from(end).unwrap_or(0))
+    (
+        u32::try_from(start).unwrap_or(0),
+        u32::try_from(end).unwrap_or(0),
+    )
 }
 
 /// The mean colour of a rectangle, if any of its pixels carry colour.
@@ -1009,11 +1057,7 @@ fn average_region<const N: usize>(
         return None;
     }
     Some(Average {
-        linear: [
-            sums[0] / coverage,
-            sums[1] / coverage,
-            sums[2] / coverage,
-        ],
+        linear: [sums[0] / coverage, sums[1] / coverage, sums[2] / coverage],
         alpha: coverage / count as f32,
     })
 }
@@ -1025,8 +1069,7 @@ fn resolve_sample(average: Average, backdrop: Option<[f32; 3]>) -> Option<[u8; 3
         // No compositing without a named background: a cell that is mostly
         // transparent is left to the terminal, and one that is mostly opaque
         // keeps its own colour rather than a guess at what is behind it.
-        None => (average.alpha >= ALPHA_COVERAGE)
-            .then(|| average.linear.map(delinearize)),
+        None => (average.alpha >= ALPHA_COVERAGE).then(|| average.linear.map(delinearize)),
         Some(backdrop) => {
             let alpha = average.alpha;
             Some(std::array::from_fn(|i| {
@@ -1099,9 +1142,7 @@ fn sharpen_samples(samples: &mut [Option<[u8; 3]>], cols: u32, rows: u32) {
             let sharpened = std::array::from_fn(|channel| {
                 let blur = blurred[channel] / weight;
                 let value = f32::from(centre[channel]);
-                (value + AMOUNT * (value - blur))
-                    .round()
-                    .clamp(0.0, 255.0) as u8
+                (value + AMOUNT * (value - blur)).round().clamp(0.0, 255.0) as u8
             });
             out[(y * cols + x) as usize] = Some(sharpened);
         }
@@ -1401,10 +1442,7 @@ fn luminance([r, g, b]: [u8; 3]) -> f32 {
 /// half that should be empty, not leave it alone.
 fn half_block(upper: Option<Color>, lower: Option<Color>) -> (char, Style) {
     match (upper, lower) {
-        (Some(upper), Some(lower)) => (
-            '\u{2580}',
-            Style::default().fg(upper).bg(lower),
-        ),
+        (Some(upper), Some(lower)) => ('\u{2580}', Style::default().fg(upper).bg(lower)),
         (Some(upper), None) => ('\u{2580}', Style::default().fg(upper)),
         (None, Some(lower)) => ('\u{2584}', Style::default().fg(lower)),
         (None, None) => (' ', Style::default()),
@@ -1633,10 +1671,7 @@ fn partition_means(present: &[[u8; 3]; 4], partition: u8) -> ([u8; 3], [u8; 3]) 
         }
         counts[side] += 1;
     }
-    (
-        average(sums[0], counts[0]),
-        average(sums[1], counts[1]),
-    )
+    (average(sums[0], counts[0]), average(sums[1], counts[1]))
 }
 
 /// How badly `partition`'s two colours explain the four samples.
@@ -1734,12 +1769,7 @@ fn encode_ascii(
 ///
 /// The standard braille numbering: dots 1–3 and 7 down the left column, 4–6
 /// and 8 down the right. U+2800 plus these bits is the glyph.
-const BRAILLE_BITS: [[u8; 2]; 4] = [
-    [0x01, 0x08],
-    [0x02, 0x10],
-    [0x04, 0x20],
-    [0x40, 0x80],
-];
+const BRAILLE_BITS: [[u8; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
 
 /// Draw the sampled grid as braille dot patterns.
 ///
@@ -1888,14 +1918,20 @@ mod tests {
 
     #[test]
     fn absolute_destinations_are_used_as_given() {
-        let resolved = resolve("C:/docs/a.png", Some(Path::new("C:/other")));
-        assert_eq!(resolved, Some(PathBuf::from("C:/docs/a.png")));
+        let (absolute, base) = if cfg!(windows) {
+            ("C:/docs/a.png", "C:/other")
+        } else {
+            ("/docs/a.png", "/other")
+        };
+        let resolved = resolve(absolute, Some(Path::new(base)));
+        assert_eq!(resolved, Some(PathBuf::from(absolute)));
     }
 
     #[test]
     fn relative_destinations_resolve_against_the_base() {
-        let resolved = resolve("img/a.png", Some(Path::new("C:/docs")));
-        assert_eq!(resolved, Some(PathBuf::from("C:/docs").join("img/a.png")));
+        let base = if cfg!(windows) { "C:/docs" } else { "/docs" };
+        let resolved = resolve("img/a.png", Some(Path::new(base)));
+        assert_eq!(resolved, Some(Path::new(base).join("img/a.png")));
     }
 
     #[test]
@@ -1976,7 +2012,15 @@ mod tests {
     #[test]
     fn a_wide_image_is_scaled_to_the_width() {
         assert_eq!(
-            cell_grid(1200, 600, Bounds { width: 80, height: None }, 0),
+            cell_grid(
+                1200,
+                600,
+                Bounds {
+                    width: 80,
+                    height: None
+                },
+                0
+            ),
             Some((80, 20, 1))
         );
     }
@@ -1984,7 +2028,15 @@ mod tests {
     #[test]
     fn a_narrow_image_is_not_enlarged_by_default() {
         assert_eq!(
-            cell_grid(16, 8, Bounds { width: 80, height: None }, 0),
+            cell_grid(
+                16,
+                8,
+                Bounds {
+                    width: 80,
+                    height: None
+                },
+                0
+            ),
             Some((16, 4, 1))
         );
     }
@@ -1992,8 +2044,16 @@ mod tests {
     #[test]
     fn the_height_bound_binds_first() {
         // 400x2000 at width 80 would be 100 rows; the page has 40.
-        let (cols, rows, _) =
-            cell_grid(400, 2000, Bounds { width: 80, height: Some(40) }, 0).unwrap();
+        let (cols, rows, _) = cell_grid(
+            400,
+            2000,
+            Bounds {
+                width: 80,
+                height: Some(40),
+            },
+            0,
+        )
+        .unwrap();
         assert_eq!(rows, 40);
         assert!(cols <= 80);
         // The aspect ratio survives: cols/rows ≈ 2 * 400/2000.
@@ -2003,37 +2063,110 @@ mod tests {
     #[test]
     fn a_short_image_keeps_its_natural_height_on_a_tall_page() {
         assert_eq!(
-            cell_grid(20, 10, Bounds { width: 80, height: Some(40) }, 0),
+            cell_grid(
+                20,
+                10,
+                Bounds {
+                    width: 80,
+                    height: Some(40)
+                },
+                0
+            ),
             Some((20, 5, 1))
         );
     }
 
     #[test]
     fn no_room_for_a_cell_is_a_fallback() {
-        assert_eq!(cell_grid(10, 10, Bounds { width: 0, height: None }, 0), None);
         assert_eq!(
-            cell_grid(10, 10, Bounds { width: 80, height: Some(0) }, 0),
+            cell_grid(
+                10,
+                10,
+                Bounds {
+                    width: 0,
+                    height: None
+                },
+                0
+            ),
             None
         );
-        assert_eq!(cell_grid(0, 10, Bounds { width: 80, height: None }, 0), None);
-        assert_eq!(cell_grid(10, 0, Bounds { width: 80, height: None }, 0), None);
+        assert_eq!(
+            cell_grid(
+                10,
+                10,
+                Bounds {
+                    width: 80,
+                    height: Some(0)
+                },
+                0
+            ),
+            None
+        );
+        assert_eq!(
+            cell_grid(
+                0,
+                10,
+                Bounds {
+                    width: 80,
+                    height: None
+                },
+                0
+            ),
+            None
+        );
+        assert_eq!(
+            cell_grid(
+                10,
+                0,
+                Bounds {
+                    width: 80,
+                    height: None
+                },
+                0
+            ),
+            None
+        );
     }
 
     #[test]
     fn a_minimum_height_enlarges_by_the_smallest_whole_factor() {
         // 16x16 is 8 natural rows; a minimum of 10 takes factor 2 (16 rows).
         assert_eq!(
-            cell_grid(16, 16, Bounds { width: 80, height: None }, 10),
+            cell_grid(
+                16,
+                16,
+                Bounds {
+                    width: 80,
+                    height: None
+                },
+                10
+            ),
             Some((32, 16, 2))
         );
         // A minimum already met changes nothing.
         assert_eq!(
-            cell_grid(16, 16, Bounds { width: 80, height: None }, 8),
+            cell_grid(
+                16,
+                16,
+                Bounds {
+                    width: 80,
+                    height: None
+                },
+                8
+            ),
             Some((16, 8, 1))
         );
         // 16 rows at factor 2 would cross the height bound, so it is not taken.
         assert_eq!(
-            cell_grid(16, 16, Bounds { width: 80, height: Some(8) }, 10),
+            cell_grid(
+                16,
+                16,
+                Bounds {
+                    width: 80,
+                    height: Some(8)
+                },
+                10
+            ),
             Some((16, 8, 1))
         );
     }
@@ -2041,7 +2174,12 @@ mod tests {
     // ── Sampling ───────────────────────────────────────────────────────────
 
     /// One sub-cell grid of `cols` × `rows` samples over `img`.
-    fn sample_grid(img: RgbaImage, cols: u32, rows: u32, background: ImageBackground) -> Vec<Option<[u8; 3]>> {
+    fn sample_grid(
+        img: RgbaImage,
+        cols: u32,
+        rows: u32,
+        background: ImageBackground,
+    ) -> Vec<Option<[u8; 3]>> {
         sample(&Pixels::Rgba(img), cols, rows, 1, background)
     }
 
@@ -2063,12 +2201,16 @@ mod tests {
     fn a_half_transparent_region_averages_only_its_opaque_pixels() {
         // Two pixels: one red and opaque, one green and transparent. The
         // average must be red, not a blend with the transparent pixel.
-        let img = image(2, 2, &[
-            [255, 0, 0, 255],
-            [0, 255, 0, 0],
-            [255, 0, 0, 255],
-            [0, 255, 0, 0],
-        ]);
+        let img = image(
+            2,
+            2,
+            &[
+                [255, 0, 0, 255],
+                [0, 255, 0, 0],
+                [255, 0, 0, 255],
+                [0, 255, 0, 0],
+            ],
+        );
         let samples = sample_grid(img, 1, 2, ImageBackground::Terminal);
         assert_eq!(samples, [Some([255, 0, 0]), Some([255, 0, 0])]);
     }
@@ -2140,7 +2282,10 @@ mod tests {
                 rgb_of(quantizer.colour(*rgb, x, y))
             })
             .collect();
-        assert!(colours.len() > 1, "a dithered flat grey must use more than one colour");
+        assert!(
+            colours.len() > 1,
+            "a dithered flat grey must use more than one colour"
+        );
 
         // The same run again, byte for byte.
         let mut budget = StyleBudget::default();
@@ -2267,7 +2412,11 @@ mod tests {
         samples.extend(vec![Some(blue); 64]);
 
         let adaptive = ColourSet::adaptive(&samples);
-        assert_eq!(adaptive.colours.len(), 2, "two distinct samples make two boxes");
+        assert_eq!(
+            adaptive.colours.len(),
+            2,
+            "two distinct samples make two boxes"
+        );
         assert!(adaptive.colours.contains(&red));
         assert!(adaptive.colours.contains(&blue));
 
@@ -2283,7 +2432,10 @@ mod tests {
             assert_eq!(adaptive.nearest_index(rgb), index);
             let theme_distance =
                 squared_distance(&lab(rgb), &lab(rgb_of(theme_colours().nearest(rgb))));
-            assert!(theme_distance > 0.0, "{rgb:?} must not be already in the cube");
+            assert!(
+                theme_distance > 0.0,
+                "{rgb:?} must not be already in the cube"
+            );
         }
     }
 
@@ -2313,10 +2465,7 @@ mod tests {
         };
         assert_eq!(quantizer.colour([12, 34, 56], 0, 0), Color::Rgb(12, 34, 56));
         quantizer.note(Style::default().fg(Color::Rgb(12, 34, 56)));
-        assert!(
-            !quantizer.exact(),
-            "one style exhausted a budget of one"
-        );
+        assert!(!quantizer.exact(), "one style exhausted a budget of one");
         // The fallback is the adaptive palette's nearest entry, not the
         // sample itself.
         assert_eq!(
@@ -2353,7 +2502,10 @@ mod tests {
         // line is identical to an uncapped render.
         let mut unlimited = StyleBudget::new(usize::MAX);
         let exact = draw(&pixels, 126, 100, 1, true, &options, &mut unlimited);
-        assert_eq!(capped[0], exact[0], "the first line must keep its exact colours");
+        assert_eq!(
+            capped[0], exact[0],
+            "the first line must keep its exact colours"
+        );
         assert!(unlimited.len() > MAX_IMAGE_STYLES);
     }
 
@@ -2743,7 +2895,14 @@ mod tests {
             ascii_cell(Some([0, 0, 0]), Some([0, 0, 0]), quantizer, 0, 0).0
         });
         let light = exact_quantizer(|quantizer| {
-            ascii_cell(Some([255, 255, 255]), Some([255, 255, 255]), quantizer, 0, 0).0
+            ascii_cell(
+                Some([255, 255, 255]),
+                Some([255, 255, 255]),
+                quantizer,
+                0,
+                0,
+            )
+            .0
         });
         assert_eq!(dark, ASCII_RAMP[0]);
         assert_eq!(light, ASCII_RAMP[ASCII_RAMP.len() - 1]);
@@ -2774,7 +2933,10 @@ mod tests {
         let mut budget = StyleBudget::default();
         let lines = artwork(
             path.to_str().unwrap(),
-            Bounds { width: 80, height: None },
+            Bounds {
+                width: 80,
+                height: None,
+            },
             &options(ImageEncoding::Blocks),
             &mut budget,
         )
@@ -2791,7 +2953,10 @@ mod tests {
         let mut budget = StyleBudget::default();
         let lines = artwork(
             path.to_str().unwrap(),
-            Bounds { width: 80, height: Some(3) },
+            Bounds {
+                width: 80,
+                height: Some(3),
+            },
             &options(ImageEncoding::Blocks),
             &mut budget,
         )
@@ -2803,7 +2968,10 @@ mod tests {
     #[test]
     fn repeated_rendering_is_identical() {
         let path = fixture("image_sample.png");
-        let bounds = Bounds { width: 40, height: Some(10) };
+        let bounds = Bounds {
+            width: 40,
+            height: Some(10),
+        };
         let mut budget = StyleBudget::default();
         let first = artwork(
             path.to_str().unwrap(),
@@ -2832,7 +3000,10 @@ mod tests {
         let mut budget = StyleBudget::default();
         let lines = artwork(
             path.to_str().unwrap(),
-            Bounds { width: 40, height: None },
+            Bounds {
+                width: 40,
+                height: None,
+            },
             &ImageOptions::default(),
             &mut budget,
         )
@@ -2852,15 +3023,32 @@ mod tests {
             base,
             ..options(ImageEncoding::Blocks)
         };
-        artwork(dest, Bounds { width: 80, height: None }, &options, budget).is_none()
+        artwork(
+            dest,
+            Bounds {
+                width: 80,
+                height: None,
+            },
+            &options,
+            budget,
+        )
+        .is_none()
     }
 
     #[test]
     fn an_unsupported_or_missing_reference_falls_back() {
         let mut budget = StyleBudget::default();
-        assert!(falls_back("image_missing.png", Some(&fixture("")), &mut budget));
+        assert!(falls_back(
+            "image_missing.png",
+            Some(&fixture("")),
+            &mut budget
+        ));
         assert!(falls_back("https://example.com/a.png", None, &mut budget));
-        assert!(falls_back("image_corrupt.png", Some(&fixture("")), &mut budget));
+        assert!(falls_back(
+            "image_corrupt.png",
+            Some(&fixture("")),
+            &mut budget
+        ));
     }
 
     #[test]
@@ -2870,7 +3058,10 @@ mod tests {
         assert!(
             artwork(
                 path.to_str().unwrap(),
-                Bounds { width: 80, height: None },
+                Bounds {
+                    width: 80,
+                    height: None
+                },
                 &options(ImageEncoding::Off),
                 &mut budget,
             )
@@ -2890,7 +3081,10 @@ mod tests {
         };
         animated_artwork(
             path.to_str().unwrap(),
-            Bounds { width: 80, height: None },
+            Bounds {
+                width: 80,
+                height: None,
+            },
             &options,
             &mut budget,
         )
@@ -2945,30 +3139,72 @@ mod tests {
 
     #[test]
     fn the_caps_admit_their_exact_bounds_and_refuse_one_past() {
-        assert!(animation_within_bounds(MAX_ANIMATION_FRAMES, 1));
-        assert!(!animation_within_bounds(MAX_ANIMATION_FRAMES + 1, 1));
+        assert!(animation_within_bounds(MAX_DECODED_FRAMES, 1));
+        assert!(!animation_within_bounds(MAX_DECODED_FRAMES + 1, 1));
 
-        // 16 MP per frame: four frames sit exactly on the 64 MP bound, a fifth
-        // crosses it. The per-frame cap allows the single frame (`MAX_PIXELS`
-        // is 16 MP), so only the cumulative bound can refuse the fifth.
-        assert!(animation_within_bounds(4, 4 * MAX_PIXELS));
-        assert!(!animation_within_bounds(5, 5 * MAX_PIXELS));
+        // The carried-frame budget is not a hard bound: more frames are
+        // sampled down, not refused.
+        assert!(animation_within_bounds(MAX_ANIMATION_FRAMES, 1));
+        assert!(animation_within_bounds(MAX_ANIMATION_FRAMES + 1, 1));
+
+        // 16 MP per frame: eight frames sit exactly on the 128 MP bound, a
+        // ninth crosses it. The per-frame cap allows the single frame
+        // (`MAX_PIXELS` is 16 MP), so only the cumulative bound can refuse the
+        // ninth.
+        assert!(animation_within_bounds(8, 8 * MAX_PIXELS));
+        assert!(!animation_within_bounds(9, 9 * MAX_PIXELS));
         assert!(animation_within_bounds(2, MAX_ANIMATION_PIXELS));
         assert!(!animation_within_bounds(2, MAX_ANIMATION_PIXELS + 1));
     }
 
     #[test]
-    fn a_257_frame_animation_falls_back_to_its_first_frame() {
+    fn halving_keeps_the_first_frame_and_every_other_one() {
+        let frames = |delays: &[u32]| {
+            delays
+                .iter()
+                .map(|&delay_ms| AnimationFrame {
+                    delay_ms,
+                    lines: Vec::new(),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let kept = halve_kept(frames(&[1, 2, 3, 4, 5, 6, 7]));
+        let delays: Vec<u32> = kept.iter().map(|frame| frame.delay_ms).collect();
+        // The odd positions are dropped; each survivor carries the delay of the
+        // frame after it, and the last survivor carries the trailing one.
+        assert_eq!(delays, vec![3, 7, 11, 7]);
+        assert_eq!(
+            delays.iter().sum::<u32>(),
+            1 + 2 + 3 + 4 + 5 + 6 + 7,
+            "halving preserves the loop's total duration"
+        );
+        assert_eq!(
+            halve_kept(frames(&[1, 2, 3, 4, 5, 6, 7])),
+            kept,
+            "the same frames halve the same way on every run"
+        );
+    }
+
+    #[test]
+    fn a_257_frame_animation_is_sampled_instead_of_refused() {
         let art = animated("image_257.gif");
         assert!(
-            art.frames.is_empty(),
-            "257 frames exceeds the cap, and the fallback is the first frame alone"
+            !art.frames.is_empty(),
+            "257 frames is over the budget, so the animation is sampled, not refused"
         );
         assert!(
-            art.animation_limited,
-            "the plugin needs to know the animation was refused, not absent"
+            art.frames.len() <= MAX_ANIMATION_FRAMES,
+            "a sampled animation still fits the carried-frame budget"
         );
-        assert!(!art.lines.is_empty(), "the fallback still draws the image");
+        assert_eq!(
+            art.frames[0].lines, art.lines,
+            "the subset is anchored at the first frame"
+        );
+        assert!(
+            !art.animation_limited,
+            "a sampled animation animates, so it is not a refusal"
+        );
     }
 
     #[test]
@@ -2980,11 +3216,54 @@ mod tests {
     }
 
     #[test]
+    fn a_513_frame_animation_keeps_its_recorded_duration() {
+        let art = animated("image_513.gif");
+        assert!(
+            art.frames.len() <= MAX_ANIMATION_FRAMES,
+            "the carried frames fit the budget"
+        );
+        assert!(art.frames.len() > 1, "a sampled animation still moves");
+        assert_eq!(
+            art.frames[0].lines, art.lines,
+            "the subset is anchored at the first frame"
+        );
+        let total: u64 = art
+            .frames
+            .iter()
+            .map(|frame| u64::from(frame.delay_ms))
+            .sum();
+        assert_eq!(
+            total, 20_470,
+            "the delays of the dropped frames are folded into the kept ones"
+        );
+        assert!(!art.animation_limited);
+        assert_eq!(
+            art.frames,
+            animated("image_513.gif").frames,
+            "the subset is the same on every run"
+        );
+    }
+
+    #[test]
+    fn a_4097_frame_animation_is_refused() {
+        let art = animated("image_4097.gif");
+        assert!(
+            art.frames.is_empty(),
+            "4,097 frames is past the decoded-frame ceiling"
+        );
+        assert!(
+            art.animation_limited,
+            "the plugin needs to know the animation was refused, not absent"
+        );
+        assert!(!art.lines.is_empty(), "the fallback still draws the image");
+    }
+
+    #[test]
     fn the_collector_enforces_the_limits_it_is_given() {
         let path = fixture("image_animation.gif");
         // The fixture is 4x2, sampled at width 80 to one cell row of four
         // cells; three frames therefore cost 24 decoded pixels in total.
-        let collect = |max_frames, max_pixels: u64| {
+        let collect = |max_decoded_frames, max_pixels: u64, max_kept| {
             let mut budget = StyleBudget::default();
             collect_animation(
                 &path,
@@ -2995,27 +3274,39 @@ mod tests {
                 &options(ImageEncoding::Blocks),
                 4,
                 2,
-                max_frames,
+                max_decoded_frames,
                 max_pixels,
+                max_kept,
                 &mut budget,
             )
         };
 
         assert!(matches!(
-            collect(3, 24),
+            collect(3, 24, MAX_ANIMATION_FRAMES),
             Collected::Frames(ref frames) if frames.len() == 3
         ));
         assert!(
-            matches!(collect(2, u64::MAX), Collected::TooLarge),
-            "one frame past the count cap"
+            matches!(
+                collect(2, u64::MAX, MAX_ANIMATION_FRAMES),
+                Collected::TooLarge
+            ),
+            "one frame past the decoded-frame ceiling"
         );
         assert!(
-            matches!(collect(3, 23), Collected::TooLarge),
+            matches!(collect(3, 23, MAX_ANIMATION_FRAMES), Collected::TooLarge),
             "one pixel past the area cap"
         );
         assert!(matches!(
-            collect(3, u64::MAX),
+            collect(3, u64::MAX, MAX_ANIMATION_FRAMES),
             Collected::Frames(ref frames) if frames.len() == 3
+        ));
+
+        // The carried-frame budget samples rather than refuses: a budget of
+        // two carries the first frame plus the one it is folded into.
+        assert!(matches!(
+            collect(3, u64::MAX, 2),
+            Collected::Frames(ref frames)
+                if frames.len() == 2 && frames[0].delay_ms == 40 + 80
         ));
     }
 }

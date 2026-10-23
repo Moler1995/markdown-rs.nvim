@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A push to a pull request's branch replaces the run for the previous commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test the workspace
+        run: cargo test --workspace --locked
+
+  lint:
+    name: Engine quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # The vendored crates are intentionally not rustfmt-clean, so both gates
+      # are scoped to the engine package.
+      - name: Formatting
+        run: cargo fmt -p md-render -- --check
+      - name: Clippy
+        run: cargo clippy -p md-render --all-targets --locked -- -D warnings
+
+  msrv:
+    name: MSRV (1.92)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.92
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the workspace with the declared minimum Rust
+        run: cargo check --workspace --locked
+
+  plugin:
+    name: Plugin (Neovim ${{ matrix.neovim }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        neovim: ['v0.10.4', 'stable']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: ${{ matrix.neovim }}
+      - name: Build the engine into bin/
+        run: |
+          cargo build --release -p md-render --locked
+          mkdir -p bin
+          cp target/release/md-render bin/
+      - name: Headless suite
+        run: MDRN_REPO=$GITHUB_WORKSPACE nvim --headless -l tests/headless/run.lua
+      - name: Interactive suite
+        run: nvim -l tests/interactive/run.lua
+      - name: Help tags are current
+        run: |
+          nvim --headless -u NONE -c 'helptags doc' -c q
+          git diff --exit-code doc/tags
+      # `qa!` rather than `q`: `:help` opens a split, so `:q` closes the help
+      # window and leaves Neovim running with the empty one still open.
+      - name: :help md-render opens
+        run: |
+          nvim --headless -u NONE --cmd "set rtp+=$GITHUB_WORKSPACE" \
+            -c 'lua local ok, err = pcall(vim.cmd, "help md-render"); if not ok then io.stderr:write(tostring(err) .. "\n"); vim.cmd("cquit 1") end' \
+            -c 'qa!'
+      - name: Health probe finds a working engine
+        run: |
+          nvim --headless -u NONE --cmd "set rtp+=$GITHUB_WORKSPACE" \
+            -c 'lua local report = require("md-render.health").probe(); if report.ok ~= true then for _, item in ipairs(report.checks or {}) do if item.ok == false then io.stderr:write(item.name .. ": " .. tostring(item.detail) .. "\n") end end vim.cmd("cquit 1") end' \
+            -c 'qa!'
+      - name: README landing page
+        run: bash tools/check-readme.sh
+
+  openspec:
+    name: OpenSpec
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Validate every spec and change
+        run: npx --yes @fission-ai/openspec@1.13.2 validate --all --no-interactive
+
+  gate:
+    name: Gate
+    if: always()
+    needs: [rust, lint, msrv, plugin, openspec]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every required job succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          failed=$(printf '%s' "$NEEDS" | jq -r 'to_entries[] | select(.value.result != "success") | .key')
+          if [ -n "$failed" ]; then
+            echo "Jobs that did not succeed: $failed" >&2
+            exit 1
+          fi

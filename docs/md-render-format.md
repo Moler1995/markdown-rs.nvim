@@ -181,18 +181,30 @@ That is what makes the field additive: a reader that ignores `animations` paints
 the still image, and a reader that swaps in frame 0 is redrawing exactly the
 rows it was already showing.
 
-The engine caps an animation at 256 frames and 64,000,000 decoded pixels in
-total. An image past either bound renders as its first frame with no entry
-here at all — the whole animation is present or none of it is, because a partial
-one would loop back to a frame that is not the image's first.
+The engine carries at most 256 frames (`MAX_ANIMATION_FRAMES`). An animation
+with more is not refused: it is reduced to a deterministic subset of at most 256
+frames, in file order, that begins with the image's first frame. Each carried
+frame's `delay` includes the display time of the frames it stands for, so the
+loop's total duration is the file's. The subset is the same on every render of
+the same image.
+
+Two hard bounds still refuse an animation outright: 4,096 decoded frames
+(`MAX_DECODED_FRAMES`) and 128,000,000 cumulative decoded pixels
+(`MAX_ANIMATION_PIXELS`). Sampling bounds what is carried, not the work — a GIF's
+later frames are decoded as deltas, so reaching a kept frame still decodes every
+frame before it. An image past either bound renders as its first frame with no
+entry here at all — the whole animation is present or none of it is, because a
+partial one would loop back to a frame that is not the image's first.
 
 ### `animations_limited`
 
-Source lines of image references whose animation the caps refused, present only
-when there is at least one and omitted otherwise. It exists so a reader can tell
-a still image from an animation that was too large: both have no `animations`
-entry and both show the first frame, but the latter usually looks like it should
-move. Entries are 0-indexed source lines, in document order.
+Source lines of image references whose animation the hard bounds refused,
+present only when there is at least one and omitted otherwise. It exists so a
+reader can tell a still image from an animation that was too large: both have no
+`animations` entry and both show the first frame, but the latter usually looks
+like it should move. An animation over the 256-frame budget is sampled, not
+refused, so it animates and is not listed here. Entries are 0-indexed source
+lines, in document order.
 
 ```json
 "animations_limited": [4]

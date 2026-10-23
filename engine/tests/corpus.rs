@@ -102,10 +102,7 @@ fn every_fixture_renders_to_blocks_whose_anchors_are_populated() {
     let palette = Palette::from_theme(Theme::default());
     for (name, content) in fixtures() {
         let blocks = render_markdown(&content, &palette, Theme::default());
-        assert!(
-            !blocks.is_empty(),
-            "{name} rendered to no blocks at all"
-        );
+        assert!(!blocks.is_empty(), "{name} rendered to no blocks at all");
         for (i, block) in blocks.iter().enumerate() {
             assert!(
                 block.anchor_source_line().is_some(),
@@ -142,9 +139,7 @@ fn the_named_constructs_all_produce_blocks() {
         "the fixture contains a mermaid fence but produced no Mermaid block"
     );
     assert!(
-        blocks
-            .iter()
-            .any(|b| matches!(b, DocBlock::Text { .. })),
+        blocks.iter().any(|b| matches!(b, DocBlock::Text { .. })),
         "the fixture contains headings, lists, code and quotes but produced no Text block"
     );
 
@@ -227,7 +222,10 @@ fn every_fixture_is_deterministic() {
     for (name, content) in fixtures() {
         let first = serde_json::to_string(&render(&content, SNAPSHOT_WIDTH)).expect("serialise");
         let second = serde_json::to_string(&render(&content, SNAPSHOT_WIDTH)).expect("serialise");
-        assert_eq!(first, second, "{name} rendered differently on a second pass");
+        assert_eq!(
+            first, second,
+            "{name} rendered differently on a second pass"
+        );
     }
 }
 

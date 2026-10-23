@@ -21,6 +21,12 @@ local md = require('md-render')
 
 md.setup_autocmds()
 
+-- The buffer on screen when this file is sourced may already be a markdown
+-- buffer whose `FileType` has fired: a package manager that loads the plugin
+-- from `FileType` does exactly that. Attach it once the startup event is over,
+-- so the first buffer shows R without being reopened.
+md.attach_current_soon()
+
 vim.api.nvim_create_user_command('MdRenderToggle', function()
   md.toggle()
 end, { desc = 'md-render: toggle between the rendered view and the source' })

@@ -1,0 +1,17 @@
+# Normalize text in the repository to LF, whatever the working tree uses.
+* text=auto eol=lf
+
+# Files consumed by Windows shells keep their CRLF line endings.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Fixtures and artifacts that must be byte-identical.
+*.png binary
+*.gif binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.ico binary
+*.exe binary
+*.dll binary

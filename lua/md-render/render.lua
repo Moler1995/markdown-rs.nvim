@@ -53,9 +53,11 @@ local function paint_line(buf, row, line, styles, hints)
   -- line; the clamp below is repeated because an extmark past the line's end is
   -- an error rather than a quiet truncation.
   --
-  -- The hint is tied to the `follow` key: with no key bound there is nothing to
-  -- advertise, and an underline that does nothing would be worse than none.
-  if hints and line.links and config.options.keymaps.follow then
+  -- The hint is tied to the follow keys: with none of them bound there is
+  -- nothing to advertise, and an underline that does nothing would be worse
+  -- than none.
+  if hints and line.links
+    and (config.options.keymaps.follow or config.options.keymaps.follow_tab) then
     for _, link in ipairs(line.links) do
       local from, to = link[1], math.min(link[2], col)
       if from < to then

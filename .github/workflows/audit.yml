@@ -1,0 +1,22 @@
+name: Audit
+
+on:
+  schedule:
+    # Off the hour on purpose: every repository that picks Monday morning
+    # would otherwise queue against the same minute.
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

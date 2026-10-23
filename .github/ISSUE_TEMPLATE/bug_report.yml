@@ -1,0 +1,81 @@
+name: Bug report
+description: Something renders wrongly, crashes, or refuses to start
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. `:checkhealth md-render` collects most of what
+        is asked below.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what the plugin or engine did instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The shortest sequence that shows the problem, including the markdown that triggers it.
+      placeholder: |
+        1. Open this file with `nvim -u minimal.lua file.md`
+        2. Press <leader>mr
+        3. ...
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Windows 11 23H2, Ubuntu 24.04, macOS 15.1
+    validations:
+      required: true
+
+  - type: input
+    id: nvim-version
+    attributes:
+      label: Neovim version
+      description: The output of `nvim --version` (first line is enough).
+      placeholder: NVIM v0.10.4
+    validations:
+      required: true
+
+  - type: input
+    id: engine-version
+    attributes:
+      label: Engine version
+      description: The output of `md-render --version`.
+      placeholder: md-render 0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: plugin-version
+    attributes:
+      label: Plugin version or commit
+      placeholder: v0.1.0, or the output of `git rev-parse --short HEAD`
+    validations:
+      required: true
+
+  - type: textarea
+    id: health
+    attributes:
+      label: ":checkhealth md-render"
+      description: Paste the report when it runs.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Messages
+      description: Any error text from `:messages`, or the engine's stderr.
+      render: text
+    validations:
+      required: false

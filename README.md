@@ -1,122 +1,210 @@
 # markdown-rs.nvim
 
-A markdown rendering engine and the Neovim plugin that uses it.
+[![CI](https://github.com/Moler1995/markdown-rs.nvim/actions/workflows/ci.yml/badge.svg)](https://github.com/Moler1995/markdown-rs.nvim/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Moler1995/markdown-rs.nvim)](https://github.com/Moler1995/markdown-rs.nvim/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Opening a markdown file shows it rendered — headings in colour, tables drawn as
-tables, diagrams drawn as diagrams, images drawn as character-cell artwork, code
-highlighted. A key toggles back to the
-source, which is an ordinary editable buffer. The engine does the rendering;
-the plugin decides when to call it and where the result goes.
+Read markdown as it was meant to look, inside Neovim, with one key back to the
+source. Headings, tables, mermaid diagrams, images and highlighted code are laid
+out for the window's width by a small Rust engine; the plugin paints the result
+into a read-only buffer in the same window and toggles back to the file's own
+buffer.
 
 ```text
-D:\projects\rust\markdown-rs.nvim\
-  Cargo.toml           workspace
-  engine/              the md-render crate
-  crates/mermaid-text/ vendored diagram renderer
-  crates/ascii-dag/    vendored layout engine, one fix backported
-  lua/md-render/       the plugin
-  plugin/md-render.lua entry point
-  bin/md-render.exe    engine binary, built locally — not in the repository
-  docs/                the wire format, and porting notes
+ Rendered view                              Source
+ ─────────────────────────────────────      ─────────────────────────────────
+ # Release notes                            # Release notes
+
+ ## Highlights                              ## Highlights
+
+   *  Faster startup                        - Faster startup
+   *  Static engine builds                  - Static engine builds
+
+ ┌───────────┬───────────┐                  | Target  | Archive  |
+ │ Target    │ Archive   │                  | ------- | -------- |
+ ├───────────┼───────────┤                  | Linux   | tar.gz   |
+ │ Linux     │ tar.gz    │                  | Windows | zip      |
+ └───────────┴───────────┘                  | macOS   | tar.gz   |
+
+ <leader>mr toggles                          the same file, editable
 ```
 
-## The engine
+## Features
 
-`engine/` builds `md-render`, a program that reads markdown and writes JSON to
-stdout:
+- **A rendered view in the window.** Every normal-mode motion, search and yank
+  works in it. The source buffer is never modified; the toggle puts it back.
+- **Links that work from the reading view.** `gf` follows files, URLs and
+  anchors, reads the source text, and follows mermaid `click` directives.
+- **Block preview and zoom.** `<CR>` on a table or diagram re-renders that
+  block at a budget of its own, so none of a clipped diagram is unreachable.
+- **Image artwork.** PNG, JPEG, GIF, WebP, BMP, TIFF and ICO are drawn as
+  character cells, in braille or ASCII, with animation stepping on demand.
+- **Themes and per-window state.** The engine's palette follows `theme`; two
+  windows on one file keep their own rendered buffers.
+- **Diagnostics.** `:checkhealth md-render` names the engine, the resolution
+  step, the wire version and anything that needs attention.
+
+## Requirements
+
+- **Neovim 0.10 or newer.**
+- **The `md-render` engine binary.** Download a release or build it from a
+  checkout; the plugin does not fetch or build anything at startup.
+- **A truecolor terminal** for braille image artwork (`'termguicolors'`).
+  Without it images use the ASCII encoding; everything else is unchanged.
+- **Rust 1.92 or newer** only for a source build.
+
+### Compatibility
+
+The plugin CI runs the suites on Neovim v0.10.4 and stable. The release
+workflow publishes one engine archive per target:
+
+| Platform | Target | Archive |
+| --- | --- | --- |
+| Linux | `x86_64-unknown-linux-musl` | `md-render-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` |
+| Windows | `x86_64-pc-windows-msvc` | `md-render-vX.Y.Z-x86_64-pc-windows-msvc.zip` |
+| macOS | universal, Intel and Apple silicon | `md-render-vX.Y.Z-universal-apple-darwin.tar.gz` |
+
+Each release also ships `SHA256SUMS`. The plugin and the engine share a wire
+format version; a mismatch is reported instead of rendering.
+
+## Installation
+
+Two pieces: the plugin, and the engine binary the plugin spawns.
+
+### 1. The plugin
+
+lazy.nvim:
+
+```lua
+{
+  'Moler1995/markdown-rs.nvim',
+  event = { 'BufReadPre *.md', 'BufNewFile *.md' },
+  -- Optional: build the engine into the plugin's bin/ on install. Works
+  -- wherever Rust does; skip it and download a release instead.
+  build = function()
+    local built = vim.system({ 'cargo', 'build', '--release', '-p', 'md-render' }):wait()
+    if built.code ~= 0 then
+      error('md-render: cargo build failed: ' .. (built.stderr or ''))
+    end
+    local name = vim.fn.has('win32') == 1 and 'md-render.exe' or 'md-render'
+    vim.fn.mkdir('bin', 'p')
+    vim.uv.fs_copyfile('target/release/' .. name, 'bin/' .. name)
+  end,
+  config = function()
+    require('md-render').setup({})
+  end,
+}
+```
+
+vim.pack:
+
+```lua
+vim.pack.add({ 'https://github.com/Moler1995/markdown-rs.nvim' })
+require('md-render').setup({})
+```
+
+mini.deps:
+
+```lua
+MiniDeps.add({ source = 'Moler1995/markdown-rs.nvim' })
+require('md-render').setup({})
+```
+
+Loading from `FileType` is supported: the buffer that triggered the load is
+attached and rendered without reopening it.
+
+### 2. The engine
+
+**Download a release.** Unpack the archive for your platform and put the
+binary at:
+
+```text
+<stdpath('data')>/md-render/md-render        POSIX
+<stdpath('data')>/md-render/md-render.exe    Windows
+```
+
+`stdpath('data')` is `~/.local/share/nvim` on Linux and macOS and
+`~/AppData/Local/nvim-data` on Windows.
+
+**Or build from a checkout.** POSIX:
 
 ```bash
-md-render --width 120 --theme nord README.md
-md-render --width 120 < README.md
+cargo build --release -p md-render
+mkdir -p bin
+cp target/release/md-render bin/md-render
 ```
 
-The width is required — the engine lays tables and diagrams out against a
-column budget, so there is no sensible default. The output is described in
-[`docs/md-render-format.md`](docs/md-render-format.md): styled display lines
-sized to the requested width, plus the mapping between those lines and the
-source lines they came from.
+PowerShell:
 
-The engine knows nothing about Neovim. It takes text and a width and returns
-data. That is what makes it testable without an editor, and what makes the
-plugin a consumer rather than a component.
-
-Image artwork is controlled by flags. `--help` is the authoritative list; these
-are the spellings it prints:
-
-| Flag | Values | Default | Does |
-| --- | --- | --- | --- |
-| `--image-encoding` | `braille`, `quads`, `blocks`, `ascii`, `off` | `braille` | How a cell is drawn |
-| `--image-palette` | `theme`, `adaptive`, `full` | `theme` | Where cell colours come from |
-| `--image-background` | `terminal`, `theme`, `#rrggbb` | `terminal` | What transparency is composited against |
-| `--image-paper` | `#rrggbb` | from the background | The page braille inks against |
-| `--image-dither` | `auto`, `on`, `off` | `off` | Whether quantisation is ordered-dithered |
-| `--image-min-rows` | rows | `0` | Enlarge an image to at least this many display rows |
-| `--image-sharpen` | — | off | Unsharp-mask an image that was reduced |
-| `--image-max-height` | rows | none | Height bound in display rows |
-| `--image-animation` | — | off | Also emit an animation's frames |
-
-The palette, background, dithering, minimum-height and sharpening defaults are
-the conservative ones: an older caller that does not pass them gets the same
-look it had before they existed. Braille is the default encoding, so a caller
-that wants the previous half-block output asks for `--image-encoding blocks`
-and, for the previous colours, `--image-palette theme --image-dither off`.
-
-## The plugin
-
-`lua/md-render/` is a Neovim plugin. It renders through the engine binary,
-shows the result in a read-only buffer in the same window, and toggles back to
-the source on request. Put the repository on `runtimepath` and markdown files
-open rendered.
-
-### The two states
-
-A managed window is always in one of two states, and each state is a buffer:
-
-```text
-   R - rendered                          S - source
-   +-----------------------------+       +-----------------------------+
-   |  # Heading                  |       |  # Heading                  |
-   |  ----------                 |       |                             |
-   |  prose, laid out to the     |       |  prose, as it is written    |
-   |  window's width             |       |                             |
-   +-----------------------------+       +-----------------------------+
-   | a scratch buffer holding    |       | the file's own buffer       |
-   | what the engine produced    |       |                             |
-   | buftype=acwrite             |       | editable, as usual          |
-   | bufhidden=wipe              |       |                             |
-   | modifiable=false            |       |                             |
-   | buflisted=false             |       |                             |
-   +-----------------------------+       +-----------------------------+
+```powershell
+cargo build --release -p md-render
+New-Item -ItemType Directory -Force bin | Out-Null
+Copy-Item target/release/md-render.exe bin/md-render.exe
 ```
 
-R is a view, not a second document. Its buffer is named after the source so that
-a write can be routed back, unlisted so it stays out of `:ls` and `:bnext`,
-unmodifiable so that an edit command cannot corrupt what is on screen, and wiped
-when hidden so that returning to S leaves nothing behind. The source buffer is
-untouched throughout — it is simply not the buffer in the window.
+A plugin loaded from the checkout finds `bin/`; an installed plugin falls
+through to the data directory. The full search order is: the `engine` option,
+then `md-render` on `PATH`, then `<plugin-root>/bin/`, then
+`<stdpath('data')>/md-render/`. A configured `engine` that cannot run is
+reported rather than silently skipped. See `docs/porting.md` for the release
+layout and the wire-version check.
 
-The state is per window, not per buffer. Two windows on one file each get their
-own rendered buffer, so one window returning to S cannot disturb the other.
+## Quick start
 
-### Staying in step
+1. Install the plugin and put the engine where it can be found.
+2. Open a markdown file: `nvim README.md`.
+3. The file opens rendered. Press `<leader>mr` to see the source, and again to
+   return.
+4. Run `:checkhealth md-render` if anything stays unrendered.
+5. `:help md-render` is the complete reference.
 
-R is remade when the window's width changes and when the source buffer changes,
-and it is remade from the buffer rather than from the file — so an edit made in S
-and not yet written is what the next render shows. Nothing is remade while R is
-off screen, and a render of a document that has not moved is answered from a
-cache keyed on the buffer, its `changedtick`, the page's width and height, the
-image encoding, the theme and whether animation frames were asked for, which is
-what makes toggling back and forth free.
-The page size is part of the key because an image has to fit the window showing
-it; an image-free document renders the same at any height, but the plugin cannot
-know that before the engine has answered.
+## Configuration
 
-Both kinds of change arrive in bursts — a drag-resize is one event per column,
-typing is one per keystroke — so the render is deferred by `resize_debounce`
-milliseconds and a burst costs one render. The deferral covers refreshes only: a
-toggle is applied at once, so a resize cannot swallow the key that follows it.
+`setup()` is optional; the defaults work. Every field is optional and the merge
+is deep:
 
-### Keymaps
+```lua
+require('md-render').setup({
+  theme = 'nord',
+  image_mode = 'auto',
+  keymaps = {
+    toggle = '<leader>mr',
+    write = '<C-s>',
+    preview = '<CR>',
+    follow = 'gf',
+    follow_tab = 'gF',
+    open_image = 'gx',
+    frame_next = '<C-n>',
+    pause = '<Space>',
+    zoom_in = '+',
+    zoom_out = '-',
+    scroll_left = '<C-h>',
+    scroll_right = '<C-l>',
+  },
+  preview = {                   -- the popup's caps, as fractions of the editor
+    max_width_pct = 0.9,
+    max_height_pct = 0.9,
+  },
+  resize_debounce = 100,
+})
+```
+
+`theme` is passed to the engine. `image_mode` picks how artwork is drawn.
+`filetypes` decides which buffers the plugin manages. Every keymap may be set
+to `false` to leave that key alone.
+
+The full option reference — every key, its type, default and meaning — is
+`:help md-render-options`. The plugin ships its own help file, so the reference
+and the code cannot drift apart.
+
+## Commands and keymaps
+
+| Command | Does |
+| --- | --- |
+| `:MdRenderToggle` | swap between the rendered view and the source |
+| `:MdRenderShow` | show the rendered view |
+| `:MdRenderSource` | show the source |
+| `:MdRenderReset` | forget cached renders and highlight groups |
 
 <!-- keymaps -->
 
@@ -125,6 +213,7 @@ toggle is applied at once, so a resize cannot swallow the key that follows it.
 | `<leader>mr` | R and S | swap between the rendered view and the source |
 | `<C-s>` | R and S | write the source buffer |
 | `gf` | R and S | follow the link under the cursor |
+| `gF` | R and S | follow the link under the cursor in a new tab |
 | `gx` | R only | open the image under the cursor with the system application |
 | `<C-n>` | R and the animation popup | show the next frame of the animated image under the cursor; step one frame in the popup while paused |
 | `<CR>` | R only | preview the block or image under the cursor, or close the preview |
@@ -135,438 +224,122 @@ toggle is applied at once, so a resize cannot swallow the key that follows it.
 | `o` | R only | cross to S and open a line below |
 | `O` | R only | cross to S and open a line above |
 
-The six insert-entry keys are how R gets out of the way. Each puts the source
+The six insert-entry keys are how R gets out of the way: each puts the source
 back in the window with the cursor on the source line the display line came
-from, and then hands the key to Vim, so that `A` in R inserts at the end of that
-source line exactly as `A` does in any other buffer. They are not configurable:
-they are the mode's way out, not a convenience.
+from, then hands the key to Vim. They are not configurable. The preview popup
+adds `+`/`-` for zoom and `<C-h>`/`<C-l>` for sideways scrolling.
 
-`Esc` is deliberately not one of them. Leaving insert mode is Vim's business,
-and a view that came back on `Esc` would be a view you could not edit in.
+The complete list, with what each key does in each state, is
+`:help md-render-keymaps`.
 
-The toggle crosses in normal mode, on the source line the display line came
-from, so the two states read as one document rather than two.
+## Troubleshooting
 
-### Following links
+**Nothing renders, or `/md-render` is not found.** Run
+`:checkhealth md-render`; it prints every location searched and the step that
+won. A stale `engine` path in your config is authoritative, so it wins over
+`bin/` and the data directory.
 
-`gf` opens whatever is under the cursor. It is the one key besides the toggle
-and the write key that is set in both states, because a link is worth following
-from wherever you are reading:
+**"speaks wire format N, but this plugin expects M".** The plugin and the
+engine are from different revisions. Rebuild the engine from the checkout, or
+upgrade both together. The plugin refuses the document rather than reading it
+wrongly.
 
-- a **file** opens in the window, resolved relative to the document holding the
-  link rather than to the working directory;
-- a **URL** goes to `vim.ui.open`, which is the desktop's browser by default;
-- an **anchor** — `#section`, on its own or after a path — scrolls to the
-  heading it names, in this document or in the one just opened.
+**Images are ASCII, not braille.** `'termguicolors'` is off.
+`:checkhealth md-render` reports it as a warning; set `vim.o.termguicolors =
+true` for braille artwork.
 
-A rendered diagram can carry links of its own: a mermaid `click NODE href "…"`
-directive names a target for a node, and with the cursor on that node's label
-the same key follows it. The engine reports the label's byte range along with
-the artwork, so the node is clickable without leaving the reading view and
-without the plugin re-parsing the fence. The label is underlined in R so the
-target is visible rather than guessed at; the hint is tied to the `follow` key,
-since with no key bound an underline would advertise nothing. It is the
-`MdRenderLink` highlight group and sets only `underline`, so a theme can restyle
-it without touching the artwork's colours. The preview popup does not bind the
-key, so it shows the diagram without the hint.
+**A lazy-loaded buffer stays on the source.** Check that its filetype is in
+`filetypes`. Loading from `FileType` is supported, including for the buffer
+that triggered the load.
 
-For everything else it reads the source, never the rendered text. In R the
-display row is first mapped back to the source line it came from — the same
-step the toggle makes — and the link is read from there. That is what makes it
-work from the reading view without crossing to S first.
+**A change to the plugin's Lua has no effect.** Neovim caches loaded modules;
+restart it. `:MdRenderReset` clears renders and highlight groups, not modules.
 
-Following a file records the source line it was followed from, so `<C-o>` comes
-back to that document and the plugin renders it again instead of leaving the
-window on source. The record is a real jump-list entry rather than a side
-effect of swapping buffers: the plugin's own R↔S swaps are `keepjumps`, so a
-toggle cannot push a stray entry between the reader and where they came from.
+More in `:help md-render-troubleshooting`.
 
-The forms it resolves are the ones a cursor actually lands on: inline
-`[text](target)` and `![alt](target)`, reference `[text][ref]` with the
-definition anywhere in the buffer, `[text][]` and shortcut `[text]`, autolinks
-`<https://…>`, and bare URLs. A destination's `"title"` and its `<…>` quoting
-are stripped, and a link inside a code span or behind a backslash is text about
-a link rather than a link.
+## Development
 
-When the cursor is not on a link the key goes back to Vim, so a path written as
-plain text still opens the way `gf` always did.
-
-### Images
-
-A markdown image is drawn in R as character-cell artwork: the engine reads the
-file named by the reference, averages its pixels down to the cells the page has
-room for, and colours each cell from a fixed sixty-four-colour palette. PNG, JPEG,
-GIF, WebP, BMP, TIFF and ICO are supported.
-
-An animated GIF or WebP is drawn on its first frame and stays there. `<C-n>` on
-the artwork advances it one frame, wrapping from the last frame back to the
-first; the frames are fetched the first time the key is pressed on that image,
-so a document that is never stepped through never pays for decoding them. The
-cursor does not move, the artwork keeps its rows, and the key goes back to Vim
-when the cursor is not on an animated image. Set `image_animation = false` to
-turn the whole thing off. Decoding frames can take a second or two, so while the
-fetch is in flight the bottom of the editor says so; pressing `<C-n>` again in
-that window does not start a second fetch — the presses are remembered and the
-image advances one frame for each of them when the frames arrive.
-
-An animation is refused when it has more than 256 frames or more than 64 million
-decoded pixels in total; the image is then drawn on its first frame, and pressing
-`<C-n>` on it warns that it is too large to animate instead of moving the cursor.
-The warning is given once per render, so pressing again neither re-renders nor
-repeats it. The popup warns on open in the same way.
-
-`<CR>` on the artwork opens the image alone in a popup, and there it plays: one
-one-shot timer is restarted with each frame's own delay, and the animation loops
-until the popup is closed. A frame whose delay is under 20 ms is shown for 100 ms,
-the floor browsers use, so a GIF encoded "as fast as possible" cannot turn into a
-redraw loop. `Space` pauses and resumes from the frame on screen, `<C-n>` steps
-one frame while paused, and closing the popup stops the timer — as does anything
-that re-renders what it is showing. A still image's popup binds neither key and
-creates no timer.
-
-`gx` on an image — on its artwork, or on its alt text when the engine cannot
-draw it — opens the referenced file with the operating system's default
-application. A relative destination resolves against the document's directory,
-as it does in the engine. A remote URL, a `data:` URI or a missing file is
-reported rather than fetched or launched, and the key goes back to Vim when the
-cursor is not on an image.
-
-The picture is fitted to the window twice over — to the text width, and to the
-text height or `image_max_height` when that is smaller — and is not enlarged
-unless `image_min_rows` asks for it. `image_max_height` defaults to 20 display
-rows, so a figure sits inside the page rather than filling it; because the
-aspect ratio is preserved, the cap narrows the artwork too. Set it to `false` to
-let an image use the whole page again. A picture smaller than both bounds keeps
-its natural size. The preview popup is not capped: `<CR>` shows the image at the
-popup's own size. Resizing the window redraws the inline artwork at the new
-size.
-
-`image_mode` chooses the drawing:
-
-- `auto` (the default) uses braille — `⣿`, eight dots in a 2×4 grid — when
-  `'termguicolors'` is on, and the ASCII ramp otherwise;
-- `braille` always uses braille. Each cell has one colour and eight dots, so a
-  photograph reads as tone and a line drawing keeps its edges; the dots are ink
-  on the page they sit on, so on a dark terminal the bright side of the picture
-  is drawn and a white screenshot becomes light dots with its own dark features
-  left as gaps, while on a light terminal the dark side is drawn instead. That
-  page is the editor's own background, read from `Normal`; it needs a font with
-  the braille patterns (Cascadia Mono and Segoe UI Symbol have them);
-- `quads` always uses quadrant blocks — `▘▝▖▗`, four sub-cells in two colours —
-  twice the horizontal detail of half blocks, and the nearest thing to the
-  pre-braille default. It needs a font with the block elements (Cascadia Mono,
-  the Windows Terminal default, has them);
-- `blocks` uses half blocks — `▀`, two colours per cell — for a font without
-  quadrants;
-- `ascii` uses one ASCII character per cell, coloured from the same palette, so
-  it works in a terminal without true colour;
-- `off` draws no artwork at all and shows each reference's alt text, which is
-  exactly what the plugin did before images were supported.
-
-The image's colours and finishing are separate knobs:
-
-- `image_palette` — `auto` (the default) asks for exact colours for `braille`
-  and `ascii`, and a per-image 64-colour palette for `quads` and `blocks`;
-  `theme` is the old fixed cube, `adaptive` the per-image palette and `full`
-  exact colours bounded at 4,096 styles per document;
-- `image_background` — `terminal` (the default) leaves transparent pixels to
-  the terminal, `theme` blends them into the theme's background, and `#rrggbb`
-  names a colour; a named background is what removes the hard halo around a
-  logo with soft edges, and it is also the page braille inks against, so with
-  `terminal` the plugin sends `Normal`'s background as the page instead;
-- `image_dither` — `auto` (the default) dithers `braille` and reduced-palette
-  `ascii`, and leaves the two-colour encodings alone; `true` and `false` force
-  it;
-- `image_min_rows` — 0 (the default) never enlarges; a positive value enlarges
-  a small image by the smallest whole factor that reaches that many rows, which
-  is what pixel art wants;
-- `image_sharpen` — `false` by default; `true` runs an unsharp mask over an
-  image that was reduced to fit the page.
-
-The previous look is one configuration away: `image_mode = 'quads'`,
-`image_palette = 'theme'`, `image_dither = false`, `image_min_rows = 0` and
-`image_sharpen = false` reproduce the output the plugin had before braille was
-the default.
-
-Relative destinations resolve against the directory of the document holding the
-reference, so `![](images/a.png)` means what it means everywhere else. Absolute
-paths work too. A URL or `data:` URI is never fetched and is not something the
-engine will draw. An image that cannot be drawn — missing file, unsupported
-format, one over the engine's limits — falls back to its alt text, the rest of
-the document renders normally, and nothing is reported: a picture the reader
-cannot see is not an error in the document.
-
-Images inside a table cell or a heading stay as alt text. Those constructs hold
-inline text rather than blocks, so there is nowhere to put a picture without
-changing the table's or heading's own layout.
-
-### Commands
-
-| Command | Does |
-| --- | --- |
-| `:MdRenderToggle` | what the toggle mapping does, for when there is no key to press |
-| `:MdRenderShow` | show R |
-| `:MdRenderSource` | show S |
-| `:MdRenderReset` | forget every cached render and highlight group |
-
-### Config
-
-```lua
-require('md-render').setup({
-  engine = nil,                 -- nil resolves to `md-render` on PATH, then
-                                -- <repo>/bin/md-render.exe
-  theme = 'catppuccin_mocha',   -- passed to the engine as --theme
-  image_mode = 'auto',          -- 'auto' | 'braille' | 'quads' | 'blocks' | 'ascii' | 'off'
-  image_max_height = 20,        -- display rows one inline image may occupy;
-                                -- false lets it fill the page again
-  image_palette = 'auto',       -- 'auto' | 'theme' | 'adaptive' | 'full'
-  image_background = 'terminal',-- 'terminal' | 'theme' | '#rrggbb'
-  image_dither = 'auto',        -- 'auto' | true | false
-  image_min_rows = 0,           -- enlarge a small image to at least this many rows
-  image_sharpen = false,        -- unsharp-mask an image reduced to fit
-  image_animation = true,       -- fetch an animated image's frames on demand
-  filetypes = { 'markdown' },   -- the filetypes that open in R
-  keymaps = {
-    toggle = '<leader>mr',
-    write = '<C-s>',
-    preview = '<CR>',
-    follow = 'gf',
-    open_image = 'gx',            -- in R, on an image
-    frame_next = '<C-n>',         -- in R and in the animation popup
-    pause = '<Space>',            -- in the animation popup, while it plays
-    zoom_in = '+',                -- in the preview popup, on a diagram
-    zoom_out = '-',
-    scroll_left = '<C-h>',        -- in the preview popup, on any block
-    scroll_right = '<C-l>',
-  },
-  preview = {                   -- the popup's caps, as fractions of the editor
-    max_width_pct = 0.9,
-    max_height_pct = 0.9,
-  },
-  resize_debounce = 100,        -- milliseconds to coalesce stale-R events:
-                                -- resizes and edits. Toggles are not delayed.
-})
-```
-
-Every field is optional and the merge is deep, so `setup{ keymaps = { toggle =
-'gm' } }` keeps the write key. A filetype that is not listed is left alone
-entirely: no state, no autocmds, no keymaps. Setting `keymaps.toggle`,
-`keymaps.write`, `keymaps.preview`, `keymaps.follow`, `keymaps.open_image`,
-`keymaps.frame_next` or `keymaps.pause` to `false` leaves that key alone, and so
-do `keymaps.zoom_in`, `keymaps.zoom_out`, `keymaps.scroll_left` and
-`keymaps.scroll_right`.
-
-The four preview keys are set in the popup's own buffer rather than in R or S,
-because they act on the block the popup is showing. They are deliberately not in
-the keymap table above: that table describes R and S, and these keys belong to
-neither.
-
-### The block preview
-
-The engine lays a diagram or a table out against the window's column budget and
-**clips what does not fit**. The characters that clip drops are not in the
-rendered buffer at all, so scrolling sideways cannot recover them: in a narrow
-window the right-hand side of a wide diagram does not exist.
-
-`<CR>` on a ` ```mermaid ` fence or a table opens a centred popup showing that
-block **re-rendered at a budget of its own**, which is what brings the clipped
-columns back. The budget depends on what the engine does with a block that does
-not fit:
-
-- A **diagram** is laid out at the largest budget the engine accepts, so nothing
-  is clipped. The engine discards the columns a diagram overflows by, and
-  discarded columns are not in the buffer for scrolling to reach, so any smaller
-  budget could lose the right-hand end of one.
-- A **table** is laid out at the popup's own width, never narrower than the
-  window's. The engine wraps a cell that does not fit rather than dropping it, so
-  a table loses nothing at any budget, and a larger one would only spread its
-  columns out.
-
-A diagram's width is not a fact about it, though. The engine re-lays one out
-against the budget it is given — narrowing the gaps, and wrapping node and
-message labels — and only clips what is still too wide after that. So asking for
-a smaller budget buys a narrower diagram, at the price of a taller one.
-
-`+` and `-` in the popup make that choice. They re-lay the diagram out at
-another budget and replace the popup's content in place; the window does not
-move, so the diagram on screen never shifts under the cursor.
-
-- `-` asks for the popup's own inner width, which is the most the popup can show
-  at once.
-- `+` asks for the largest budget again, restoring the layout the popup opened
-  with.
-
-Neither key ever shows a diagram with columns missing. Where the engine cannot
-lay one out whole within the popup it lays it out at the narrowest budget at
-which it *can* lay it whole, so a diagram still too wide to fit without
-scrolling is nonetheless narrower than it opened, and whole.
-
-That is the whole ladder — the natural width, the popup's inner width, and that
-narrowest whole layout — so one press spends one of the two keys and leaves the
-other. Where the diagram is already at the narrowest layout, or already fits, `-`
-does nothing; once it is zoomed out, `+` is the live key. A key with nothing to
-ask for returns without reaching the engine, so holding it down costs nothing.
-Once the diagram is narrower than it opened, the popup's title says by how much —
-the width it is laid out at, then the width it opened with.
-
-In a table's popup the keys are bound and do nothing: the engine wraps a table's
-cells rather than discarding them, so a table has nothing to zoom away from, and
-a smaller budget would only make it harder to read.
-
-`<C-l>` and `<C-h>` scroll the popup sideways, a step per press, and can be held
-down. Vim's own sideways scrolling is `zl` and `zh` — two keystrokes each, so
-there is no key to hold, and crossing a block wider than the popup means
-alternating `z` and `l` by hand. These are one key each, so holding one keeps the
-view moving. The step is the horizontal step of your own `'mousescroll'` (6
-columns by default), so the keys and a tilt wheel move the view by the same
-amount.
-
-Unlike the zoom keys, these do something in a table's popup too: a table is laid
-out at the popup's inner width floored at the window's, so it can be wider than
-the popup as well, and its columns past the edge are reached the same way.
-
-`<C-l>` is one of Neovim's own mappings — `nohlsearch`, then a redraw — and in
-the popup it is taken for scrolling. The mapping is buffer-local, so R and S keep
-theirs, and `:nohlsearch` still works from the command line.
-
-The popup is sized to fit the block and capped at `preview.max_width_pct` and
-`preview.max_height_pct` of the editor. It is an ordinary buffer — scroll it,
-search it, yank from it — but not a modifiable one, and it is not listed. Zooming
-changes its content, never its frame, which is why a zoomed-out diagram has dead
-space to its right.
-
-`<CR>`, `q` and `Esc` close it, and the window underneath is left exactly as it
-was. On anything else — prose, a non-diagram fence, a list — `<CR>` does its
-ordinary job, so the key is safe to press anywhere.
-
-The popup is a second reading of the block, not a magnifier of the first: because
-the layout follows the budget, it can be *arranged* differently from the window's
-copy. What it guarantees is that the whole block is there.
-
-### Tests
+Prerequisites: Rust 1.92+, Neovim 0.10+.
 
 ```bash
+cargo build --release -p md-render
+mkdir -p bin
+cp target/release/md-render bin/md-render
+
+cargo test
+cargo fmt -p md-render -- --check
+cargo clippy -p md-render --all-targets -- -D warnings
+
 MDRN_REPO=$PWD nvim --headless -l tests/headless/run.lua
 nvim -l tests/interactive/run.lua
+
+nvim --headless -u NONE -c 'helptags doc' -c q
+openspec validate --all --no-interactive
 ```
 
-The headless runner drives the plugin directly, and is where most of it is
-checked. The interactive runner starts a real Neovim, sends keys with
-`--remote-send`, and reads back what that server observed.
+PowerShell:
 
-Two things can only be checked there, both for the same reason: `nvim -l` never
-runs the main input loop. The six insert-entry keys hand the key back to Vim
-through `nvim_feedkeys`, and only that loop reads a key queued that way. And
-`TextChanged` — the event the plugin re-renders on — is raised from that loop's
-own change handling, so under `nvim -l` no edit route raises it at all, not
-`nvim_buf_set_lines`, not `:normal!`, not `nvim_input`.
-
-## Building
-
-The workspace builds with a stock Rust toolchain:
-
-```bash
+```powershell
 cargo build --release -p md-render
-cargo test
+New-Item -ItemType Directory -Force bin | Out-Null
+Copy-Item target/release/md-render.exe bin/md-render.exe
+$env:MDRN_REPO = (Get-Location).Path
+nvim --headless -l tests/headless/run.lua
 ```
 
-`bin/md-render.exe` is not in the repository — it is a build artifact. A clone
-has to produce it once before the plugin will render anything. See
-[`docs/porting.md`](docs/porting.md) for what the plugin does when it is
-missing.
+The vendored crates are intentionally not formatted or linted with the engine.
+Rebuild and copy the engine after any engine change, and restart Neovim after
+editing `lua/md-render/`; see `CONTRIBUTING.md` for the full workflow.
 
-### Installing the engine binary
+## Architecture
 
-From the repository root:
-
-```bash
-cargo build --release -p md-render
-cp target/release/md-render.exe bin/md-render.exe
+```text
+markdown-rs.nvim/
+  engine/                  md-render, the editor-agnostic Rust binary
+  crates/mermaid-text/     vendored diagram renderer
+  crates/ascii-dag/        vendored layout engine, one fix backported
+  lua/md-render/           the plugin
+  plugin/md-render.lua     startup file: autocmds and commands
+  doc/                     :help md-render
+  bin/md-render[.exe]      engine binary, built locally — not committed
+  docs/                    wire format, design, engine distribution
 ```
 
-`bin/md-render.exe` is the first place the plugin looks, after
-`g:md_render_binary`, so the copy is the step that matters. It used to be
-committed, because the plugin cannot build Rust and a Windows user without a
-toolchain had no way to produce it; it is built locally now, which is one
-command and keeps a 4.6 MB artifact out of the history.
+The engine reads markdown and writes styled display lines, laid out for a
+requested width, plus the mapping back to source lines. The plugin spawns it
+and owns every buffer and window decision. The boundary is the point: the
+engine is testable without an editor and the plugin knows nothing about
+markdown.
 
-The binary was cross-compiled from Linux against `x86_64-pc-windows-gnu` when
-that was the only route. A native GNU toolchain builds it directly — check
-`rustc -vV`'s `host` for `x86_64-pc-windows-gnu` — and the cross-compile is
-only needed from a machine that has no Windows toolchain of its own:
+- [`docs/design.md`](docs/design.md) — the two states, link resolution, images,
+  preview and zoom, and the vendored-crate changes.
+- [`docs/md-render-format.md`](docs/md-render-format.md) — the wire format.
+- [`docs/porting.md`](docs/porting.md) — building, shipping and resolving the
+  engine.
 
-```bash
-rustup target add x86_64-pc-windows-gnu
-cargo build --release --target x86_64-pc-windows-gnu -p md-render
-cp target/x86_64-pc-windows-gnu/release/md-render.exe bin/md-render.exe
-```
+## Contributing
 
-## Provenance
+See [`CONTRIBUTING.md`](CONTRIBUTING.md): build and test commands, formatting
+and lint scope, snapshot updates, the OpenSpec workflow, help-tag regeneration,
+and the restart needed after editing plugin Lua. Issues and pull requests are
+welcome.
 
-The rendering pipeline — markdown parsing, table layout, syntax highlighting,
-LaTeX-to-Unicode conversion, and diagram text rendering — was ported from
-[`markdown-reader`](https://github.com/leboiko/markdown-reader), a terminal
-markdown reader, at revision `4f0f635` (2026-10-14), MIT licensed,
-© leboiko.
+## Security
 
-It was ported rather than depended on. `markdown-reader` is a complete
-application: it owns a terminal, negotiates graphics protocols, and carries a
-dependency set for all of that. An engine that turns markdown into styled lines
-needs none of it, and linking it would make this crate heavy, slow to build,
-and impossible to publish on its own. The port takes the parts that render
-text and leaves the application behind.
-
-The two copies are not kept in step. The port is a one-time lift; there is no
-upstream tracking.
-
-### The vendored crates
-
-`crates/mermaid-text/` is the published `mermaid-text` 0.57.4, and
-`crates/ascii-dag/` is the published `ascii-dag` 0.9.1 — the layout engine
-`mermaid-text`'s Sugiyama backend is built on. Both are vendored to be
-patchable, and both carry a fix that could not be taken from a release:
-
-- **`mermaid-text`** — two changes. A `direction TB` subgraph inside an `LR`
-  graph had its band ordered by `HashMap` iteration, so the same diagram laid
-  out differently from one process to the next. And the renderer no longer
-  fills cells with a Unicode shade block (`░▒▓`, U+2591-93): a `rect` block
-  uses the ASCII ladder `.`/`:`/`#`, a gantt bar's empty cells and a pie bar's
-  unfilled cells use `.`, and a sequence block interior is simply left blank.
-  The shade blocks are dithered patterns, and a full-screen repaint of them
-  costs far more than one of solid or ASCII glyphs at the same ink coverage —
-  a diagram whose block interiors were all `░` made scrolling crawl in the
-  editor, while the same cells blank or filled with `.` scroll smoothly. Only
-  the fill changed: for a document that uses no `rect` block the output is
-  byte-identical once the retired fill is mapped back to a space.
-- **`ascii-dag`** — a level's subgraph blocks were ordered the same way, with
-  the same result. Upstream fixed it in 0.10.1, but that release also rewrites
-  the renderer and the layout API; the one function's fix is backported
-  instead, with upstream's regression test. See
-  [`crates/ascii-dag/VENDORED.md`](crates/ascii-dag/VENDORED.md).
-
-The engine's spec calls for byte-identical output for identical input, and a
-per-process hash seed defeats a same-process determinism test: two renders
-inside one test binary share a seed and agree. Both defects were found by
-hashing separate runs of the same file.
-
-### The port-header convention
-
-Every ported file begins with a line naming its origin:
-
-```rust
-//! Ported from `markdown-reader` revision 4f0f635 (2026-10-14), MIT, (c) leboiko.
-```
-
-Where a module also carries an origin copyright notice, that notice is kept
-verbatim below the header. Modules written for this repository have no such
-header — its absence is the marker for "new code".
-
-Files that were ported carry a second paragraph explaining what was removed and
-why. A port is not a copy: the origin's types served the origin's interaction
-model, and re-expressing the code against this crate's own types is what makes
-it a library rather than a transplanted application. Where behaviour changed
-deliberately, the change is stated in the header.
+Report a vulnerability as described in [`SECURITY.md`](SECURITY.md). Dependabot
+and the weekly `cargo audit` run watch the Rust dependencies; the plugin
+executes only the engine binary it resolves, and never downloads or runs
+anything at startup.
 
 ## License
 
 MIT. See [`LICENSE`](LICENSE).
+
+## Provenance
+
+The rendering pipeline — markdown parsing, table layout, syntax highlighting,
+LaTeX-to-Unicode conversion and diagram text rendering — was ported from
+[`markdown-reader`](https://github.com/leboiko/markdown-reader) at revision
+`4f0f635` (2026-10-14), MIT licensed. [`NOTICE`](NOTICE) records the derivation
+and the vendored crates; `docs/design.md` explains the vendored changes and the
+port-header convention. The port is a one-time lift with no upstream tracking.

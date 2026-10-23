@@ -1,0 +1,164 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build, for example v0.1.0
+        required: true
+        type: string
+      dry_run:
+        description: Build and checksum the archives without publishing a release
+        required: false
+        default: true
+        type: boolean
+
+# A release that is half cancelled is worse than a slow one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  # A tag push names the tag; a manual run passes it in.
+  TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  preflight:
+    name: Tag matches the engine version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Compare the tag with the md-render package version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked |
+            jq -r '.packages[] | select(.name == "md-render") | .version')
+          if [ "$TAG" != "v$version" ]; then
+            echo "tag $TAG does not match engine version v$version" >&2
+            exit 1
+          fi
+          echo "building $TAG for md-render $version"
+
+  linux:
+    name: Linux (musl)
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --release -p md-render --locked --target x86_64-unknown-linux-musl
+      - name: Smoke test
+        run: ./target/x86_64-unknown-linux-musl/release/md-render --version
+      - name: Package
+        run: |
+          name="md-render-$TAG-x86_64-unknown-linux-musl"
+          mkdir -p "dist/$name" artifacts
+          cp target/x86_64-unknown-linux-musl/release/md-render "dist/$name/"
+          cp LICENSE README.md "dist/$name/"
+          tar -C dist -czf "$name.tar.gz" "$name"
+          mv "$name.tar.gz" artifacts/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-musl
+          path: artifacts/*.tar.gz
+
+  windows:
+    name: Windows (MSVC, static CRT)
+    needs: preflight
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release -p md-render --locked --target x86_64-pc-windows-msvc
+      - name: Smoke test
+        run: target/x86_64-pc-windows-msvc/release/md-render.exe --version
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "md-render-$env:TAG-x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory -Force "dist/$name", artifacts | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/md-render.exe "dist/$name/"
+          Copy-Item LICENSE, README.md "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "$name.zip"
+          Move-Item "$name.zip" artifacts/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-msvc
+          path: artifacts/*.zip
+
+  macos:
+    name: macOS (universal)
+    needs: preflight
+    # macos-latest is arm64. The x86_64 slice is cross-built on the same
+    # machine and merged with lipo. If that cross-link ever fails, the fallback
+    # is a macos-13 (x86_64) runner feeding a separate merge job.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build both slices
+        run: |
+          cargo build --release -p md-render --locked --target aarch64-apple-darwin
+          cargo build --release -p md-render --locked --target x86_64-apple-darwin
+      - name: Merge, smoke test and package
+        run: |
+          name="md-render-$TAG-universal-apple-darwin"
+          mkdir -p "dist/$name" artifacts
+          lipo -create -output "dist/$name/md-render" \
+            target/aarch64-apple-darwin/release/md-render \
+            target/x86_64-apple-darwin/release/md-render
+          "dist/$name/md-render" --version
+          cp LICENSE README.md "dist/$name/"
+          tar -C dist -czf "$name.tar.gz" "$name"
+          mv "$name.tar.gz" artifacts/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: artifacts/*.tar.gz
+
+  release:
+    name: Checksums and release
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Write SHA256SUMS
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: checksums
+          path: artifacts/SHA256SUMS
+      - name: Publish the release
+        if: github.event_name == 'push' || inputs.dry_run == false
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$TAG" --verify-tag --generate-notes artifacts/*

@@ -43,6 +43,10 @@ local ADDRESS = '127.0.0.1:7787'
 local OUT = vim.fn.tempname()
 vim.fn.mkdir(OUT, 'p')
 
+-- The same directory as a path the server can read out of a `:lua` chunk. A
+-- Windows tempname has backslashes, and those are escapes in Lua source.
+local OUT_CMD = (OUT:gsub('\\', '/'))
+
 -- How long to give the server to produce something the driver is waiting for.
 -- Only a genuine hang costs this much: every wait here is a poll, so a healthy
 -- run pays a few milliseconds each.
@@ -93,11 +97,9 @@ local function read_report(tag)
   local lines = wait_for(string.format('%s/%s.txt', OUT, tag))
   if not lines then
     error(string.format(
-      'the server wrote no report for %q.\nInsertEnter events seen: %s\n'
-        .. 'last error raised in the server: %s\n%s',
+      'the server wrote no report for %q.\nInsertEnter events seen: %s\n%s',
       tag,
       table.concat(read(OUT .. '/events.txt') or {}, ' | '),
-      table.concat(read(OUT .. '/error.txt') or { '(none)' }, ' | '),
       vim.inspect(vim.fn.readdir(OUT))
     ))
   end
@@ -111,19 +113,36 @@ local function read_report(tag)
   return out
 end
 
---- Run a call on the server's `MD` table, recording any error it raises.
+--- Run a call on the server's `MD` table, and wait until the server is done.
 ---
---- A `:lua` call cannot return a value to the driver, and an error raised inside
---- one does not reach the server's stderr either — it goes into the message area
---- of a headless server nobody is looking at. The run then goes on waiting for a
---- report that was never going to be written, and the cause is invisible: the
---- failure looks like a missing file rather than like the error that stopped it.
---- Wrapping the call is what turns that into a message.
+--- The wait is a barrier, not politeness. A step such as `reset()` blocks inside
+--- `vim.wait()` while it waits for the render, and a wait in the server's own
+--- loop reads the input queue: a key sent behind such a step is served *inside*
+--- it instead of after it. That is how a fed `i` once arrived in the middle of
+--- the next `:lua` command line, on CI only — a mangled report tag
+--- (`ciross2_0.txt`) is the signature. Waiting for the step's own marker keeps
+--- every key sent afterwards behind it.
+---
+--- The marker also carries the step's error. An error raised inside a `:lua`
+--- call does not reach the server's stderr — it goes into the message area of a
+--- headless server nobody is looking at — so an unwrapped call makes the run
+--- wait for a report that was never going to be written, and the failure looks
+--- like a missing file rather than like the error that stopped it.
+local call_count = 0
 local function md_call(call)
+  call_count = call_count + 1
+  local marker = string.format('%s/call%d.txt', OUT_CMD, call_count)
   step(string.format(
     ":lua local ok, e = pcall(function() MD.%s end) "
-      .. "if not ok then vim.fn.writefile({ tostring(e) }, MD.out .. '/error.txt') end<CR>",
-    call))
+      .. "vim.fn.writefile({ ok and 'ok' or tostring(e) }, '%s')<CR>",
+    call, marker))
+  local result = wait_for(marker)
+  if not result then
+    error(string.format('the server never finished MD.%s', call))
+  end
+  if result[1] ~= 'ok' then
+    error(string.format('MD.%s failed in the server: %s', call, table.concat(result, '\n')))
+  end
 end
 
 local function report(tag)
@@ -164,9 +183,21 @@ env.MDRN_OUT = OUT
 
 -- The server's own output is kept: an error raised inside it — a failing step,
 -- a bad key — arrives here rather than as a silent missing report.
+--
+-- Collected through callbacks rather than written to paths by `vim.system`:
+-- Neovim 0.10 accepts only a callback there, a path arrived in 0.11.
+local server_output = { ['server.out'] = {}, ['server.err'] = {} }
+local function collect(name)
+  return function(_, data)
+    if data then
+      local sink = server_output[name]
+      sink[#sink + 1] = data
+    end
+  end
+end
 local server = vim.system(
   { 'nvim', '--headless', '--listen', ADDRESS, '-u', 'NONE' },
-  { env = env, stdout = OUT .. '/server.out', stderr = OUT .. '/server.err' }
+  { env = env, stdout = collect('server.out'), stderr = collect('server.err') }
 )
 
 local started = false
@@ -216,6 +247,26 @@ end
 
 local function truthy(name, got, detail)
   check(name, got and true or false, detail or string.format('got %s', vim.inspect(got)))
+end
+
+--- Check `preview.open`, naming the plugin's own message when it has one.
+---
+--- A popup that did not open because the engine refused the block and one that
+--- had not opened yet are the same `false` in the report; the plugin's last
+--- error is the only thing that tells them apart, and it is worth having in the
+--- log of the run that failed rather than in the next investigation.
+local function expect_open(name, report, want)
+  local reported = report.reported or ''
+  check(name, report.open == tostring(want),
+    string.format('got %s, want %s%s%s', vim.inspect(report.open), tostring(want),
+      reported ~= '' and ('; the plugin reported: ' .. reported) or '',
+      -- The row under the cursor says whether the key fell through to Vim's
+      -- own `<CR>` instead of finding a block: it is the row *below* the one
+      -- the check put the cursor on when it did. The layout and the source line
+      -- the row came from say whether the row was resolved against the layout
+      -- that was on screen when the key was pressed.
+      report.cursor_text and string.format('; cursor on %s (layout %s, source %s)',
+        report.cursor_text, report.doc_width or '?', report.source_at_cursor or '?') or ''))
 end
 
 --- `  - nested item` is source line 5, counted from zero.
@@ -289,6 +340,12 @@ local function cross(src, offset)
   md_call('reset()')
   md_call(string.format('goto(%d, %d)', src, offset))
   step('i')
+  -- The key crosses to S and feeds `i` back to Vim, so that key travels
+  -- through the server's own typeahead rather than this driver's input queue.
+  -- Wait until Vim has read it before sending `<Esc>`: a late `i` can otherwise
+  -- arrive in the middle of the next command on a loaded machine, entering
+  -- insert mode inside the command line.
+  wait_for(OUT .. '/events.txt')
   step('<Esc>')
   return report(string.format('cross%d_%d', src, offset))
 end
@@ -360,6 +417,11 @@ local function body()
   md_call('reset()')
   md_call('split()')
   step('O')
+  -- `O` is read by the server's own loop too, so wait for the `InsertEnter` it
+  -- raised: a text step that arrives before it is read as normal-mode commands
+  -- (`#` searches, `i` starts inserting) and mangles the buffer instead of
+  -- typing a line into it.
+  wait_for(OUT .. '/events.txt')
   step('# live-edit-10.4')
   step('<Esc>')
   md_call('settle(600)')
@@ -397,7 +459,7 @@ local function body()
   step('<CR>')
   local prose_after = preview_report('prose_after')
 
-  expect('4.3 <CR> on prose opens no popup', prose_after.open, 'false')
+  expect_open('4.3 <CR> on prose opens no popup', prose_after, false)
   expect('4.3 and leaves the window in R', prose_after.state, 'R')
   expect('4.3 and still showing the rendered buffer', prose_after.showing_rendered, 'true')
   expect('4.3 the cursor moves down one display row',
@@ -421,11 +483,16 @@ local function body()
   -- single-kind check. Which budget each kind gets, and how far above the
   -- window's it is, is 5.3 and 5.4.
   md_call('reset_wide()')
+  -- Two steps, not one: the resize and the wait for the layout it causes
+  -- cannot be the same `:lua` call. Neovim delivers `WinResized` from the main
+  -- loop, not from inside `vim.wait`, so a step that waited for its own resize
+  -- would wait for an event only it could release (see `M.narrow`).
   md_call('narrow(40)')
+  md_call('settled(40)')
   md_call('goto(6)')
   local narrow_table = preview_key('narrow_table', true)
 
-  expect('5.1 the table preview opens', narrow_table.open, 'true')
+  expect_open('5.1 the table preview opens', narrow_table, true)
   expect('5.1 in a window narrower than the cap', narrow_table.window_width, '40')
   truthy('5.1 and the popup shows columns the window clipped',
     tonumber(narrow_table.popup_widest) > tonumber(narrow_table.window_width),
@@ -433,12 +500,12 @@ local function body()
       narrow_table.popup_widest, narrow_table.window_width))
 
   local closed = preview_key('narrow_closed', false)
-  expect('5.1 and the key closes it again', closed.open, 'false')
+  expect_open('5.1 and the key closes it again', closed, false)
 
   md_call('goto(12)')
   local narrow_diagram = preview_key('narrow_diagram', true)
 
-  expect('5.1 the diagram preview opens', narrow_diagram.open, 'true')
+  expect_open('5.1 the diagram preview opens', narrow_diagram, true)
   expect('5.1 in the same narrow window', narrow_diagram.window_width, '40')
   truthy('5.1 and the popup shows columns the window clipped',
     tonumber(narrow_diagram.popup_widest) > tonumber(narrow_diagram.window_width),
@@ -464,12 +531,12 @@ local function body()
     tonumber(view_before.topline) > 1, view_before.topline)
 
   local view_open = preview_key('view_open', true)
-  expect('5.2 the preview opens over the wide table', view_open.open, 'true')
+  expect_open('5.2 the preview opens over the wide table', view_open, true)
   expect('5.2 and the window underneath is still in R', view_open.state, 'R')
 
   local view_after = preview_key('view_after', false)
 
-  expect('5.2 the key closes it again', view_after.open, 'false')
+  expect_open('5.2 the key closes it again', view_after, false)
   expect('5.2 and the window is still in R', view_after.state, 'R')
   expect('5.2 on the same buffer', view_after.buffer, view_before.buffer)
   expect('5.2 with the same cursor line', view_after.cursor_line, view_before.cursor_line)
@@ -489,7 +556,7 @@ local function body()
   md_call('goto(6)')
   local full_table = preview_key('full_table', true)
 
-  expect('5.3 the table preview opens', full_table.open, 'true')
+  expect_open('5.3 the table preview opens', full_table, true)
   expect('5.3 in a window as wide as the editor',
     full_table.window_width, full_table.columns)
   truthy('5.3 and the popup holds no fewer columns than the window did',
@@ -518,10 +585,11 @@ local function body()
   -- width would not tell the two budgets apart.
   md_call('reset_wide_diagram()')
   md_call('narrow(40)')
+  md_call('settled(40)')
   md_call('goto(9)')
   local wide_diagram = preview_key('wide_diagram', true)
 
-  expect('5.4 the diagram preview opens', wide_diagram.open, 'true')
+  expect_open('5.4 the diagram preview opens', wide_diagram, true)
   expect('5.4 in the narrow window', wide_diagram.window_width, '40')
   truthy('5.4 and the popup holds more of it than the popup\'s own width',
     tonumber(wide_diagram.popup_widest) > tonumber(wide_diagram.popup_inner),
@@ -542,20 +610,6 @@ else
 end
 server:wait()
 
--- An error raised inside the server — a step that failed, a key that did not
--- exist — arrives as a missing report rather than as a message, because a `:lua`
--- call cannot return to the driver. Its output is kept for exactly this reason,
--- and without printing it the cause is a report that never appeared and nothing
--- else. Printed before the results so it reads as the explanation of them.
-if not ok then
-  for _, name in ipairs({ 'server.err', 'server.out' }) do
-    local text = read(OUT .. '/' .. name)
-    if text and #text > 0 then
-      io.stdout:write(string.format('\n--- %s ---\n%s\n', name, table.concat(text, '\n')))
-    end
-  end
-end
-
 --------------------------------------------------------------------------------
 -- Report
 --------------------------------------------------------------------------------
@@ -574,4 +628,20 @@ io.stdout:write(string.format('\n%d checks, %d failed\n', #results, failed))
 if not ok then
   io.stdout:write(string.format('\nthe run stopped early: %s\n', err))
 end
+
+-- An error raised inside the server — a step that failed, a key that did not
+-- exist — never comes back to the driver, because a `:lua` call cannot return
+-- to it. Key handlers raise there too: a mapping that fails prints to the
+-- server's stderr and nothing else, and the only sign here is the check that
+-- key was driving. Printed after the results, and whenever anything went
+-- wrong, so a failed check is followed by whatever the server said about it.
+if not ok or failed > 0 then
+  for _, name in ipairs({ 'server.err', 'server.out' }) do
+    local text = table.concat(server_output[name])
+    if #text > 0 then
+      io.stdout:write(string.format('\n--- %s ---\n%s\n', name, text))
+    end
+  end
+end
+
 os.exit((ok and failed == 0) and 0 or 1)
