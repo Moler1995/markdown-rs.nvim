@@ -11,9 +11,10 @@ than to the window, and it SHALL NOT be enlarged past its natural size.
 
 An image the engine cannot draw SHALL still open a popup, showing the reference's alt text.
 
-Where the terminal draws images, the popup SHALL show the image file the engine reported instead
-of the artwork: the same window, opened at the same size and position, with the file placed over
-its interior. An image the engine reported no path for SHALL still open the artwork's popup.
+Where the terminal can draw images, the popup SHALL show the image file instead of the artwork:
+the same window, opened at the same size and position, with the file placed over its interior by
+the terminal. A reference that does not resolve to a readable local file SHALL still open the
+artwork's popup.
 
 #### Scenario: Cursor on an image
 
@@ -32,7 +33,8 @@ its interior. An image the engine reported no path for SHALL still open the artw
 
 #### Scenario: A popup drawn by the terminal
 
-- **WHEN** the terminal draws images and the preview key opens an image
+- **WHEN** the terminal draws images and the preview key opens an image whose reference resolves
+  to a readable file
 - **THEN** the popup window is the one the artwork would have opened
 - **AND** the image file is shown over its interior
 
@@ -54,10 +56,10 @@ and frame-step keys SHALL perform their ordinary actions, and no timer SHALL be 
 An image whose animation the engine refused for size SHALL likewise show its first frame and start
 no timer, and the plugin SHALL report that the image is too large to animate.
 
-Where the popup's image is drawn by the terminal, the terminal SHALL own playback: the plugin
-SHALL start no timer for it, SHALL swap no frames, and SHALL NOT bind the pause and frame-step
-keys, whose ordinary actions the reader keeps. Every rule above about timers, delays and refusals
-SHALL be read as applying to a popup whose content is artwork.
+Where the popup's image is drawn by the terminal, the terminal SHALL own playback and the rules
+above SHALL be read as applying to a popup whose content is artwork: the plugin SHALL request no
+frames for the popup, SHALL start no timer, SHALL swap no frames, and SHALL NOT bind the pause and
+frame-step keys, whose ordinary actions the reader keeps.
 
 #### Scenario: Opening an animated image
 
@@ -98,7 +100,8 @@ SHALL be read as applying to a popup whose content is artwork.
 
 - **WHEN** an animated image's popup is drawn by the terminal
 - **THEN** the terminal plays the file's frames
-- **AND** no timer is started and the pause and frame-step keys keep their ordinary meaning
+- **AND** no frames are requested for the popup, no timer is started, and the pause and frame-step
+  keys keep their ordinary meaning
 
 ### Requirement: The popup is a reading surface
 
@@ -107,13 +110,21 @@ and yanking operate on it. Modification SHALL be refused, and the popup SHALL NO
 buffer.
 
 Where a graphic is placed over the popup, the artwork SHALL remain the popup's content: it is what
-a search, a yank and a scroll act on, and the graphic covers it without changing the buffer.
+a search and a yank act on, and the graphic covers it without changing the buffer.
 
 #### Scenario: Scrolling a block larger than the popup
 
-- **WHEN** the block is taller or wider than the popup
+- **WHEN** the block is taller or wider than the popup and no graphic is placed over it
 - **THEN** the popup's content can be scrolled to reach the rest of it
 - **AND** no line is soft-wrapped, so a row of artwork stays on one row
+
+#### Scenario: A graphic popup does not scroll
+
+- **WHEN** a graphic is placed over the popup
+- **THEN** the wheel, the vertical scroll keys and the configured sideways scroll keys do nothing,
+  because a repaint that a scroll causes removes the image from the cells it covers on the
+  cell-attached transport
+- **AND** every other key, including the close key, keeps its meaning
 
 #### Scenario: Modification is refused
 

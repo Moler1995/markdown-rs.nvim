@@ -76,6 +76,7 @@ vim.cmd('source ' .. vim.fn.fnameescape(repo .. '/plugin/md-render.lua'))
 local md = require('md-render')
 local config = require('md-render.config')
 local engine_mod = require('md-render.engine')
+local graphics = require('md-render.graphics')
 local link = require('md-render.link')
 local preview = require('md-render.preview')
 local render = require('md-render.render')
@@ -261,6 +262,7 @@ section('8.1', function()
   eq_table('8.1 default preview caps', d.preview,
     { max_width_pct = 0.9, max_height_pct = 0.9 })
   expect('8.1 default resize debounce', d.resize_debounce, 100)
+  expect('8.1 default graphics mode', d.graphics, 'auto')
 
   -- The user's options must not mutate the defaults table.
   local resolved = config.setup({ theme = 'dracula' })
@@ -4731,6 +4733,639 @@ section('7.4', function()
 
   config.setup({})
   vim.fn.delete(dir, 'rf')
+end)
+
+--------------------------------------------------------------------------------
+-- Graphics protocol: identification, sequences, the popup
+--------------------------------------------------------------------------------
+
+local ESC = string.char(27)
+local ST = string.char(92)
+
+--- A fresh directory holding one file of `bytes`, for the plan checks.
+local function temp_file(name, bytes)
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, 'p')
+  local path = dir .. '/' .. name
+  vim.fn.writefile({ bytes }, path, 'b')
+  return dir, path
+end
+
+--- Whether `buf` maps `lhs` in normal mode, however Neovim stored it.
+---
+--- `nvim_buf_get_keymap` reports the canonical form, so `<Space>` comes back as
+--- a literal space and `<C-n>` as `<C-N>`: comparing the configured string to
+--- the reported `lhs` would find only the maps that needed no translation.
+local function has_keymap(buf, lhs)
+  local wanted = vim.api.nvim_replace_termcodes(lhs, true, true, true)
+  for _, map in ipairs(vim.api.nvim_buf_get_keymap(buf, 'n')) do
+    if vim.api.nvim_replace_termcodes(map.lhs, true, true, true) == wanted then
+      return true
+    end
+  end
+  return false
+end
+
+--- The right-hand side `buf` maps `lhs` to, `'<callback>'` for a Lua
+--- function, or nil when it maps nothing.
+---
+--- The sideways scroll keys are bound on every popup and *re*-bound to a no-op
+--- on a graphic one, and which of the two a buffer holds is the whole difference
+--- between a key that scrolls and a key that would erase the image: presence
+--- alone cannot tell them apart.
+local function keymap_rhs(buf, lhs)
+  local wanted = vim.api.nvim_replace_termcodes(lhs, true, true, true)
+  for _, map in ipairs(vim.api.nvim_buf_get_keymap(buf, 'n')) do
+    if vim.api.nvim_replace_termcodes(map.lhs, true, true, true) == wanted then
+      if map.callback ~= nil then
+        return '<callback>'
+      end
+      return map.rhs
+    end
+  end
+  return nil
+end
+
+--- Open `path`'s image popup with `tier`'s placement, and return the popup and
+--- the placement.
+---
+--- `tier` nil asks the real decision, which is what the fallback checks need.
+--- The caller installs the recording `graphics.send` before calling, so that
+--- what closing the popup sends is recorded too.
+local function open_image(tag, path, tier, opts)
+  preview.close()
+  config.setup(vim.tbl_extend('force', { image_mode = 'blocks' }, opts or {}))
+  truthy(tag .. ' reset to ' .. vim.fn.fnamemodify(path, ':t'), reset_to(path))
+  local st = current_state()
+  local row = artwork_row(st)
+  truthy(tag .. ' the artwork is drawn', row ~= nil)
+  local lines = vim.api.nvim_buf_get_lines(st.source, 0, -1, false)
+  local block = row and preview.locate(st.doc, row, lines)
+  truthy(tag .. ' the artwork resolves to an image block', block and block.kind == 'image')
+  local base = vim.fn.fnamemodify(path, ':p:h')
+  local graphic = block and graphics.plan(block.ref, base, tier) or nil
+
+  local geometry = preview.geometry('image', 80)
+  local view = preview.view(block, geometry, base, graphic)
+  local doc, err, done
+  preview.render_block(config.options, block, view, function(e, d)
+    err, doc, done = e, d, true
+  end)
+  truthy(tag .. ' the popup render answers', wait_until(function() return done end), tostring(err))
+  if not doc then
+    return nil, graphic
+  end
+  preview.open(doc, geometry, block, graphic)
+  return preview.popup, graphic
+end
+
+--------------------------------------------------------------------------------
+-- 1.2 Which terminal, and which transport
+--------------------------------------------------------------------------------
+
+section('1.2', function()
+  expect('1.2 WezTerm by TERM_PROGRAM',
+    graphics.identify({ TERM_PROGRAM = 'WezTerm' }), 'osc')
+  expect('1.2 WezTerm by WEZTERM_PANE',
+    graphics.identify({ WEZTERM_PANE = '0' }), 'osc')
+  expect('1.2 iTerm2 by TERM_PROGRAM',
+    graphics.identify({ TERM_PROGRAM = 'iTerm.app' }), 'osc')
+  expect('1.2 iTerm2 by LC_TERMINAL',
+    graphics.identify({ LC_TERMINAL = 'iTerm2' }), 'osc')
+  expect('1.2 kitty by KITTY_WINDOW_ID',
+    graphics.identify({ KITTY_WINDOW_ID = '1' }), 'kitty')
+  expect('1.2 kitty by TERM',
+    graphics.identify({ TERM = 'xterm-kitty' }), 'kitty')
+  expect('1.2 kitty by a -kitty TERM suffix',
+    graphics.identify({ TERM = 'foo-kitty' }), 'kitty')
+  expect('1.2 Ghostty by TERM_PROGRAM',
+    graphics.identify({ TERM_PROGRAM = 'ghostty' }), 'kitty')
+  expect('1.2 Ghostty by TERM',
+    graphics.identify({ TERM = 'xterm-ghostty' }), 'kitty')
+
+  -- Order matters: WezTerm implements both protocols, and OSC 1337 is the one
+  -- that reaches it through ConPTY.
+  expect('1.2 WezTerm wins over a Kitty variable',
+    graphics.identify({ TERM_PROGRAM = 'WezTerm', KITTY_WINDOW_ID = '1' }), 'osc')
+
+  expect('1.2 an unknown terminal',
+    graphics.identify({ TERM = 'xterm-256color', TERM_PROGRAM = 'Apple_Terminal' }), nil)
+  expect('1.2 an empty environment', graphics.identify({}), nil)
+  expect('1.2 tmux by TMUX',
+    graphics.identify({ TERM_PROGRAM = 'WezTerm', TMUX = '/tmp/tmux-1/default,1,0' }), nil)
+  expect('1.2 tmux by TERM',
+    graphics.identify({ TERM_PROGRAM = 'WezTerm', TERM = 'tmux-256color' }), nil)
+  expect('1.2 screen by TERM',
+    graphics.identify({ TERM_PROGRAM = 'WezTerm', TERM = 'screen-256color' }), nil)
+end)
+
+--------------------------------------------------------------------------------
+-- 1.3 The conditions that turn graphics off, and the health sentence
+--------------------------------------------------------------------------------
+
+section('1.3', function()
+  local real = { has_send = graphics.has_send, uis = graphics.uis, env = graphics.env }
+  local function stub(opts)
+    graphics.has_send = function() return opts.send ~= false end
+    graphics.uis = function() return opts.uis or { {} } end
+    graphics.env = function() return opts.env or { TERM_PROGRAM = 'WezTerm' } end
+    config.setup({ graphics = opts.mode or 'auto' })
+  end
+  local function restore()
+    graphics.has_send, graphics.uis, graphics.env = real.has_send, real.uis, real.env
+    config.setup({})
+  end
+
+  local ok, err = pcall(function()
+    stub({ send = false })
+    local no_api = graphics.reason()
+    truthy('1.3 no raw-bytes API turns graphics off', not graphics.available())
+    truthy('1.3 and names the API', no_api:find('nvim_ui_send', 1, true) ~= nil, no_api)
+
+    stub({ uis = {} })
+    local no_ui = graphics.reason()
+    truthy('1.3 no attached UI turns graphics off', not graphics.available())
+    truthy('1.3 and names the UI', no_ui:find('UI', 1, true) ~= nil, no_ui)
+
+    stub({ mode = 'off' })
+    local option = graphics.reason()
+    truthy('1.3 the option turns graphics off', not graphics.available())
+    truthy("1.3 and names 'off'", option:find("'off'", 1, true) ~= nil, option)
+
+    stub({ env = { TERM_PROGRAM = 'WezTerm', TMUX = '/tmp/tmux-1/default,1,0' } })
+    local mux = graphics.reason()
+    truthy('1.3 a multiplexer turns graphics off', not graphics.available())
+    truthy('1.3 and names the multiplexer', mux:find('multiplexer', 1, true) ~= nil, mux)
+
+    stub({ env = { TERM = 'xterm-256color' } })
+    local unknown = graphics.reason()
+    truthy('1.3 an unknown terminal turns graphics off', not graphics.available())
+    truthy('1.3 and names the terminal', unknown:find('identify', 1, true) ~= nil, unknown)
+
+    stub({})
+    local sentence, on = graphics.reason()
+    truthy('1.3 an identified terminal turns graphics on', graphics.available())
+    truthy('1.3 and names the transport', on and sentence:find('OSC 1337', 1, true) ~= nil,
+      sentence)
+    expect('1.3 with the tier', graphics.tier(), 'osc')
+
+    stub({ env = { TERM = 'xterm-kitty' } })
+    expect('1.3 and the Kitty tier', graphics.tier(), 'kitty')
+  end)
+  restore()
+  if not ok then
+    error(err, 0)
+  end
+end)
+
+--------------------------------------------------------------------------------
+-- 2.1 The OSC 1337 sequence
+--------------------------------------------------------------------------------
+
+section('2.1', function()
+  expect('2.1 the exact bytes',
+    graphics.osc_sequence({ 0, 0 }, 10, 5, 'AAAA'),
+    ESC .. '[1;1H'
+      .. ESC .. ']1337;File=inline=1;width=10;height=5;preserveAspectRatio=0;doNotMoveCursor=1:AAAA'
+      .. ESC .. ST)
+  local head = ESC .. '[7;4H'
+  expect('2.1 the cursor move is 1-based',
+    graphics.osc_sequence({ 6, 3 }, 1, 1, 'x'):sub(1, #head), head)
+  local payload = vim.base64.encode('abc')
+  truthy('2.1 the payload is carried as given',
+    graphics.osc_sequence({ 0, 0 }, 2, 2, payload):find(':' .. payload .. ESC .. ST, 1, true)
+      ~= nil)
+end)
+
+--------------------------------------------------------------------------------
+-- 2.2 The Kitty sequences
+--------------------------------------------------------------------------------
+
+section('2.2', function()
+  local path = 'C:/tmp/a.png'
+  expect('2.2 the placement bytes',
+    graphics.kitty_sequence({ 2, 4 }, 20, 9, 7, path),
+    ESC .. '[3;5H'
+      .. ESC .. '_Gi=7,a=T,t=f,p=7,c=20,r=9,C=1,q=2;'
+      .. vim.base64.encode(path) .. ESC .. ST)
+  local wide = 'C:/图片/图.png'
+  truthy('2.2 a non-ASCII path is sent as its bytes',
+    graphics.kitty_sequence({ 0, 0 }, 1, 1, 1, wide):find(vim.base64.encode(wide), 1, true)
+      ~= nil)
+  expect('2.2 the delete bytes',
+    graphics.kitty_delete(7), ESC .. '_Ga=d,d=I,i=7,q=2' .. ESC .. ST)
+end)
+
+--------------------------------------------------------------------------------
+-- 2.3 What can be placed
+--------------------------------------------------------------------------------
+
+section('2.3', function()
+  local dir, path = temp_file('pic.png', 'abc')
+  local ref = { target = 'pic.png' }
+
+  -- `fs_stat` and `vim.fs.joinpath` normalize separators, so the resolved path
+  -- is the file's identity rather than the string `temp_file` built.
+  local resolved = vim.fs.normalize(path)
+
+  local osc = graphics.plan(ref, dir, 'osc')
+  truthy('2.3 a readable file plans an OSC placement', osc ~= nil)
+  expect('2.3 with the resolved path', osc and osc.path, resolved)
+  expect('2.3 carrying the encoded bytes', osc and osc.data, vim.base64.encode('abc'))
+  expect('2.3 and its transport', osc and osc.tier, 'osc')
+
+  local kitty = graphics.plan(ref, dir, 'kitty')
+  truthy('2.3 a readable file plans a Kitty placement', kitty ~= nil)
+  expect('2.3 with the path', kitty and kitty.path, resolved)
+  expect('2.3 and no bytes', kitty and kitty.data, nil)
+  truthy('2.3 and an id to place and delete by', type(kitty and kitty.id) == 'number')
+
+  expect('2.3 a missing file plans nothing',
+    graphics.plan({ target = 'not-there.png' }, dir, 'osc'), nil)
+  expect('2.3 a directory plans nothing',
+    graphics.plan({ target = '.' }, dir, 'osc'), nil)
+  expect('2.3 an https URL plans nothing',
+    graphics.plan({ target = 'https://example.com/a.png' }, dir, 'osc'), nil)
+  expect('2.3 an http URL plans nothing',
+    graphics.plan({ target = 'HTTP://example.com/a.png' }, dir, 'kitty'), nil)
+  expect('2.3 a data URI plans nothing',
+    graphics.plan({ target = 'data:image/png;base64,AAAA' }, dir, 'kitty'), nil)
+  expect('2.3 an empty destination plans nothing',
+    graphics.plan({ target = '' }, dir, 'kitty'), nil)
+
+  expect('2.3 a relative destination joins the document directory',
+    graphics.resolve('pic.png', dir), vim.fs.joinpath(dir, 'pic.png'))
+  expect('2.3 an absolute destination is used as it is',
+    graphics.resolve(path, '/somewhere/else'), path)
+
+  -- The cap belongs to the transport that carries the bytes; the one that
+  -- carries a path has nothing to bound.
+  local cap = graphics.MAX_BYTES
+  graphics.MAX_BYTES = 2
+  expect('2.3 a file over the cap is not sent whole',
+    graphics.plan(ref, dir, 'osc'), nil)
+  truthy('2.3 the path-carrying transport has no cap',
+    graphics.plan(ref, dir, 'kitty') ~= nil)
+  graphics.MAX_BYTES = cap
+
+  vim.fn.delete(dir, 'rf')
+end)
+
+--------------------------------------------------------------------------------
+-- 2.4 Placing and removing, through the injectable sender
+--------------------------------------------------------------------------------
+
+section('2.4', function()
+  local buf = vim.api.nvim_create_buf(false, true)
+  local win = vim.api.nvim_open_win(buf, false, {
+    relative = 'editor', row = 2, col = 3, width = 10, height = 5,
+  })
+  local real = graphics.send
+  local sends = {}
+  graphics.send = function(bytes) sends[#sends + 1] = bytes end
+
+  local ok, err = pcall(function()
+    graphics.place(win, { tier = 'osc', data = 'AAAA' })
+    expect('2.4 an OSC placement is one send', #sends, 1)
+    expect('2.4 carrying the window\'s position and box', sends[1],
+      graphics.osc_sequence({ 2, 3 }, 10, 5, 'AAAA'))
+
+    sends = {}
+    graphics.place(win, { tier = 'kitty', id = 3, path = 'p.png' })
+    expect('2.4 a Kitty placement is one send', #sends, 1)
+    expect('2.4 carrying the path and the box', sends[1],
+      graphics.kitty_sequence({ 2, 3 }, 10, 5, 3, 'p.png'))
+
+    -- A bordered float reports its *frame's* corner, one cell above and left of
+    -- its first text cell. `screenpos` is the independent measure of where the
+    -- text begins, so the two disagreeing is what this pins.
+    local bbuf = vim.api.nvim_create_buf(false, true)
+    local bwin = vim.api.nvim_open_win(bbuf, false, {
+      relative = 'editor', row = 2, col = 3, width = 10, height = 5,
+      style = 'minimal', border = 'rounded',
+    })
+    local sp = vim.fn.screenpos(bwin, 1, 1)
+    truthy('2.4 a bordered window reports one cell outside its text',
+      sp.row - 1 ~= vim.api.nvim_win_get_position(bwin)[1], sp.row)
+    sends = {}
+    graphics.place(bwin, { tier = 'osc', data = 'AAAA' })
+    expect('2.4 and is placed at its first text cell', sends[1],
+      graphics.osc_sequence({ sp.row - 1, sp.col - 1 }, 10, 5, 'AAAA'))
+    pcall(vim.api.nvim_win_close, bwin, true)
+    pcall(vim.api.nvim_buf_delete, bbuf, { force = true })
+
+    sends = {}
+    graphics.place(win, nil)
+    expect('2.4 no placement sends nothing', #sends, 0)
+
+    graphics.remove({ tier = 'osc', data = 'AAAA' })
+    expect('2.4 removing an OSC placement sends nothing', #sends, 0)
+    graphics.remove({ tier = 'kitty', id = 3 })
+    expect('2.4 removing a Kitty placement deletes it', sends[#sends], graphics.kitty_delete(3))
+  end)
+  graphics.send = real
+  pcall(vim.api.nvim_win_close, win, true)
+  pcall(vim.api.nvim_buf_delete, buf, { force = true })
+  if not ok then
+    error(err, 0)
+  end
+end)
+
+--------------------------------------------------------------------------------
+-- 3.1 The block keeps its reference, and a URL yields no placement
+--------------------------------------------------------------------------------
+
+section('3.1', function()
+  local doc = { lines = { { source = 0, spans = { { nil, 'x' } } } } }
+  local block = preview.locate(doc, 0, { '![alt](pic.png)' })
+  truthy('3.1 an image row resolves to an image block', block and block.kind == 'image')
+  truthy('3.1 carrying its parsed reference', block and block.ref ~= nil)
+  expect('3.1 the reference targets the file', block and block.ref and block.ref.target,
+    'pic.png')
+
+  local url = preview.locate(doc, 0, { '![alt](https://example.com/a.png)' })
+  truthy('3.1 a URL reference is still a block', url ~= nil)
+  expect('3.1 but yields no placement', graphics.plan(url.ref, nil, 'osc'), nil)
+end)
+
+--------------------------------------------------------------------------------
+-- 3.2 What the engine is asked for, per transport
+--------------------------------------------------------------------------------
+
+section('3.2', function()
+  local block = { kind = 'image', lines = { '![a](pic.png)' } }
+  local geometry = preview.geometry('image', 80)
+  expect('3.2 without a placement the frames are requested',
+    preview.view(block, geometry, nil, nil).animation, config.options.image_animation)
+  expect('3.2 the OSC transport asks for no frames',
+    preview.view(block, geometry, nil, { tier = 'osc' }).animation, false)
+  expect('3.2 the Kitty transport still asks for them',
+    preview.view(block, geometry, nil, { tier = 'kitty' }).animation,
+    config.options.image_animation)
+  expect('3.2 and the dimensions stay the artwork\'s',
+    preview.view(block, geometry, nil, { tier = 'osc' }).width, geometry.inner)
+end)
+
+--------------------------------------------------------------------------------
+-- 3.3 The popup places the file, or keeps its artwork
+--------------------------------------------------------------------------------
+
+section('3.3', function()
+  local real = graphics.send
+  local sends = {}
+  graphics.send = function(bytes) sends[#sends + 1] = bytes end
+  local ok, err = pcall(function()
+    local popup, graphic = open_image('3.3', inline_fixture, 'osc')
+    truthy('3.3 a still image on OSC opens a popup', popup ~= nil)
+    expect('3.3 and is placed once', #sends, 1)
+    -- The popup's interior, measured from the screen rather than from the
+    -- window's report: `screenpos` is where its first text cell really is, which
+    -- is one cell inside the frame the position names.
+    local sp = vim.fn.screenpos(popup.win, 1, 1)
+    expect('3.3 with the sequence for the popup\'s own box', sends[1],
+      graphics.osc_sequence(
+        { sp.row - 1, sp.col - 1 },
+        vim.api.nvim_win_get_width(popup.win),
+        vim.api.nvim_win_get_height(popup.win),
+        graphic.data))
+    local shown = table.concat(vim.api.nvim_buf_get_lines(popup.buf, 0, -1, false), '\n')
+    truthy('3.3 the artwork is still the buffer',
+      shown:find('▀', 1, true) ~= nil or shown:find('▄', 1, true) ~= nil, shown)
+    expect('3.3 an OSC popup has no frames to play', popup.animation, nil)
+    expect('3.3 and no pause key', has_keymap(popup.buf, config.options.keymaps.pause), false)
+    expect('3.3 and no frame-step key',
+      has_keymap(popup.buf, config.options.keymaps.frame_next), false)
+    preview.close()
+
+    sends = {}
+    local kpopup = open_image('3.3', inline_fixture, 'kitty')
+    truthy('3.3 a still image on Kitty opens a popup', kpopup ~= nil)
+    expect('3.3 and is placed once', #sends, 1)
+    truthy('3.3 with the Kitty sequence', sends[1]:find('a=T,t=f', 1, true) ~= nil, sends[1])
+    preview.close()
+
+    sends = {}
+    local apopup = open_image('3.3', animated_fixture, 'kitty')
+    truthy('3.3 an animated image on Kitty opens a popup', apopup ~= nil)
+    expect('3.3 and is not placed', #sends, 0)
+    truthy('3.3 and keeps its animation', apopup and apopup.animation ~= nil)
+    truthy('3.3 with frames to play',
+      apopup and apopup.animation and #apopup.animation.frames > 1)
+    truthy('3.3 and its pause key', has_keymap(apopup.buf, config.options.keymaps.pause))
+    preview.close()
+  end)
+  graphics.send = real
+  preview.close()
+  config.setup({})
+  if not ok then
+    error(err, 0)
+  end
+end)
+
+--------------------------------------------------------------------------------
+-- 3.5 A resize re-places the image, once per burst
+--------------------------------------------------------------------------------
+
+section('3.5', function()
+  local real = graphics.send
+  local sends = {}
+  graphics.send = function(bytes) sends[#sends + 1] = bytes end
+  local ok, err = pcall(function()
+    open_image('3.5', inline_fixture, 'osc')
+    expect('3.5 the popup places the image when it opens', #sends, 1)
+
+    -- A drag-resize arrives as a burst of events.
+    vim.cmd('doautocmd <nomodeline> VimResized')
+    vim.cmd('doautocmd <nomodeline> VimResized')
+    vim.cmd('doautocmd <nomodeline> WinResized')
+    truthy('3.5 the burst re-places the image',
+      wait_until(function() return #sends == 2 end))
+    vim.wait(200)
+    expect('3.5 once per burst, not once per event', #sends, 2)
+    expect('3.5 with the same bytes', sends[2], sends[1])
+
+    preview.close()
+    local after = #sends
+    vim.cmd('doautocmd <nomodeline> VimResized')
+    vim.wait(200)
+    expect('3.5 a closed popup is not re-placed', #sends, after)
+  end)
+  graphics.send = real
+  preview.close()
+  config.setup({})
+  if not ok then
+    error(err, 0)
+  end
+end)
+
+--------------------------------------------------------------------------------
+-- 3.6 What closing removes, per transport
+--------------------------------------------------------------------------------
+
+section('3.6', function()
+  local real = graphics.send
+  local sends = {}
+  graphics.send = function(bytes) sends[#sends + 1] = bytes end
+  local ok, err = pcall(function()
+    local _, graphic = open_image('3.6', inline_fixture, 'kitty')
+    expect('3.6 the Kitty placement is sent once', #sends, 1)
+    preview.close()
+    expect('3.6 closing sends the delete', #sends, 2)
+    expect('3.6 naming the placed id', sends[2], graphics.kitty_delete(graphic.id))
+    preview.close()
+    expect('3.6 a second close sends nothing more', #sends, 2)
+
+    -- Closed by another route — `:close`, a click elsewhere — is the same
+    -- removal.
+    sends = {}
+    local popup, other = open_image('3.6', inline_fixture, 'kitty')
+    vim.api.nvim_win_close(popup.win, true)
+    expect('3.6 a close by another route also deletes', #sends, 2)
+    expect('3.6 naming the placed id', sends[2], graphics.kitty_delete(other.id))
+
+    sends = {}
+    open_image('3.6', inline_fixture, 'osc')
+    preview.close()
+    expect('3.6 an OSC close sends no delete', #sends, 1)
+  end)
+  graphics.send = real
+  preview.close()
+  config.setup({})
+  if not ok then
+    error(err, 0)
+  end
+end)
+
+--------------------------------------------------------------------------------
+-- 3.7 A placed graphic freezes the popup's viewport
+--------------------------------------------------------------------------------
+
+section('3.7', function()
+  local real = graphics.send
+  graphics.send = function() end
+  local ok, err = pcall(function()
+    local popup = open_image('3.7', inline_fixture, 'osc')
+    truthy('3.7 a still image on OSC opens a popup', popup ~= nil)
+    for _, key in ipairs({ '<ScrollWheelUp>', '<ScrollWheelDown>', '<C-e>', '<C-y>', '<C-d>', '<C-u>' }) do
+      truthy('3.7 ' .. key .. ' moves nothing while the image is shown',
+        popup and keymap_rhs(popup.buf, key) == '<callback>')
+    end
+    -- The sideways keys move the viewport too, so they are frozen with the
+    -- wheel: a reported failure, where pressing one left the artwork showing.
+    -- They are bound on every popup before the placement, so this is a
+    -- re-binding rather than an addition, and it is the binding that matters.
+    for _, name in ipairs({ 'scroll_left', 'scroll_right' }) do
+      local key = config.options.keymaps[name]
+      expect('3.7 ' .. key .. ' moves nothing while the image is shown',
+        popup and keymap_rhs(popup.buf, key), '<callback>')
+    end
+    -- The keys that are not scroll keys keep their meaning: the popup is still
+    -- a reading surface, and its close key is not a casualty of the freeze.
+    expect('3.7 the close key is untouched',
+      has_keymap(popup.buf, config.options.keymaps.preview), true)
+    preview.close()
+
+    popup = open_image('3.7', inline_fixture, 'kitty')
+    truthy('3.7 a still image on Kitty freezes too',
+      popup and has_keymap(popup.buf, '<ScrollWheelDown>'))
+    expect('3.7 and freezes its sideways keys too', popup and
+      keymap_rhs(popup.buf, config.options.keymaps.scroll_right), '<callback>')
+    preview.close()
+
+    -- Every popup that keeps its artwork keeps both ways of moving around it,
+    -- which is why the freeze has to be per-popup rather than global.
+
+    -- The artwork animation is the content there, and scrolling it is how a
+    -- large frame is read; nothing covers it, so nothing is frozen.
+    popup = open_image('3.7', animated_fixture, 'kitty')
+    truthy('3.7 an animated image on Kitty keeps its artwork',
+      popup and popup.animation and #popup.animation.frames > 1)
+    expect('3.7 and keeps the wheel',
+      has_keymap(popup.buf, '<ScrollWheelDown>'), false)
+    local rhs = popup and keymap_rhs(popup.buf, config.options.keymaps.scroll_right)
+    truthy('3.7 and keeps its sideways key scrolling',
+      rhs ~= nil and rhs:match('l$') ~= nil, rhs)
+    preview.close()
+
+    -- No placement, no freeze: a fallback popup scrolls exactly as before.
+    popup = open_image('3.7', inline_fixture, nil)
+    truthy('3.7 a fallback popup opens', popup ~= nil)
+    expect('3.7 with the wheel left alone',
+      has_keymap(popup.buf, '<ScrollWheelDown>'), false)
+    rhs = popup and keymap_rhs(popup.buf, config.options.keymaps.scroll_right)
+    truthy('3.7 and its sideways key still scrolling', rhs ~= nil and rhs:match('l$') ~= nil, rhs)
+    preview.close()
+  end)
+  graphics.send = real
+  preview.close()
+  config.setup({})
+  if not ok then
+    error(err, 0)
+  end
+end)
+
+--------------------------------------------------------------------------------
+-- 4.1 Health reports the transport or the reason it is off
+--------------------------------------------------------------------------------
+
+section('4.1', function()
+  local health = require('md-render.health')
+  local report = health.probe()
+
+  local entry, others_ok = nil, true
+  for _, item in ipairs(report.checks) do
+    if item.name == 'graphics' then
+      entry = item
+    elseif not item.ok and item.severity ~= 'warn' then
+      others_ok = false
+    end
+  end
+
+  truthy('4.1 the report has a graphics entry', entry ~= nil)
+  expect('4.1 as a warning, not an error', entry and entry.severity, 'warn')
+  expect('4.1 and it does not decide the verdict', report.ok, others_ok)
+  -- This runner has no UI, so the entry names the condition that is first.
+  local expected = vim.api.nvim_ui_send and 'UI' or 'nvim_ui_send'
+  truthy('4.1 naming why graphics is off',
+    entry and entry.detail:find(expected, 1, true) ~= nil, entry and entry.detail)
+  truthy('4.1 with a remedy', entry and entry.remediation ~= nil)
+end)
+
+--------------------------------------------------------------------------------
+-- 4.2 The fallbacks are the artwork, unchanged
+--------------------------------------------------------------------------------
+
+section('4.2', function()
+  local real = graphics.send
+  local sends = {}
+  graphics.send = function(bytes) sends[#sends + 1] = bytes end
+  local ok, err = pcall(function()
+    -- The option alone turns it off, even in a terminal that could draw.
+    local popup, graphic = open_image('4.2', inline_fixture, nil, { graphics = 'off' })
+    truthy('4.2 with graphics off the popup still opens', popup ~= nil)
+    expect('4.2 with no placement', graphic, nil)
+    expect('4.2 and nothing sent', #sends, 0)
+    local shown = table.concat(vim.api.nvim_buf_get_lines(popup.buf, 0, -1, false), '\n')
+    truthy('4.2 showing the artwork',
+      shown:find('▀', 1, true) ~= nil or shown:find('▄', 1, true) ~= nil, shown)
+    preview.close()
+
+    -- An animated image with graphics off is exactly the popup it always was:
+    -- playing, with its pause key.
+    local apopup = open_image('4.2', animated_fixture, nil, { graphics = 'off' })
+    truthy('4.2 the animated popup still plays', apopup and apopup.animation ~= nil)
+    truthy('4.2 with its pause key', has_keymap(apopup.buf, config.options.keymaps.pause))
+    truthy('4.2 with its frame-step key',
+      has_keymap(apopup.buf, config.options.keymaps.frame_next))
+    expect('4.2 and nothing sent', #sends, 0)
+    preview.close()
+  end)
+  graphics.send = real
+  preview.close()
+  config.setup({})
+  if not ok then
+    error(err, 0)
+  end
 end)
 
 --------------------------------------------------------------------------------

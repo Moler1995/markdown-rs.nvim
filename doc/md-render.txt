@@ -177,6 +177,12 @@ Every top-level key in `config.defaults`, with its default. Set a keymap to
   Fetch an animated image's frames so |keymaps.frame_next| can step through
   them. `false` renders every image as its first frame.
 
+`graphics` (default `'auto'`)~
+  Whether an image's preview popup shows the file itself, drawn by the
+  terminal, instead of the artwork. `'auto'` uses the OSC 1337 protocol in
+  WezTerm and iTerm2, and the Kitty graphics protocol in kitty and Ghostty;
+  `'off'` never writes a graphics sequence. See |md-render-graphics|.
+
 `keymaps` (default below)~
   Buffer-local maps for R, S and the preview popup. Every key is optional and
   may be `false`; see |md-render-keymaps| for what each one does.
@@ -333,7 +339,8 @@ A spent key returns without spawning the engine. A cropped layout is never
 shown. The title says the width a zoomed-out diagram is laid out at.
 
 `<C-h>` and `<C-l>` scroll the popup sideways by the horizontal step of
-'mousescroll' and can be held down. They work in a table's popup too.
+'mousescroll' and can be held down. They work in a table's popup too, and do
+nothing in an image's popup while the terminal is drawing the file.
 
 `<CR>`, `q` and `Esc` close the popup; the window underneath is untouched. On
 anything other than a diagram, table or image, `<CR>` keeps its ordinary
@@ -369,6 +376,44 @@ Animation~
   with a 100 ms floor, and the loop repeats until the popup closes.
   |keymaps.pause| pauses and resumes; stepping works while paused.
 
+Native drawing                                          *md-render-graphics*
+  The preview popup can show the image file itself, drawn by the terminal at
+  its own resolution, instead of the character-cell artwork. Nothing else
+  changes: the popup is the same window at the same size and position, the
+  artwork stays its content, and the popup's keys act as before except for
+  scrolling, which does nothing while the image is shown. This needs Neovim
+  0.12 or newer, whose `nvim_ui_send` writes the sequence, and a terminal the
+  plugin can identify from the environment:
+
+  - WezTerm and iTerm2 get the OSC 1337 inline-image protocol. The file is
+    sent to the terminal, which draws it and plays an animated GIF, APNG or
+    WebP itself, with the file's own delays and no timer in the editor.
+  - kitty and Ghostty get the Kitty graphics protocol. The terminal reads the
+    file from its path. That protocol cannot play a file, so an animated image
+    keeps its character-art animation there; a still image is drawn natively.
+
+  The file fills the popup's interior, stretched to the same cell box the
+  artwork was laid out in, so its proportions can differ from the file's own by
+  the terminal's cell shape. Nothing of the artwork is left showing at an edge.
+
+  `graphics = 'off'`, an unidentified terminal, a tmux or screen session, a
+  URL or `data:` reference, or a file the plugin cannot read all leave the
+  artwork visible and say nothing. An image over 8 MiB is not sent to the OSC
+  transport; the Kitty transport sends a path and has no such limit.
+
+  The image is placed again after the editor is resized. A full redraw the
+  plugin did not cause — `:redraw!` or `CTRL-L` — clears an OSC 1337 image
+  until the next resize; a Kitty placement survives it. Closing the popup
+  removes the image.
+
+  Nothing moves the viewport while the image is shown — not the wheel, not the
+  vertical scroll keys, not `<C-h>` and `<C-l>`: on the OSC transport an image
+  is attached to the cells it covers, so the repaint any scroll causes removes
+  it and leaves only the artwork. There is nothing to reach either way: an
+  image is laid out to fit the popup, so no column or row lies past its edge.
+  Every other key, including `gf`, search and yank, acts on the artwork as
+  before.
+
 `gx`~
   Opens the image's file with the operating system's default application.
   Relative destinations resolve against the document's directory. A remote
@@ -386,6 +431,8 @@ Animation~
     understands it;
   - `'termguicolors'` and the image encoding it implies (a warning, not a
     failure);
+  - which transport the preview popup draws images with, or which condition
+    turned graphics off (a warning, not a failure);
   - the configured filetypes.
 
 It runs the engine twice, with a timeout, and never renders the buffer you are

@@ -15,6 +15,7 @@
 
 local config = require('md-render.config')
 local engine = require('md-render.engine')
+local graphics = require('md-render.graphics')
 local link = require('md-render.link')
 local render = require('md-render.render')
 
@@ -185,6 +186,10 @@ end
 --- The source text is sliced by byte columns rather than reconstructed from the
 --- reference's parts, so an escaped bracket or a title with spaces reaches the
 --- engine exactly as the reader wrote it.
+---
+--- The parse is kept on the block as `ref` as well: the popup resolves the
+--- reference to a file itself when the terminal can draw it, and re-parsing the
+--- text there would be a second answer to a question already answered.
 local function image_block(doc, row, lines)
   local ref = link.image_at_row(lines, doc, row)
   if not ref then
@@ -201,6 +206,7 @@ local function image_block(doc, row, lines)
     first = source + 1,
     last = source + 1,
     lines = { raw },
+    ref = ref,
   }
 end
 
@@ -258,18 +264,30 @@ end
 --- so it is the one request that pays for the frames up front. Every inline
 --- render leaves the flag out until the stepping key asks for it.
 ---
+--- `graphic` is the placement the terminal will make, or nil. On the OSC
+--- transport the terminal plays the file itself, so the frames are not asked
+--- for at all: decoding every frame of a multi-megabyte GIF only to throw them
+--- away is the cost this capability exists to avoid. On the Kitty transport the
+--- protocol cannot play a file, so the frames are still requested — the document
+--- is how the popup knows the image animates and must keep its artwork — and a
+--- still image's document simply carries none.
+---
 --- The image quality options come from the same `config.image_options()` the
 --- inline render uses, so the popup cannot show a palette or background the
 --- page does not. The engine's argument builder is shared; there is no second
 --- copy of these flags here.
-function M.view(block, geometry, base)
+function M.view(block, geometry, base, graphic)
   if block.kind == 'image' then
+    local animation = config.options.image_animation
+    if graphic and graphic.tier == 'osc' then
+      animation = false
+    end
     return vim.tbl_extend('force', {
       width = geometry.inner,
       height = math.max(1, geometry.max_h - 2),
       encoding = config.image_encoding(),
       base = base,
-      animation = config.options.image_animation,
+      animation = animation,
     }, config.image_options())
   end
   return { width = geometry.budget, encoding = 'off' }
@@ -564,6 +582,12 @@ function M.close()
   -- Before the window goes: a timer that fires while the buffer is being
   -- deleted would be writing into a buffer that is on its way out.
   stop_playback(popup)
+  -- Also before the window goes, for the transport that has to be told: its
+  -- placement survives the repaint that closing causes. Sending it after the
+  -- close would work as well, but a delete that names the placement the popup
+  -- recorded cannot remove anything else, so the earlier order is the one that
+  -- leaves the least time with two things on screen.
+  graphics.remove(popup.graphic)
   if popup.win and vim.api.nvim_win_is_valid(popup.win) then
     pcall(vim.api.nvim_win_close, popup.win, true)
   end
@@ -581,15 +605,136 @@ function M.is_open()
     and vim.api.nvim_win_is_valid(M.popup.win)
 end
 
+--- Send the popup's graphic to the terminal, after flushing Neovim's paint.
+---
+--- The flush is load-bearing: `nvim_ui_send` reaches the terminal host at once,
+--- while the float's own paint may still be queued behind it. Landing after the
+--- placement, that paint removes the image from every cell it touches — a
+--- measured failure, not a theoretical one. `nvim__redraw` then puts the cursor
+--- back where Neovim has it, since the placement's cursor move is a paint and
+--- not a mode change; it is private API, so it is called under `pcall`, and its
+--- absence costs a cursor the next repaint fixes anyway.
+---
+--- Declared above the resize handler because that handler calls it: a local
+--- declared later would be a global at the point of use, and the re-place would
+--- fail silently inside a scheduled callback.
+local function paint_graphic(popup)
+  if not popup.graphic or M.popup ~= popup or not M.is_open() then
+    return
+  end
+  vim.cmd('redraw')
+  graphics.place(popup.win, popup.graphic)
+  pcall(vim.api.nvim__redraw, { cursor = true, flush = true })
+end
+
+--- The keys that move the popup's viewport, as the plugin's own names for them.
+---
+--- Bound to a no-op while a graphic is placed, and for one measured reason: on
+--- the OSC transport the image is attached to the cells it covers, so the
+--- repaint a scroll causes removes it and leaves the character artwork
+--- underneath — a reported failure, not a theoretical one. With the image over
+--- the whole interior there is nothing to scroll to anyway: the engine fits an
+--- image to the popup, so the content never exceeds it.
+---
+--- Only the scroll keys, not every key: a search, a yank and a cursor motion
+--- have to keep working, because the artwork is still the popup's content and
+--- this is still a reading surface.
+---
+--- The plugin's own sideways scroll keys are frozen with them, though they are
+--- not in this list: they are bound on every popup before a graphic is placed,
+--- and a repaint is a repaint whichever key caused it — a sideways keypress
+--- left the artwork showing exactly as a wheel notch did (reported after the
+--- third hand check). Nothing is lost: an image is laid out at the popup's inner
+--- width, so its window is as wide as its content and there is no column past
+--- the edge to reach.
+local SCROLL_KEYS = {
+  '<ScrollWheelUp>', '<ScrollWheelDown>', '<ScrollWheelLeft>', '<ScrollWheelRight>',
+  '<C-e>', '<C-y>', '<C-d>', '<C-u>', '<C-f>', '<C-b>', '<PageUp>', '<PageDown>',
+}
+
+--- Make the popup's viewport move for no key.
+local function freeze_scroll(buf)
+  local keys = vim.list_extend({}, SCROLL_KEYS)
+  for _, name in ipairs({ 'scroll_left', 'scroll_right' }) do
+    local key = config.options.keymaps[name]
+    if key and key ~= '' and key ~= false then
+      keys[#keys + 1] = key
+    end
+  end
+  for _, key in ipairs(keys) do
+    vim.keymap.set('n', key, function() end, {
+      buffer = buf,
+      desc = 'md-render: the image covers the popup, so there is nothing to scroll',
+      nowait = true,
+    })
+  end
+end
+
+--------------------------------------------------------------------------------
+-- Surviving a resize
+--------------------------------------------------------------------------------
+
+--- The pending re-placement, if a resize burst is in flight.
+local replace_timer = nil
+
+--- Put the popup's graphic back after a resize.
+---
+--- A resize repaints the whole screen, and an image placed over it is lost with
+--- the repaint (measured; neither transport restores it by itself). The popup
+--- window survives — a float keeps its size and its position — so the whole fix
+--- is to send the same placement again, read from the window as it is now.
+---
+--- Debounced by the same `resize_debounce` that coalesces re-renders, and for
+--- the same reason: a drag-resize fires once per column, and on the OSC
+--- transport every re-placement writes the file's whole payload again.
+function M.schedule_replace()
+  local popup = M.popup
+  if not popup or not popup.graphic or not M.is_open() then
+    return
+  end
+  if not replace_timer then
+    replace_timer = uv.new_timer()
+    if not replace_timer then
+      return
+    end
+  end
+  replace_timer:stop()
+  replace_timer:start(math.max(1, config.options.resize_debounce), 0, function()
+    vim.schedule(function()
+      local current = M.popup
+      if current and current.graphic then
+        paint_graphic(current)
+      end
+    end)
+  end)
+end
+
+-- One registration for the module's lifetime: the popup is a single window at a
+-- time, and `M.schedule_replace` decides from what is actually on screen.
+vim.api.nvim_create_autocmd({ 'VimResized', 'WinResized' }, {
+  group = augroup,
+  callback = function()
+    M.schedule_replace()
+  end,
+})
+
 --- Open the popup showing `doc`, sized from `geometry`.
 ---
 --- `block` is the source block `doc` was laid out from. The popup keeps it, and
 --- the budget it was laid out at, so that `M.zoom` can lay the same block out
 --- again without going back to the window for its source.
 ---
+--- `graphic` is the placement `graphics.plan` prepared, or nil. It changes what
+--- is painted over the window, never the window: the float is still sized from
+--- the artwork, the artwork is still the buffer's content, and every key still
+--- acts on the block. An animated image on the Kitty transport is decided
+--- against here rather than at plan time, because whether it animates is a
+--- property of the document — the engine is the one that knows, and it says so
+--- with `doc.animations`.
+---
 --- Sized to content and only then clamped, so a small diagram gets a small popup
 --- rather than a large empty frame. Returns the window.
-function M.open(doc, geometry, block)
+function M.open(doc, geometry, block, graphic)
   M.close()
 
   -- Measured in display columns rather than bytes: the artwork is box-drawing
@@ -643,6 +788,10 @@ function M.open(doc, geometry, block)
     frame = 0,
     playing = false,
     timer = nil,
+    -- The placement on screen, or nil. Kept for the two things only it can do:
+    -- re-place on a resize, and name what to delete on the transport that has to
+    -- be told.
+    graphic = nil,
   }
 
   local function close()
@@ -719,6 +868,18 @@ function M.open(doc, geometry, block)
   pcall(vim.api.nvim_buf_set_name, buf, popup_buffer_name(popup))
   M.popup = popup
 
+  -- The terminal draws the file over the popup's interior. The one case that
+  -- keeps the artwork is an animated image on a transport that cannot play a
+  -- file: the character-art animation below is still motion, and a still image
+  -- in its place would be a worse trade than the artwork it replaced.
+  if graphic and not (graphic.tier == 'kitty' and popup.animation and #popup.animation.frames > 1) then
+    popup.graphic = graphic
+    paint_graphic(popup)
+    -- After the placement, because it is the placement that makes a scroll
+    -- destructive; a popup without one keeps the viewport's ordinary keys.
+    freeze_scroll(buf)
+  end
+
   -- The image animates but the engine refused the frames for size: there is
   -- nothing to play, so say so rather than leave the reader wondering why the
   -- popup is still. The document here holds the one reference, so any entry in
@@ -761,9 +922,11 @@ function M.open(doc, geometry, block)
     callback = function()
       if M.popup and M.popup.win == win then
         -- The window went without `M.close`, so it is this handler that has to
-        -- stop the timer; otherwise playback would keep writing into a buffer
-        -- `bufhidden=wipe` is taking away.
+        -- stop the timer and take the image down; otherwise playback would keep
+        -- writing into a buffer `bufhidden=wipe` is taking away, and a Kitty
+        -- placement would outlive the popup that owns it.
         stop_playback(M.popup)
+        graphics.remove(M.popup.graphic)
         M.popup = nil
       end
     end,

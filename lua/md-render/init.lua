@@ -12,6 +12,7 @@
 
 local config = require('md-render.config')
 local engine = require('md-render.engine')
+local graphics = require('md-render.graphics')
 local link = require('md-render.link')
 local preview = require('md-render.preview')
 local render = require('md-render.render')
@@ -659,8 +660,15 @@ function M.preview(win)
   preview_generation = preview_generation + 1
   local generation = preview_generation
 
+  -- The placement is prepared before the render rather than after it, because
+  -- it decides what to ask the engine for: on the transport that plays files
+  -- the popup has no use for frames. A reference that is not a readable local
+  -- file yields no placement, and the request is the artwork's own.
+  local base = image_base(source)
+  local graphic = block.kind == 'image' and block.ref and graphics.plan(block.ref, base) or nil
+
   local geometry = preview.geometry(block.kind, text_width(win))
-  local view = preview.view(block, geometry, image_base(source))
+  local view = preview.view(block, geometry, base, graphic)
   preview.render_block(config.options, block, view, function(err, doc)
     if generation ~= preview_generation then
       return
@@ -671,7 +679,7 @@ function M.preview(win)
       report(st, err)
       return
     end
-    preview.open(doc, geometry, block)
+    preview.open(doc, geometry, block, graphic)
   end)
 end
 

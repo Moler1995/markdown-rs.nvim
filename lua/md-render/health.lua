@@ -11,6 +11,7 @@ local M = {}
 
 local engine = require('md-render.engine')
 local config = require('md-render.config')
+local graphics = require('md-render.graphics')
 
 --- How long either engine call may take, in milliseconds.
 ---
@@ -136,6 +137,17 @@ function M.probe()
     vim.o.termguicolors and 'enabled: images use the braille encoding'
       or 'disabled: images fall back to the ASCII encoding',
     'Add `vim.o.termguicolors = true` to your config for braille image artwork.',
+    'warn')
+
+  -- Which transport the preview popup draws images with, or the condition that
+  -- turned graphics off. A `warn` rather than an error: character art is a
+  -- working popup, and `:checkhealth` is often run where no terminal is
+  -- attached at all.
+  local graphics_detail, graphics_ok = graphics.reason()
+  report.graphics = graphics.tier()
+  add(report, 'graphics', graphics_ok, graphics_detail,
+    'Images still show as character cells. Use Neovim 0.12 or newer in WezTerm, '
+      .. 'iTerm2, kitty or Ghostty, with `graphics` left at its default.',
     'warn')
 
   local filetypes = #report.filetypes > 0 and table.concat(report.filetypes, ', ')

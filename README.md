@@ -40,6 +40,10 @@ buffer.
   block at a budget of its own, so none of a clipped diagram is unreachable.
 - **Image artwork.** PNG, JPEG, GIF, WebP, BMP, TIFF and ICO are drawn as
   character cells, in braille or ASCII, with animation stepping on demand.
+- **Native-resolution images in the preview.** On Neovim 0.12 in WezTerm,
+  iTerm2, kitty or Ghostty, `<CR>` on an image has the terminal draw the file
+  itself over the popup — including animated GIFs playing at their own speed in
+  WezTerm and iTerm2. `graphics = 'off'` keeps the character artwork.
 - **Themes and per-window state.** The engine's palette follows `theme`; two
   windows on one file keep their own rendered buffers.
 - **Diagnostics.** `:checkhealth md-render` names the engine, the resolution
@@ -52,6 +56,8 @@ buffer.
   checkout; the plugin does not fetch or build anything at startup.
 - **A truecolor terminal** for braille image artwork (`'termguicolors'`).
   Without it images use the ASCII encoding; everything else is unchanged.
+- **Neovim 0.12 or newer** for the terminal to draw the image file itself in
+  the preview popup. Optional: older versions keep the character artwork.
 - **Rust 1.92 or newer** only for a source build.
 
 ### Compatibility
@@ -168,6 +174,7 @@ is deep:
 require('md-render').setup({
   theme = 'nord',
   image_mode = 'auto',
+  graphics = 'auto',
   keymaps = {
     toggle = '<leader>mr',
     write = '<C-s>',
@@ -190,7 +197,8 @@ require('md-render').setup({
 })
 ```
 
-`theme` is passed to the engine. `image_mode` picks how artwork is drawn.
+`theme` is passed to the engine. `image_mode` picks how artwork is drawn, and
+`graphics` whether the preview popup has the terminal draw the file itself.
 `filetypes` decides which buffers the plugin manages. Every keymap may be set
 to `false` to leave that key alone.
 

@@ -151,6 +151,7 @@ Module responsibilities:
 | `style.lua` | interning wire styles into highlight groups named by a hash of the style, so re-renders reuse groups instead of redefining them |
 | `link.lua` | resolving the link under the cursor from the *source* text (the engine drops link targets) |
 | `preview.lua` | finding the block under the cursor, the float, its own render budget and the zoom ladder |
+| `graphics.lua` | terminal identification, the two graphics transports, the escape sequences, and the injectable raw-bytes sender |
 
 Refreshes are debounced by `resize_debounce` (100 ms) because resizes and typing arrive in bursts; toggles are applied immediately so a pending refresh cannot swallow the key after a resize.
 

@@ -157,6 +157,29 @@ M.defaults = {
   -- pressed.
   image_animation = true,
 
+  -- Whether an image's preview popup shows the file itself, drawn by the
+  -- terminal, instead of the artwork.
+  --
+  --   'auto'  Use the terminal's graphics protocol when the process environment
+  --           names a client known to implement one, and the editor can write
+  --           raw bytes to it. WezTerm and iTerm2 get the OSC 1337 inline-image
+  --           protocol, whose terminals also play an animated GIF, APNG or WebP
+  --           from the file itself; kitty and Ghostty get the Kitty graphics
+  --           protocol, which reads the file from its path but has no playback,
+  --           so an animated image there keeps its character-art animation.
+  --   'off'   Never write a graphics sequence. Every popup is the artwork, in
+  --           any terminal, exactly as it was before this option existed.
+  --
+  -- This changes only what the popup paints, never what the engine draws: the
+  -- popup's window, its size and its position are the artwork's, and the
+  -- artwork stays the buffer's content. A terminal the plugin cannot identify,
+  -- a multiplexer, a URL or `data:` reference, or a file it cannot read leaves
+  -- the artwork visible and warns about nothing.
+  --
+  -- :checkhealth md-render reports which transport is in use, or which
+  -- condition turned graphics off.
+  graphics = 'auto',
+
   -- Buffer-local keymaps set in R. Set a value to `false` to leave the key
   -- alone. `toggle` swaps between R and S; `preview` opens the block popup and
   -- belongs to R only, since in S the cursor is already on the block's source.
