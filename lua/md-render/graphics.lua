@@ -14,10 +14,12 @@
 --           and composites it at native resolution. WezTerm and iTerm2 also play
 --           an animated GIF, APNG or WebP from those bytes with the file's own
 --           delays, so an animated image needs nothing from the editor.
---   kitty   The Kitty graphics protocol, `ESC _ G ... ESC \`. The payload is the
---           file's path, so the terminal reads the file and almost nothing
---           crosses the pty. The protocol has no file playback; see
---           `design.md` D7 for what the popup does with an animated image here.
+--   kitty   The Kitty graphics protocol, `ESC _ G ... ESC \`. A PNG is sent as
+--           its path, so the terminal reads the file and almost nothing crosses
+--           the pty; everything else is sent as the engine's PNG encode, because
+--           the protocol's data transmission decodes PNG alone. The protocol has
+--           no file playback; see `design.md` D7 for what the popup does with an
+--           animated image here.
 --
 -- Identification is from the process environment, never a query: a query is an
 -- asynchronous round trip, and its answer would name the terminal rather than
@@ -52,8 +54,8 @@ local RESTORE_CURSOR = ESC .. '8'
 ---
 --- The whole file is base64-encoded into one sequence, so this bounds a single
 --- write to the pty at about 11 MiB of text. A preview is not worth an unbounded
---- one; a file over the cap simply keeps its artwork. The Kitty transport sends
---- a path and is not capped.
+--- one; a file over the cap simply keeps its artwork. The Kitty transport's path
+--- transmission is not capped, because the terminal reads the file itself.
 M.MAX_BYTES = 8 * 1024 * 1024
 
 --------------------------------------------------------------------------------
@@ -239,11 +241,13 @@ local PNG_SIGNATURE = '\137PNG\r\n\26\n'
 
 --- True when `path` is a PNG, read from its own bytes.
 ---
---- The path-carrying transport names the picture's format in the sequence
---- (`f=100`), and kitty decodes only PNG there: any other file is answered with
---- `EBADPNG:Not a PNG file` and nothing is drawn. A file that is not a PNG is
---- therefore left as its card rather than sent to be refused. The bytes are
---- read, not the name, because a `.png` that is not one would be refused too.
+--- Kitty's transmissions name the picture's format in the sequence (`f=100`),
+--- and the protocol decodes PNG alone: a path transmission of any other file is
+--- answered with `EBADPNG:Not a PNG file` and nothing is drawn. A PNG is
+--- therefore sent as its path, which the terminal reads at its own resolution,
+--- and every other format is carried as data the engine encoded to PNG. The
+--- bytes are read, not the name, because a `.png` that is not one would be
+--- refused too.
 function M.is_png(path)
   if type(path) ~= 'string' or path == '' then
     return false
@@ -268,11 +272,12 @@ local next_id = 0
 ---
 --- `tier` defaults to the transport in use. The work is done once per preview:
 --- an OSC plan carries the base64 the terminal needs, so a resize re-places it
---- without touching the disk; a Kitty plan carries the path, because that is
---- all its transport ever sends. A destination that is not a local file, one
---- that does not stat as a readable file, one over `M.MAX_BYTES` on the
---- byte-carrying transport, and on the path-carrying one a file that is not a
---- PNG all mean nil — the popup keeps its artwork and says nothing.
+--- without touching the disk; a Kitty plan carries the path of a PNG, which the
+--- terminal reads itself, and for any other file the path alone plus `encode`,
+--- because the PNG it has to be carried as is sized to the popup and that is
+--- not known until the window exists. A destination that is not a local file,
+--- one that does not stat as a readable file, and one over `M.MAX_BYTES` all
+--- mean nil — the popup keeps its artwork and says nothing.
 function M.plan(ref, base, tier)
   tier = tier or M.tier()
   if not tier or not ref then
@@ -301,11 +306,12 @@ function M.plan(ref, base, tier)
       return nil
     end
     graphic.data = vim.base64.encode(data)
-  elseif M.is_png(path) then
+  else
     next_id = next_id + 1
     graphic.id = next_id
-  else
-    return nil
+    -- A path transmission is a PNG and nothing else; another format has to be
+    -- carried as data, which means the engine's encode at the popup's own box.
+    graphic.encode = not M.is_png(path)
   end
 
   return graphic
@@ -333,7 +339,7 @@ local thumbnail_order = {}
 --- headless suite, which has no engine and records the request instead: this is
 --- the one side effect the cache exists to avoid repeating, so it is also the
 --- one the checks count.
-function M.run_thumbnail(exe, source, cols, rows, background, out, crop)
+function M.run_thumbnail(exe, source, cols, rows, background, out, crop, format)
   local args = { exe, 'thumbnail', source, '--box', cols .. 'x' .. rows }
   if crop then
     args[#args + 1] = '--crop'
@@ -343,6 +349,10 @@ function M.run_thumbnail(exe, source, cols, rows, background, out, crop)
   args[#args + 1] = out
   args[#args + 1] = '--background'
   args[#args + 1] = background
+  if format then
+    args[#args + 1] = '--format'
+    args[#args + 1] = format
+  end
   local res = vim.system(args, { text = true }):wait()
   if res.code ~= 0 then
     return false, vim.trim(res.stderr or '')
@@ -363,13 +373,16 @@ end
 ---
 --- The box is part of it because the same picture at another size is another
 --- encode, and so is the crop: the rows a half-scrolled block shows are another
---- picture, and scrolling a row is another request. The background is
---- deliberately not: it is the theme's, and a theme change re-renders the
---- document through a path that is not this cache.
-local function thumbnail_key(path, stat, cols, rows, crop)
+--- picture, and scrolling a row is another request. The format is part of it
+--- too, because the same picture as PNG and as JPEG are two encodings of it and
+--- each transport can take one. The background is deliberately not: it is the
+--- theme's, and a theme change re-renders the document through a path that is
+--- not this cache.
+local function thumbnail_key(path, stat, cols, rows, crop, format)
   local top = crop and crop.top or 0
   local height = crop and crop.rows or rows
   return file_key(path, stat) .. '\0' .. cols .. '\0' .. rows .. '\0' .. top .. '\0' .. height
+    .. '\0' .. (format or 'auto')
 end
 
 --- Mark `key` as the most recently used entry of `order`.
@@ -408,7 +421,11 @@ end
 --- `crop` asks for part of the box, as `{ top, rows }` in its cells: a block the
 --- window cuts in half is painted with the rows still on screen, cut exactly
 --- where the window's edge is, instead of squeezed or left as a card.
-function M.thumbnail(path, cols, rows, background, crop)
+---
+--- `format` forces the encoder, as the engine's `--format` names it: `'png'` is
+--- what the Kitty transport's data transmission decodes. Nil leaves the engine's
+--- own choice, which is the smallest encode the OSC clients read.
+function M.thumbnail(path, cols, rows, background, crop, format)
   if not path or path == '' or not cols or not rows or cols < 1 or rows < 1 then
     return nil
   end
@@ -420,7 +437,7 @@ function M.thumbnail(path, cols, rows, background, crop)
     return nil
   end
 
-  local key = thumbnail_key(path, stat, cols, rows, crop)
+  local key = thumbnail_key(path, stat, cols, rows, crop, format)
   local cached = thumbnails[key]
   if cached then
     touch(thumbnail_order, key)
@@ -436,7 +453,7 @@ function M.thumbnail(path, cols, rows, background, crop)
   -- document in every other mode, and a picture is not something a caller can
   -- tell apart from a broken document by looking at a prefix.
   local out = vim.fn.tempname()
-  local ok = M.run_thumbnail(exe, path, cols, rows, background or '#000000', out, crop)
+  local ok = M.run_thumbnail(exe, path, cols, rows, background or '#000000', out, crop, format)
   local bytes
   if ok then
     local read_ok, blob = pcall(vim.fn.readblob, out)
@@ -533,14 +550,18 @@ end
 --- `crop` is the part of the box the window is showing. A file's own bytes carry
 --- the whole picture, so a crop always goes through the engine, which cuts the
 --- rows out of the box: the terminal cannot crop what it is handed.
-function M.inline_bytes(path, cols, rows, background, crop)
-  if not crop then
+---
+--- `format` is passed on to the engine. Nil is the byte-carrying transport's
+--- choice; a caller whose terminal decodes one format names it and gets the
+--- engine's encode rather than the file, because the file may be another.
+function M.inline_bytes(path, cols, rows, background, crop, format)
+  if not crop and not format then
     local data = M.original(path)
     if data then
       return data
     end
   end
-  return M.thumbnail(path, cols, rows, background, crop)
+  return M.thumbnail(path, cols, rows, background, crop, format)
 end
 
 --------------------------------------------------------------------------------
@@ -614,8 +635,19 @@ end
 ---
 --- The cursor line and `scrolloff` are not consulted: what the window shows is
 --- the question, not where the cursor is.
+---
+--- A window in another tab page shows nothing, and `screenpos` does not say so:
+--- measured, a hidden window's first row comes back at the same row and column
+--- as the current window's, because the position is computed from the layout
+--- rather than from what is painted. Without the tab page being compared, a
+--- settle scheduled while another tab was current put a document's picture over
+--- that tab's content — `:checkhealth` opens its own tab, and the picture of the
+--- document left behind covered the report.
 function M.slice(win, rect)
   if not rect or not vim.api.nvim_win_is_valid(win) then
+    return nil
+  end
+  if vim.api.nvim_win_get_tabpage(win) ~= vim.api.nvim_get_current_tabpage() then
     return nil
   end
   local first, last = unpack(vim.api.nvim_win_call(win, function()
@@ -730,6 +762,20 @@ end
 --- erases, so nothing is kept for it.
 local inline = {}
 
+--- The id `source`'s inline placement already has in `win`, or a new one.
+---
+--- Reusing the id is what makes a repaint a move rather than a second picture
+--- laid over the first: the same image and placement id replaces what was
+--- there, so a window that settles often costs one image, not a growing pile.
+local function inline_id(win, source)
+  local before = inline[win] and inline[win][source]
+  if before and before.id then
+    return before.id
+  end
+  next_id = next_id + 1
+  return next_id
+end
+
 --- Take every inline placement off `win`.
 ---
 --- Called when the window stops showing R — a toggle to S, another document
@@ -771,10 +817,10 @@ end
 --- One send per block, for the transport that needs one: the byte-carrying
 --- transport sends the file itself while the block is wholly visible and the
 --- file is small enough to send unchanged, and otherwise the engine's encode of
---- the block's box — cut to the rows on screen when the window cuts it; the
---- path-carrying one sends the path of a PNG file, which the terminal reads
---- itself, and leaves a file of any other format as its card, because that
---- transport decodes only PNG.
+--- the block's box — cut to the rows on screen when the window cuts it. The
+--- path-carrying one sends a PNG as its path, which the terminal reads itself,
+--- and every other format as the engine's PNG encode carried as data, because
+--- that transport decodes PNG alone.
 --- A block that was placed and is not in this pass is deleted, because the
 --- rewrite that stopped showing it does not remove a Kitty placement.
 --- Nothing here waits, and nothing is reported: every failure — no transport, a
@@ -823,20 +869,23 @@ function M.paint(win, doc, lines, base)
                 vim.base64.encode(bytes)))
             end
           elseif whole and M.is_png(path) then
-            -- The path transport carries a path and names PNG as its format;
-            -- kitty refuses every other file with `EBADPNG`, so a picture it
-            -- cannot decode keeps its card rather than being sent to fail.
-            -- The id is kept for as long as the block stays placed: sending the
-            -- same one again replaces the placement rather than adding a second
-            -- picture over it, so a repaint costs one image, not a growing pile.
-            local before = inline[win] and inline[win][source]
-            local id = before and before.id
-            if not id then
-              next_id = next_id + 1
-              id = next_id
-            end
-            M.send(M.kitty_sequence(slice.origin, rect.width, rect.height, id, path))
+            -- A PNG goes as its path, which the terminal reads at the file's
+            -- own resolution and costs one write.
+            local id = inline_id(win, source)
+            M.send(M.kitty_path_sequence(slice.origin, rect.width, rect.height, id, path))
             wanted[source] = { id = id }
+          elseif whole then
+            -- Every other format goes as data: kitty decodes PNG alone, so the
+            -- engine encodes the picture for this box and `f=100` says what
+            -- arrived. A block the window cuts still keeps its card: the
+            -- placement's box is the block's, and a path cannot be cropped.
+            local bytes = M.inline_bytes(path, rect.width, rect.height,
+              block_background(doc, rect) or '#000000', nil, 'png')
+            if bytes then
+              local id = inline_id(win, source)
+              M.send(M.kitty_sequence(slice.origin, rect.width, rect.height, id, bytes))
+              wanted[source] = { id = id }
+            end
           end
         end
       end
@@ -900,23 +949,67 @@ function M.osc_sequence(position, cols, rows, data)
     .. RESTORE_CURSOR
 end
 
---- The Kitty sequence transmitting `path` and placing it as image `id`.
+--- The largest payload one Kitty sequence may carry, in base64 characters.
 ---
---- `t=f` says the payload is a path rather than the file's bytes, and the path
---- itself is base64 because the payload is binary-safe by definition. `f=100`
---- is not optional: omitted, kitty takes the file for raw RGBA, whose width and
---- height are zero when unnamed, and refuses the whole transmission with
---- `EINVAL:Zero width/height not allowed` — measured against kitty 0.32, where
---- a path placement without it draws nothing at all. `100` is PNG, the only
---- format the path transport decodes (`M.is_png` is what callers check).
+--- The protocol's own bound on a single APC, so a larger picture travels as
+--- chunks: every sequence but the last carries `m=1`, and only the first
+--- carries the keys.
+M.KITTY_CHUNK = 4096
+
+--- The Kitty sequence carrying `data` as the picture and placing it as `id`.
+---
+--- `t=d` is a direct transmission, and its payload is base64 because the
+--- sequence is binary-safe by definition. `f=100` is not optional: omitted,
+--- kitty takes the payload for raw RGBA, whose width and height are zero when
+--- unnamed, and refuses the whole transmission with `EINVAL:Zero width/height
+--- not allowed` — measured against kitty 0.32, where a placement without it
+--- draws nothing at all. PNG is the only format this transmission decodes, so
+--- the caller hands it the engine's PNG encode (`M.thumbnail`'s `'png'`) rather
+--- than the file, whatever the file is.
 --- `C=1` is "do not move the cursor", the counterpart of `doNotMoveCursor`;
 --- `q=2` suppresses both the OK and the error reply, because there is no reply
 --- reader. The image id and the placement id are the same number: the sequence
 --- places exactly the image it transmits, and `M.kitty_delete` can free both.
 ---
 --- The save/restore around the sequence has the same reason as the OSC one:
---- the move is for the placement to anchor at, not for the editor to adopt.
-function M.kitty_sequence(position, cols, rows, id, path)
+--- the move is for the placement to anchor at, not for the editor to adopt. The
+--- save is before the first chunk, so the chunks' own writes are covered too.
+function M.kitty_sequence(position, cols, rows, id, data)
+  local encoded = vim.base64.encode(data)
+  local parts = {
+    SAVE_CURSOR .. move_to(position)
+      .. ESC .. '_Ga=T,t=d,f=100,i=' .. id .. ',p=' .. id
+      .. ',c=' .. cols .. ',r=' .. rows .. ',C=1,q=2',
+  }
+  local first = true
+  local at = 1
+  repeat
+    local chunk = encoded:sub(at, at + M.KITTY_CHUNK - 1)
+    at = at + #chunk
+    local more = at <= #encoded and 1 or 0
+    if first then
+      parts[#parts + 1] = ',m=' .. more .. ';' .. chunk .. ESC .. ST
+      first = false
+    else
+      parts[#parts + 1] = ESC .. '_Gm=' .. more .. ';' .. chunk .. ESC .. ST
+    end
+  until at > #encoded
+  parts[#parts + 1] = RESTORE_CURSOR
+  return table.concat(parts)
+end
+
+--- The Kitty sequence transmitting `path` and placing it as image `id`.
+---
+--- `t=f` says the payload is a path rather than the file's bytes, and the path
+--- itself is base64 because the payload is binary-safe by definition. The
+--- terminal reads the file itself, so the picture keeps its own resolution and
+--- one sequence carries it whatever its size. `f=100` is not optional here
+--- either: PNG is the only format the path transmission decodes, and a path to
+--- anything else is answered with `EBADPNG` — `M.is_png` is what callers check
+--- before choosing this sequence instead of `M.kitty_sequence`.
+--- `C=1`, `q=2`, the id and the save/restore are the data sequence's, for the
+--- same reasons.
+function M.kitty_path_sequence(position, cols, rows, id, path)
   return SAVE_CURSOR .. move_to(position)
     .. ESC .. '_Gi=' .. id .. ',a=T,t=f,f=100,p=' .. id
     .. ',c=' .. cols .. ',r=' .. rows .. ',C=1,q=2;'
@@ -938,6 +1031,19 @@ end
 -- Placing and removing
 --------------------------------------------------------------------------------
 
+--- The colour a data-carried placement is letterboxed with.
+---
+--- The popup has no card to read a background from, so it uses the one its
+--- artwork is drawn on: the configured image background when it names a colour,
+--- and otherwise the editor's own, since that is what shows through.
+local function placement_background()
+  local background = config.options.image_background
+  if type(background) == 'string' and background:match('^#%x%x%x%x%x%x$') then
+    return background
+  end
+  return config.image_options().paper or '#000000'
+end
+
 --- Place `graphic` over `win`'s interior.
 ---
 --- The box is the window's own, read now rather than stored, which is what makes
@@ -955,8 +1061,17 @@ function M.place(win, graphic)
   local rows = vim.api.nvim_win_get_height(win)
   if graphic.tier == 'osc' then
     M.send(M.osc_sequence(position, cols, rows, graphic.data))
+  elseif graphic.encode then
+    -- The data transmission carries PNG alone, so a file of another format is
+    -- encoded for this box first. The box is the window's, read here rather
+    -- than when the popup opened, so a resize re-encodes at the size the
+    -- picture is about to take.
+    local data = M.thumbnail(graphic.path, cols, rows, placement_background(), nil, 'png')
+    if data then
+      M.send(M.kitty_sequence(position, cols, rows, graphic.id, data))
+    end
   else
-    M.send(M.kitty_sequence(position, cols, rows, graphic.id, graphic.path))
+    M.send(M.kitty_path_sequence(position, cols, rows, graphic.id, graphic.path))
   end
 end
 

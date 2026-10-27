@@ -12,11 +12,16 @@ md-render --width 120 --theme nord path/to/file.md
 ```text
 md-render thumbnail <source> --box <cols>x<rows> --out <path> --background <#rrggbb>
 md-render thumbnail <source> --box <cols>x<rows> --crop <top>x<rows> --out <path> --background <#rrggbb>
+md-render thumbnail <source> --box <cols>x<rows> --format png --out <path> --background <#rrggbb>
 ```
 
 `thumbnail` encodes a picture at the shape a terminal cell box has — `cols` to
 twice `rows`, the artwork's own proportions — and writes it to `--out`. It
-writes nothing to stdout and takes no `--width`.
+writes nothing to stdout and takes no `--width`. The pixel box is `cols × k`
+by `rows × 2k`, with `k` aimed at 640 pixels across but never more pixels per
+cell than the source has: a picture smaller than its box is written at its own
+size rather than resampled up, so it looks the same whether the terminal is
+drawing the encode or the file itself.
 
 `--crop TOPxROWS` writes only those rows of the box. The picture is fitted and
 centred in the whole box first and the rows are cut from that drawing, so the
@@ -24,6 +29,13 @@ output is the same picture at the same scale as the whole box: a block half
 scrolled out of the window asks for the rows still on screen and the reader
 sees the part of the picture that is there, not a squeezed whole. A crop that
 is not inside the box is refused, naming `--crop`.
+
+`--format` names the encoder and defaults to `auto`, which writes PNG when the
+picture has transparent pixels and JPEG otherwise — the smallest encode the
+terminals decode. `png` is what the Kitty graphics protocol's data transmission
+takes, because it decodes PNG alone; `jpeg` has no alpha channel, so the
+picture is composited over `--background` rather than having its transparency
+dropped.
 
 It is the only stage that decodes pixels on the plugin's behalf: the plugin
 paints the result inline where the terminal draws images, and the document's

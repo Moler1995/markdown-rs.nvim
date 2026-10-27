@@ -318,6 +318,25 @@ M.defaults = {
   -- engine. Only refreshes are coalesced: a toggle is applied at once, so this
   -- cannot delay or swallow one.
   resize_debounce = 100,
+
+  -- Milliseconds to coalesce the events that move or repaint the viewport —
+  -- scrolling, resizing, moving the cursor — before the inline pictures are
+  -- painted again. Every one of those events wipes what was painted, and the
+  -- next paint has to wait until the rectangle has stopped moving; what shows
+  -- meanwhile is the picture's card.
+  --
+  -- Its own knob, and much shorter than `resize_debounce`, because the two
+  -- waits are not the same cost. Waiting on a re-render leaves the old picture
+  -- on screen; waiting on a placement leaves a card where the picture should
+  -- be, which is visible as a flicker on every scroll. One frame is enough to
+  -- fold a burst into one paint, and short enough that the picture is back
+  -- before the reader misses it. Lower it further to have pictures follow a
+  -- scroll more closely; raise it on a terminal that chokes on payloads, since
+  -- each paint re-sends one — and on the byte-carrying transport a block the
+  -- window cuts asks the engine for a thumbnail of each new slice, which a
+  -- longer wait folds together. `0` paints on the next event-loop tick, which
+  -- still folds one burst into one paint.
+  settle_debounce = 15,
 }
 
 M.options = vim.deepcopy(M.defaults)
@@ -428,7 +447,8 @@ function M.image_hint_text()
   return ' ' .. table.concat(keys, '/') .. ' open image'
 end
 
---- The rows and the narrowest width a card is drawn with.
+--- The rows and the narrowest width a card is drawn with, and whether a
+--- picture is painted over it.
 ---
 --- A card the terminal paints over is the artwork's box, in both dimensions:
 --- the picture is measured for those cells and is placed back on them, so the
@@ -438,18 +458,24 @@ end
 --- cards rather than as a column of towers. Its width stays the picture's;
 --- the floor is only what the hint needs to fit inside the box.
 ---
+--- The third answer is whether the picture goes over the card. It is what
+--- decides the caption: a picture may be transparent, and a transparent pixel
+--- shows whatever is under it, so a caption under one is read as part of the
+--- picture. A card nothing is painted over keeps its caption, because the
+--- caption is then all the reader gets.
+---
 --- `painting` is the graphics module's answer, passed in rather than asked
 --- for: this module knows nothing about terminals, and the caller that places
 --- pictures is the one that can see one.
 local function card_shape(painting)
   if M.image_inline_encoding() ~= 'card' then
-    return 0, 0
+    return 0, 0, false
   end
   if M.options.image_inline == 'auto' and painting then
-    return 0, 0
+    return 0, 0, true
   end
   local text = M.image_hint_text()
-  return 3, text and vim.fn.strdisplaywidth(text) + 2 or 0
+  return 3, text and vim.fn.strdisplaywidth(text) + 2 or 0, false
 end
 
 --- The image options in the shape the render views carry.
@@ -464,11 +490,12 @@ end
 --- what the page is, so the engine uses that instead.
 ---
 --- `painting` is whether the terminal can draw a picture over a card; it
---- decides only the card's shape, and a caller with no card to shape — the
---- preview popup — passes nothing and gets the artwork's own box.
+--- decides the card's shape and whether that card keeps its caption, and a
+--- caller with no card to shape — the preview popup — passes nothing and gets
+--- the artwork's own box, captioned.
 function M.image_options(painting)
   local background = M.options.image_background
-  local card_rows, card_min_width = card_shape(painting)
+  local card_rows, card_min_width, painted = card_shape(painting)
   return {
     palette = M.image_palette(),
     background = background,
@@ -478,6 +505,7 @@ function M.image_options(painting)
     paper = background == 'terminal' and page_background() or nil,
     card_rows = card_rows,
     card_min_width = card_min_width,
+    card_caption = not painted,
   }
 end
 

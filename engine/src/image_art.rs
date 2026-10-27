@@ -294,7 +294,7 @@ pub struct Bounds {
 /// One value rather than three arguments, because every one of them is a
 /// layout input and they travel together from the command line to
 /// [`crate::document::layout_document`].
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct ImageOptions<'a> {
     /// Base for relative destinations; `None` means the working directory.
     pub base: Option<&'a Path>,
@@ -350,9 +350,41 @@ pub struct ImageOptions<'a> {
     /// page's width stays the hard bound, so the floor can never widen a
     /// document.
     pub card_min_width: u16,
+    /// Whether a card carries its one caption.
+    ///
+    /// A caller that paints the picture over the card turns this off. The
+    /// picture may be transparent, and a transparent pixel shows whatever is
+    /// underneath it: a caption there would read as part of the picture,
+    /// letters floating in a logo. The box keeps its rows, columns and
+    /// colours — it is the surface under the picture, and nothing more.
+    pub card_caption: bool,
     /// The colours a card is drawn with, or the default that asks the layout
     /// for the theme's.
     pub card: CardColours,
+}
+
+/// Written out rather than derived, because [`ImageOptions::card_caption`] is
+/// the one field that is on by default: a card without a caption is the
+/// exception a caller asks for, not the neutral state.
+impl Default for ImageOptions<'_> {
+    fn default() -> Self {
+        ImageOptions {
+            base: None,
+            max_height: None,
+            encoding: ImageEncoding::default(),
+            animation: false,
+            palette: ImagePalette::default(),
+            background: ImageBackground::default(),
+            dither: DitherMode::default(),
+            min_rows: 0,
+            sharpen: false,
+            paper: None,
+            card_rows: 0,
+            card_min_width: 0,
+            card_caption: true,
+            card: CardColours::default(),
+        }
+    }
 }
 
 /// A style reduced to the two colours that distinguish it, as 8-bit channels.
@@ -588,13 +620,36 @@ pub const MAX_THUMBNAIL_PIXELS: u64 = 2_000_000;
 /// would notice, small enough that the payload stays cheap.
 const THUMBNAIL_TARGET_WIDTH: u32 = 640;
 
+/// How [`thumbnail`] encodes its output.
+///
+/// A terminal decodes a fixed set, and one transport decodes exactly one: the
+/// Kitty data transmission names PNG as the picture's format. Deciding the
+/// format here, where the decoder lives, is what lets a caller ask for the one
+/// its transport can read instead of hoping the heuristic picked it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "lowercase")]
+pub enum ThumbnailFormat {
+    /// PNG for a picture with transparent pixels, JPEG otherwise.
+    #[default]
+    Auto,
+    /// PNG always: lossless, transparent and the only format the Kitty data
+    /// transmission decodes.
+    Png,
+    /// JPEG always, composited over the box's background because the format
+    /// has no alpha channel.
+    Jpeg,
+}
+
 /// Encode `source` as a thumbnail for a `cols` × `rows` cell box at `out`.
 ///
 /// The box is `cols × k` by `rows × 2k`: the artwork's own 2:1 cell
-/// assumption, so the terminal places the picture where the card was. The
-/// picture is scaled to fit inside the box without distortion and centred,
-/// with the remainder filled with `background`, so the placement is a clean
-/// rectangle and nothing of the card shows at an edge.
+/// assumption, so the terminal places the picture where the card was. `k`
+/// aims at [`THUMBNAIL_TARGET_WIDTH`] pixels across but never gives a cell
+/// more pixels than the source has — see [`thumbnail_box`], and the reason it
+/// matters: the same file drawn whole is sent as itself. The picture is scaled
+/// to fit inside the box without distortion and centred, with the remainder
+/// filled with `background`, so the placement is a clean rectangle and nothing
+/// of the card shows at an edge.
 ///
 /// `crop` asks for part of that box instead of all of it, as `(top, rows)` in
 /// cells: the box is drawn in full and then cut, so the rows carry exactly the
@@ -604,9 +659,12 @@ const THUMBNAIL_TARGET_WIDTH: u32 = 640;
 /// per cell is the whole box's, so a crop and the full picture are the same
 /// picture at the same scale, and `None` is the whole box.
 ///
-/// PNG is written when the picture has transparent pixels and JPEG otherwise,
-/// both with the encoders the engine already links. The same request twice
-/// produces the same bytes.
+/// `format` names the encoder when the caller's terminal decodes one format
+/// only; under [`ThumbnailFormat::Auto`] PNG is written when the picture has
+/// transparent pixels and JPEG otherwise, both with the encoders the engine
+/// already links. A JPEG is composited over `background` first, because the
+/// format has no alpha channel to keep and the band the picture does not cover
+/// is already that colour. The same request twice produces the same bytes.
 ///
 /// # Errors
 ///
@@ -620,9 +678,9 @@ pub fn thumbnail(
     rows: u16,
     crop: Option<(u16, u16)>,
     background: [u8; 3],
+    format: ThumbnailFormat,
     out: &Path,
 ) -> Result<(), String> {
-    let (box_width, box_height) = thumbnail_box(cols, rows)?;
     let (crop_top, crop_rows) = crop.unwrap_or((0, rows));
     if crop_rows == 0 || u32::from(crop_top) + u32::from(crop_rows) > u32::from(rows) {
         return Err(format!(
@@ -630,6 +688,7 @@ pub fn thumbnail(
         ));
     }
     let pixels = decode_thumbnail_source(source)?;
+    let (box_width, box_height) = thumbnail_box(cols, rows, pixels.width())?;
     let transparent = pixels.pixels().any(|pixel| pixel[3] < u8::MAX);
 
     let (src_width, src_height) = pixels.dimensions();
@@ -671,23 +730,61 @@ pub fn thumbnail(
         canvas
     };
 
-    let saved = if transparent {
-        DynamicImage::ImageRgba8(picture).save_with_format(out, ImageFormat::Png)
-    } else {
-        DynamicImage::ImageRgba8(picture)
-            .to_rgb8()
-            .save_with_format(out, ImageFormat::Jpeg)
+    let saved = match format {
+        ThumbnailFormat::Png => {
+            DynamicImage::ImageRgba8(picture).save_with_format(out, ImageFormat::Png)
+        }
+        ThumbnailFormat::Jpeg => DynamicImage::ImageRgb8(over_background(&picture, background))
+            .save_with_format(out, ImageFormat::Jpeg),
+        ThumbnailFormat::Auto if transparent => {
+            DynamicImage::ImageRgba8(picture).save_with_format(out, ImageFormat::Png)
+        }
+        ThumbnailFormat::Auto => DynamicImage::ImageRgb8(over_background(&picture, background))
+            .save_with_format(out, ImageFormat::Jpeg),
     };
     saved.map_err(|err| format!("could not write {}: {err}", out.display()))
 }
 
+/// `picture` composited over `background`, for an encoder with no alpha.
+///
+/// An opaque picture comes through unchanged — the blend of a fully opaque
+/// pixel is the pixel — so a picture that has no transparency encodes to the
+/// same bytes as it did before the format could be forced.
+fn over_background(picture: &RgbaImage, background: [u8; 3]) -> RgbImage {
+    RgbImage::from_fn(picture.width(), picture.height(), |x, y| {
+        let pixel = picture.get_pixel(x, y).0;
+        let alpha = u16::from(pixel[3]);
+        let blend = |channel: u8, behind: u8| {
+            ((u16::from(channel) * alpha + u16::from(behind) * (255 - alpha)) / 255) as u8
+        };
+        image::Rgb([
+            blend(pixel[0], background[0]),
+            blend(pixel[1], background[1]),
+            blend(pixel[2], background[2]),
+        ])
+    })
+}
+
 /// The pixel box a `cols` × `rows` cell box is encoded at.
-fn thumbnail_box(cols: u16, rows: u16) -> Result<(u32, u32), String> {
+///
+/// Aimed at [`THUMBNAIL_TARGET_WIDTH`] pixels across, and never denser than
+/// the source has pixels to give: a 16 × 16 file encoded at 640 pixels is
+/// resampled thirty-nine times over, and every edge in it is gone. At its own
+/// size the source is placed as it is, and the terminal does the one scaling a
+/// wholly visible block already asks of it — those two must look alike, since
+/// scrolling a block to the window's edge is the only thing that decides which
+/// of them a reader sees.
+///
+/// The page bound stays hard, so a cell box that cannot be met even at one
+/// pixel per cell is a refusal rather than a smaller placement.
+fn thumbnail_box(cols: u16, rows: u16, source_width: u32) -> Result<(u32, u32), String> {
     if cols == 0 || rows == 0 {
         return Err(format!("--box {cols}x{rows} leaves no room for a cell"));
     }
     let (cols, rows) = (u32::from(cols), u32::from(rows));
-    let mut scale = (THUMBNAIL_TARGET_WIDTH / cols).max(1);
+    let mut scale = (THUMBNAIL_TARGET_WIDTH / cols)
+        .max(1)
+        .min((source_width / cols).max(1));
     while scale > 1 && u64::from(cols * scale) * u64::from(rows * 2 * scale) > MAX_THUMBNAIL_PIXELS
     {
         scale -= 1;
@@ -838,7 +935,8 @@ fn card_width(artwork_cols: u32, bounds: Bounds, minimum: u16) -> u32 {
 }
 
 /// Draw a card: the artwork's whole box in the raised surface, with one
-/// centred caption on its middle row.
+/// centred caption on its middle row — or with no caption at all, when
+/// [`ImageOptions::card_caption`] says the caller paints a picture over it.
 ///
 /// The box is `cols` × `rows`. Left to the artwork's own grid — which is what
 /// a caller that paints the picture over the card asks for — the reference
@@ -859,24 +957,31 @@ fn draw_card(
     let surface = Style::new().bg(options.card.background);
     let caption_style = surface.fg(options.card.caption);
 
-    let caption = truncate_to_width(&card_caption(path, width, height), cols);
-    let caption_width = u32::from(measure(&[Span::raw(caption.as_str())]));
-    // A caption that does not fit was already cut to the box, so the left pad
-    // cannot exceed it; the spare column of an odd gap goes to the right.
-    let left = (cols - caption_width) / 2;
-    let right = cols - caption_width - left;
+    // No caption at all when the caller paints a picture over the card: the
+    // box is then the surface under that picture, and text on it would show
+    // through wherever the picture is transparent.
+    let caption = options
+        .card_caption
+        .then(|| truncate_to_width(&card_caption(path, width, height), cols));
     let middle = (rows - 1) / 2;
 
     (0..rows)
         .map(|row| {
-            let spans = if row == middle {
-                vec![
-                    Span::styled(" ".repeat(left as usize), surface),
-                    Span::styled(caption.clone(), caption_style),
-                    Span::styled(" ".repeat(right as usize), surface),
-                ]
-            } else {
-                vec![Span::styled(" ".repeat(cols as usize), surface)]
+            let spans = match &caption {
+                Some(caption) if row == middle => {
+                    let caption_width = u32::from(measure(&[Span::raw(caption.as_str())]));
+                    // A caption that does not fit was already cut to the box, so
+                    // the left pad cannot exceed it; the spare column of an odd
+                    // gap goes to the right.
+                    let left = (cols - caption_width) / 2;
+                    let right = cols - caption_width - left;
+                    vec![
+                        Span::styled(" ".repeat(left as usize), surface),
+                        Span::styled(caption.clone(), caption_style),
+                        Span::styled(" ".repeat(right as usize), surface),
+                    ]
+                }
+                _ => vec![Span::styled(" ".repeat(cols as usize), surface)],
             };
             Line { spans }
         })
@@ -3537,6 +3642,41 @@ mod tests {
     }
 
     #[test]
+    fn a_card_a_picture_is_painted_over_carries_no_caption() {
+        let path = fixture("image_sample.png");
+        let bounds = Bounds {
+            width: 40,
+            height: None,
+        };
+        let options = ImageOptions {
+            card_caption: false,
+            card: CardColours {
+                background: Color::Rgb(0x28, 0x28, 0x28),
+                caption: Color::Rgb(0xa8, 0x99, 0x84),
+            },
+            ..options(ImageEncoding::Card)
+        };
+        let mut budget = StyleBudget::default();
+        let lines = artwork(path.to_str().unwrap(), bounds, &options, &mut budget)
+            .expect("the fixture renders as a card");
+
+        // 16x16 is a 16 x 8 cell box, caption or no caption: the picture is
+        // measured for this box, so its shape cannot depend on the text.
+        assert_eq!(lines.len(), 8);
+        for (row, line) in lines.iter().enumerate() {
+            assert_eq!(line.width(), 16);
+            assert_eq!(line.spans.len(), 1, "row {row} has more than its surface");
+            assert_eq!(line.spans[0].style.bg, Some(Color::Rgb(0x28, 0x28, 0x28)));
+            assert_eq!(line.spans[0].style.fg, None, "row {row} carries a colour");
+            assert!(
+                line.text().trim().is_empty(),
+                "row {row} carries text: {:?}",
+                line.text()
+            );
+        }
+    }
+
+    #[test]
     fn a_card_caption_is_the_file_name_and_its_header_size() {
         assert_eq!(
             card_caption(Path::new("/docs/images/pic.png"), 24, 16),
@@ -3862,6 +4002,26 @@ mod tests {
             .expect("write the source picture");
     }
 
+    /// `thumbnail` as a caller that has no format to force asks for it.
+    fn thumb(
+        source: &Path,
+        cols: u16,
+        rows: u16,
+        crop: Option<(u16, u16)>,
+        background: [u8; 3],
+        out: &Path,
+    ) -> Result<(), String> {
+        thumbnail(
+            source,
+            cols,
+            rows,
+            crop,
+            background,
+            ThumbnailFormat::Auto,
+            out,
+        )
+    }
+
     #[test]
     fn a_thumbnail_fills_its_box_with_the_picture_and_the_background() {
         let dir = temp_dir("md-render-thumbnail-shape-test");
@@ -3870,7 +4030,7 @@ mod tests {
         let out = dir.join("wide-thumb.png");
         let background = [0x28, 0x28, 0x28];
 
-        thumbnail(&source, 10, 10, None, background, &out).expect("the thumbnail is written");
+        thumb(&source, 10, 10, None, background, &out).expect("the thumbnail is written");
 
         // Ten columns at k = 64 is 640 x 1280, the box's 10 : 20 cell shape.
         let decoded = image::open(&out).expect("decode").to_rgba8();
@@ -3911,8 +4071,8 @@ mod tests {
         let full = dir.join("full.png");
         let part = dir.join("part.png");
 
-        thumbnail(&source, 10, 10, None, [0; 3], &full).expect("full");
-        thumbnail(&source, 10, 10, Some((3, 3)), [0; 3], &part).expect("part");
+        thumb(&source, 10, 10, None, [0; 3], &full).expect("full");
+        thumb(&source, 10, 10, Some((3, 3)), [0; 3], &part).expect("part");
 
         let whole = image::open(&full).expect("decode").to_rgba8();
         let cropped = image::open(&part).expect("decode").to_rgba8();
@@ -3935,8 +4095,8 @@ mod tests {
         let first = dir.join("first.jpg");
         let second = dir.join("second.jpg");
 
-        thumbnail(&source, 40, 12, None, [0, 0, 0], &first).expect("first");
-        thumbnail(&source, 40, 12, None, [0, 0, 0], &second).expect("second");
+        thumb(&source, 40, 12, None, [0, 0, 0], &first).expect("first");
+        thumb(&source, 40, 12, None, [0, 0, 0], &second).expect("second");
 
         assert_eq!(
             std::fs::read(&first).expect("first bytes"),
@@ -3954,14 +4114,63 @@ mod tests {
         solid(&opaque, 64, 64, false);
 
         let png = dir.join("out-png");
-        thumbnail(&transparent, 8, 4, None, [0, 0, 0], &png).expect("png");
+        thumb(&transparent, 8, 4, None, [0, 0, 0], &png).expect("png");
         let png_bytes = std::fs::read(&png).expect("png bytes");
         assert_eq!(&png_bytes[..8], b"\x89PNG\r\n\x1a\n");
 
         let jpeg = dir.join("out-jpeg");
-        thumbnail(&opaque, 8, 4, None, [0, 0, 0], &jpeg).expect("jpeg");
+        thumb(&opaque, 8, 4, None, [0, 0, 0], &jpeg).expect("jpeg");
         let jpeg_bytes = std::fs::read(&jpeg).expect("jpeg bytes");
         assert_eq!(&jpeg_bytes[..3], b"\xff\xd8\xff");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_forced_format_is_written_and_a_transparent_picture_is_laid_on_the_background() {
+        let dir = temp_dir("md-render-thumbnail-forced-format-test");
+        let transparent = dir.join("transparent.png");
+        let opaque = dir.join("opaque.png");
+        solid(&transparent, 64, 64, true);
+        solid(&opaque, 64, 64, false);
+        let background = [0x28, 0x28, 0x28];
+
+        // JPEG has no alpha: the semi-transparent red is blended onto the
+        // background instead of being dropped, so nothing of the card shows
+        // through the picture.
+        let jpeg = dir.join("forced-jpeg");
+        thumbnail(
+            &transparent,
+            8,
+            4,
+            None,
+            background,
+            ThumbnailFormat::Jpeg,
+            &jpeg,
+        )
+        .expect("jpeg");
+        let bytes = std::fs::read(&jpeg).expect("jpeg bytes");
+        assert_eq!(&bytes[..3], b"\xff\xd8\xff");
+        let pixel = image::load_from_memory(&bytes)
+            .expect("decodes")
+            .to_rgb8()
+            .get_pixel(4, 4)
+            .0;
+        // (200, 10, 10) at alpha 200 over (40, 40, 40) is (165, 16, 16); the
+        // encoder is lossy, so the check is near rather than exact.
+        for (got, want) in pixel.iter().zip([165u8, 16, 16]) {
+            assert!(
+                got.abs_diff(want) <= 16,
+                "pixel {pixel:?} is not the blend of the picture and the background"
+            );
+        }
+
+        // An opaque picture forced to PNG, which is what the Kitty transport
+        // decodes whatever the heuristic would have chosen.
+        let png = dir.join("forced-png");
+        thumbnail(&opaque, 8, 4, None, background, ThumbnailFormat::Png, &png).expect("png");
+        let bytes = std::fs::read(&png).expect("png bytes");
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3975,37 +4184,37 @@ mod tests {
 
         // A missing file.
         let missing = dir.join("missing.png");
-        assert!(thumbnail(&missing, 8, 4, None, [0; 3], &out).is_err());
+        assert!(thumb(&missing, 8, 4, None, [0; 3], &out).is_err());
 
         // A path that is a directory.
-        assert!(thumbnail(&dir, 8, 4, None, [0; 3], &out).is_err());
+        assert!(thumb(&dir, 8, 4, None, [0; 3], &out).is_err());
 
         // A file the decoder cannot identify.
         let text = dir.join("notes.txt");
         std::fs::write(&text, b"not a picture").expect("write");
-        assert!(thumbnail(&text, 8, 4, None, [0; 3], &out).is_err());
+        assert!(thumb(&text, 8, 4, None, [0; 3], &out).is_err());
 
         // A box with no room for a cell.
-        assert!(thumbnail(&source, 0, 4, None, [0; 3], &out).is_err());
-        assert!(thumbnail(&source, 8, 0, None, [0; 3], &out).is_err());
+        assert!(thumb(&source, 0, 4, None, [0; 3], &out).is_err());
+        assert!(thumb(&source, 8, 0, None, [0; 3], &out).is_err());
 
         // A box whose pixel count is over the bound even at one pixel a cell.
-        assert!(thumbnail(&source, 4000, 2000, None, [0; 3], &out).is_err());
+        assert!(thumb(&source, 4000, 2000, None, [0; 3], &out).is_err());
 
         // A crop that is empty, or that reaches past the box.
-        assert!(thumbnail(&source, 8, 4, Some((0, 0)), [0; 3], &out).is_err());
-        assert!(thumbnail(&source, 8, 4, Some((3, 2)), [0; 3], &out).is_err());
+        assert!(thumb(&source, 8, 4, Some((0, 0)), [0; 3], &out).is_err());
+        assert!(thumb(&source, 8, 4, Some((3, 2)), [0; 3], &out).is_err());
 
         // An output path in a directory that does not exist.
         let unwritable = dir.join("no-such-directory").join("out.png");
-        assert!(thumbnail(&source, 8, 4, None, [0; 3], &unwritable).is_err());
+        assert!(thumb(&source, 8, 4, None, [0; 3], &unwritable).is_err());
 
         // A file over the byte decoding limit, whose header is still valid.
         let oversized = dir.join("oversized.png");
         let mut bytes = std::fs::read(&source).expect("source bytes");
         bytes.resize(usize::try_from(MAX_FILE_BYTES).expect("fits") + 1, 0);
         std::fs::write(&oversized, &bytes).expect("write");
-        let err = thumbnail(&oversized, 8, 4, None, [0; 3], &out).expect_err("refused");
+        let err = thumb(&oversized, 8, 4, None, [0; 3], &out).expect_err("refused");
         assert!(
             err.contains(&oversized.display().to_string()),
             "{err} must name the file"

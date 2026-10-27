@@ -162,11 +162,14 @@ Every top-level key in `config.defaults`, with its default. Set a keymap to
   The largest file painted inline as it is instead of downscaled first. A file
   at or below this size is sent to the terminal unchanged, at its own
   resolution; a larger one becomes the engine's thumbnail, about 640 pixels
-  across, which is what keeps every settle cheap. Only a still PNG or JPEG is
+  across — or the picture's own size, when it has fewer pixels than that to
+  give — which is what keeps every settle cheap. Only a still PNG or JPEG is
   sent this way: an animation would play itself inline, and every other format
   is left to the engine, which decodes more than the terminal does. `0` always
   asks for the thumbnail. The 8 MiB the OSC 1337 transport carries is a hard
-  cap on the option. See |md-render-inline|.
+  cap on the option. The choice belongs to that transport: on Kitty a PNG is
+  sent as its path whatever its size, and anything else is the engine's PNG
+  encode. See |md-render-inline|.
 
 `image_palette` (default `'auto'`)~
   Where cell colours come from: `'auto'` (`full` for one-colour cells,
@@ -228,6 +231,16 @@ Every top-level key in `config.defaults`, with its default. Set a keymap to
 `resize_debounce` (default `100`)~
   Milliseconds to coalesce resizes and edits before re-rendering. Toggles are
   applied immediately and are not delayed.
+
+`settle_debounce` (default `15`)~
+  Milliseconds to coalesce scrolling, resizing and cursor motion before an
+  inline picture is painted over its card again. Every one of those events
+  wipes the paint, and the card is what shows until the next one, so this is a
+  flicker the reader sees: keep it short. Raise it on a terminal that struggles
+  with the payloads, since each paint sends one — and where a block the window
+  cuts is painted, each new slice is a thumbnail the engine has to produce.
+  `0` paints on the next event-loop tick and still folds one burst of events
+  into one paint.
 
 ==============================================================================
 6. COMMANDS                                            *md-render-commands*
@@ -387,7 +400,8 @@ The card~
   line up. Its width is the picture's box, raised to whatever its hint needs
   and never wider than the window. Where a terminal paints the picture over the
   card, the card takes exactly the box the artwork would have had, column for
-  column and row for row.
+  column and row for row, and carries no caption: a picture may be transparent,
+  and a transparent pixel would show the caption as letters inside the picture.
 
   Switching |image_inline| re-renders the document without reflowing it: only
   the picture's own rows change, and every one of them is attributed to the
@@ -417,7 +431,8 @@ Inline pictures                                          *md-render-inline*
     alt text with `'off'`.
 
   A picture is painted over the rows of the block the window shows, and only
-  once the viewport has been still for |resize_debounce| milliseconds.
+  once the viewport has been still for |settle_debounce| milliseconds — short
+  on purpose, because until it paints the card is what the reader sees.
   Scrolling, resizing, a re-render and a cursor move all ask for that one
   repaint, so a wheel or a held key costs a burst one picture. A block the
   window cuts in half is painted up to the edge: the engine cuts the shown rows
@@ -433,15 +448,25 @@ Inline pictures                                          *md-render-inline*
   whatever was placed last, so a picture repainted under an open popup would
   cover it.
 
+  A picture belongs to the tab page that shows its window. A window in another
+  tab page is not painted at all: the screen position Neovim reports for it is
+  the one it would have if it were showing, so painting from another tab would
+  put this document's picture over the tab the reader had switched to. Entering
+  a tab asks for the pictures of the windows it shows, since the cells they
+  were painted on were off screen in the meantime.
+
   What is painted is the file itself while it is no larger than
   |image_inline_original_bytes| — at its own resolution, with no encode behind
-  it — and otherwise a thumbnail of it about 640 pixels across. A block the
-  window cuts is always the engine's encode, whatever the file's size: a
+  it — and otherwise a thumbnail of it about 640 pixels across, or at the
+  picture's own size when that is smaller: a small picture that the engine
+  enlarged would look soft where the file itself looks sharp, and which of the
+  two a reader sees must not depend on how far the block is scrolled. A block
+  the window cuts is always the engine's encode, whatever the file's size: a
   file's own bytes carry the whole picture, and the terminal cannot cut them.
-  On the Kitty transport the terminal reads the original file either way, but
-  only a PNG: that transport names the picture's format in the sequence and
-  decodes no other one, so a JPEG, a WebP or a file of any other format keeps
-  its card there.
+  On the Kitty transport a PNG is sent as its path and the terminal reads the
+  file itself; every other format is carried as the engine's PNG encode,
+  because that transport names the picture's format in the sequence and
+  decodes PNG alone.
 
   The paint is not the buffer's content. Every motion, search, yank and edit
   command acts on the card's text — an edit command cannot reach the file
@@ -495,18 +520,25 @@ Native drawing                                          *md-render-graphics*
     file from its path. That protocol cannot play a file, so an animated image
     keeps its character-art animation there; a still image is drawn natively.
 
+  Where the terminal plays the file itself, the popup binds no playback key:
+  |keymaps.pause| and |keymaps.frame_next| keep their ordinary meaning there,
+  and the terminal's own controls are what stop or step the picture. Where the
+  popup plays the character art — on Kitty, and wherever the file is not drawn
+  natively — those keys work as described in Animation above.
+
   The file fills the popup's interior, stretched to the same cell box the
   artwork was laid out in, so its proportions can differ from the file's own by
   the terminal's cell shape. Nothing of the artwork is left showing at an edge.
 
   The same transport is what paints an inline picture over its card. There the
   OSC 1337 transport sends an encoded thumbnail in the block's cell box, and
-  the Kitty transport sends the file's path.
+  the Kitty transport sends a PNG's path or, for a file of any other format,
+  the engine's PNG encode.
 
   `graphics = 'off'`, an unidentified terminal, a tmux or screen session, a
   URL or `data:` reference, or a file the plugin cannot read all leave the
   artwork visible and say nothing. An image over 8 MiB is not sent to the OSC
-  transport; the Kitty transport sends a path and has no such limit.
+  transport; the Kitty transport sends a path, which has no such limit.
 
   The image is placed again after the editor is resized. A full redraw the
   plugin did not cause — `:redraw!` or `CTRL-L` — clears an OSC 1337 image

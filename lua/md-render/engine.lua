@@ -122,6 +122,8 @@ end
 ---   min_rows  fewest display rows to enlarge an image to, or 0 for never
 ---   card_rows the rows a card occupies, or 0 for the artwork's own box
 ---   card_min_width the narrowest a card may be, or 0 for the artwork's box
+---   card_caption false to leave a card without its caption, for a card a
+---             picture is painted over; nil or true keeps the caption
 ---   sharpen   true to sharpen an image that was reduced
 ---   paper     the '#rrggbb' braille inks against, when the caller knows it;
 ---             nil lets the engine derive it from `background`
@@ -207,6 +209,13 @@ function M.render(opts, content, view, cb)
   if view.card_min_width and view.card_min_width > 0 then
     args[#args + 1] = '--image-card-min-width'
     args[#args + 1] = tostring(view.card_min_width)
+  end
+  -- A card the terminal paints over is a surface under a picture, and a
+  -- transparent pixel would show its caption as part of the picture. Only the
+  -- refusal is sent: a caption is the engine's default, and restating a
+  -- default is one more thing that can disagree with it.
+  if view.card_caption == false then
+    args[#args + 1] = '--no-image-card-caption'
   end
   if view.sharpen then
     args[#args + 1] = '--image-sharpen'

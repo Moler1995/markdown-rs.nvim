@@ -859,9 +859,15 @@ local function settle()
   if config.image_inline_encoding() ~= 'card' then
     return
   end
+  -- A window in another tab page is not on screen, even though `screenpos`
+  -- answers for it as if it were: the paint would land over whatever tab is
+  -- showing. Skipping it here also leaves the placement it has alone, which is
+  -- what a picture nobody is looking at deserves.
+  local tab = vim.api.nvim_get_current_tabpage()
   for _, st in pairs(state.windows) do
     if st.want == 'R' and st.doc and st.rendered
       and vim.api.nvim_win_is_valid(st.win)
+      and vim.api.nvim_win_get_tabpage(st.win) == tab
       and vim.api.nvim_win_get_buf(st.win) == st.rendered then
       local lines = source_lines(st)
       if lines then
@@ -891,7 +897,7 @@ function schedule_settle()
     return
   end
   settle_timer:stop()
-  settle_timer:start(config.options.resize_debounce, 0, vim.schedule_wrap(settle))
+  settle_timer:start(config.options.settle_debounce, 0, vim.schedule_wrap(settle))
 end
 
 --- The animation `doc` carries for the reference on source line `lnum`, if any.
@@ -1611,9 +1617,11 @@ function M.setup_autocmds()
   -- was painted over — and with `cursorline` set, a cursor motion alone is
   -- enough. One debounce for all of them, and for the resize that already
   -- re-renders: the render's own completion asks again through `show_rendered`,
-  -- so the expensive path is not repeated here.
+  -- so the expensive path is not repeated here. `TabEnter` is here because a
+  -- tab that was not showing had no picture placed while it was away, and the
+  -- settle skips the windows of every other tab.
   vim.api.nvim_create_autocmd(
-    { 'WinScrolled', 'WinResized', 'VimResized', 'CursorMoved', 'CursorMovedI' },
+    { 'WinScrolled', 'WinResized', 'VimResized', 'CursorMoved', 'CursorMovedI', 'TabEnter' },
     {
       group = group,
       callback = schedule_settle,

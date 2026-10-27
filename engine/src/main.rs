@@ -24,6 +24,7 @@ use clap::{Args, Parser, Subcommand};
 use md_render::document::{layout_document, source_line_count};
 use md_render::image_art::{
     CardColours, DitherMode, ImageBackground, ImageEncoding, ImageOptions, ImagePalette,
+    ThumbnailFormat,
 };
 use md_render::renderer::render_markdown;
 use md_render::style::Color;
@@ -85,6 +86,15 @@ struct ThumbnailArgs {
     /// Colour filling the band the picture does not cover, as `#rrggbb`.
     #[arg(long, value_name = "#rrggbb", value_parser = parse_background_hex)]
     background: [u8; 3],
+
+    /// Format to encode in.
+    ///
+    /// `auto` writes PNG when the picture has transparent pixels and JPEG
+    /// otherwise, which is the smallest encode the terminals decode. `png` is
+    /// for the transport that decodes PNG alone; `jpeg` composites the picture
+    /// over `--background`, because the format has no alpha channel.
+    #[arg(long, value_enum, default_value = "auto", value_name = "auto|png|jpeg")]
+    format: ThumbnailFormat,
 }
 
 #[derive(Debug, Args)]
@@ -193,6 +203,16 @@ struct RenderArgs {
     #[arg(long, default_value_t = 0, value_name = "COLS")]
     image_card_min_width: u16,
 
+    /// Do not write a card's caption.
+    ///
+    /// A caller that paints the picture over the card wants a surface, not a
+    /// placeholder: a picture may be transparent, and a transparent pixel
+    /// shows what is underneath it, so a caption there would read as letters
+    /// floating in the picture. The card keeps its rows, its columns and its
+    /// colours either way.
+    #[arg(long)]
+    no_image_card_caption: bool,
+
     /// Sharpen an image that was reduced to fit the page.
     #[arg(long)]
     image_sharpen: bool,
@@ -223,6 +243,7 @@ fn main() -> ExitCode {
             args.cells.1,
             args.crop,
             args.background,
+            args.format,
             &args.out,
         ) {
             Ok(()) => ExitCode::SUCCESS,
@@ -285,6 +306,7 @@ fn run(cli: &RenderArgs) -> Result<String, String> {
         min_rows: cli.image_min_rows,
         card_rows: cli.image_card_rows,
         card_min_width: cli.image_card_min_width,
+        card_caption: !cli.no_image_card_caption,
         sharpen: cli.image_sharpen,
         paper,
         // Left at its default: the layout fills a card's colours from the

@@ -194,7 +194,8 @@ require('md-render').setup({
     max_width_pct = 0.9,
     max_height_pct = 0.9,
   },
-  resize_debounce = 100,
+  resize_debounce = 100,        -- coalesce resizes and edits before re-rendering
+  settle_debounce = 15,         -- coalesce scrolls before an inline picture is painted again
 })
 ```
 

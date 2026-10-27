@@ -86,6 +86,50 @@ fn a_complete_request_writes_one_file_and_nothing_to_stdout() {
 }
 
 #[test]
+fn a_picture_is_never_encoded_denser_than_its_source() {
+    // `image_sample.png` is 16 x 16. Aiming the box at 640 pixels across would
+    // resample it forty times over and lose every edge in it — and the same
+    // file drawn whole is sent as itself, so the two would not look alike.
+    let dir = temp_dir("md-render-thumbnail-density-test");
+    let source = image_fixture("image_sample.png");
+    let source = source.to_str().expect("utf-8");
+
+    // The width and height of a PNG's IHDR, at bytes 16..24 of the file.
+    let dimensions = |name: &str, box_size: &str| {
+        let out = dir.join(name);
+        let out_str = out.to_str().expect("utf-8");
+        let output = run(&[
+            "thumbnail",
+            source,
+            "--box",
+            box_size,
+            "--format",
+            "png",
+            "--out",
+            out_str,
+            "--background",
+            "#282828",
+        ]);
+        assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+        let bytes = std::fs::read(&out).expect("the thumbnail exists");
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        (
+            u32::from_be_bytes(bytes[16..20].try_into().expect("a width")),
+            u32::from_be_bytes(bytes[20..24].try_into().expect("a height")),
+        )
+    };
+
+    // 16 columns by 8 rows of cells is a 16 x 16 pixel box at one pixel per
+    // cell: the source's own size, not 640 x 640.
+    assert_eq!(dimensions("own-size", "16x8"), (16, 16));
+    // A box wider than the source keeps the box's shape and still spends no
+    // more pixels per cell than the source has: 80 columns at one pixel each.
+    assert_eq!(dimensions("wide", "80x8"), (80, 16));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_crop_writes_the_rows_it_names() {
     let dir = temp_dir("md-render-thumbnail-cli-crop-test");
     let out = dir.join("full");
@@ -143,6 +187,56 @@ fn a_crop_writes_the_rows_it_names() {
             "#000000",
         ],
         "--crop",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_forced_format_is_what_the_file_holds() {
+    let dir = temp_dir("md-render-thumbnail-cli-format-test");
+    let source = image_fixture("image_sample.png");
+    let source = source.to_str().expect("utf-8");
+    let png = dir.join("png");
+    let jpeg = dir.join("jpeg");
+
+    for (out, format) in [(&png, "png"), (&jpeg, "jpeg")] {
+        let output = run(&[
+            "thumbnail",
+            source,
+            "--box",
+            "16x8",
+            "--format",
+            format,
+            "--out",
+            out.to_str().expect("utf-8"),
+            "--background",
+            "#282828",
+        ]);
+        assert!(output.status.success(), "stderr: {}", stderr_of(&output));
+        assert!(output.stdout.is_empty(), "stdout must carry nothing");
+    }
+
+    let png = std::fs::read(&png).expect("png bytes");
+    assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    let jpeg = std::fs::read(&jpeg).expect("jpeg bytes");
+    assert_eq!(&jpeg[..3], b"\xff\xd8\xff");
+
+    // A format the encoder does not have is refused, naming the option.
+    assert_refused(
+        &[
+            "thumbnail",
+            source,
+            "--box",
+            "16x8",
+            "--format",
+            "webp",
+            "--out",
+            dir.join("webp").to_str().expect("utf-8"),
+            "--background",
+            "#000000",
+        ],
+        "--format",
     );
 
     let _ = std::fs::remove_dir_all(&dir);

@@ -262,6 +262,7 @@ section('8.1', function()
   eq_table('8.1 default preview caps', d.preview,
     { max_width_pct = 0.9, max_height_pct = 0.9 })
   expect('8.1 default resize debounce', d.resize_debounce, 100)
+  expect('8.1 default settle debounce', d.settle_debounce, 15)
   expect('8.1 default graphics mode', d.graphics, 'auto')
 
   -- The user's options must not mutate the defaults table.
@@ -747,6 +748,7 @@ section('10.2', function()
     state.cached(source, tick, width, height, encoding, 'nord', false, image), nil)
   for _, field in ipairs({
     'palette', 'background', 'dither', 'min_rows', 'sharpen', 'card_rows', 'card_min_width',
+    'card_caption',
   }) do
     local changed = vim.deepcopy(image)
     if type(changed[field]) == 'boolean' then
@@ -5009,15 +5011,41 @@ end)
 
 section('2.2', function()
   local path = 'C:/tmp/a.png'
-  expect('2.2 the placement bytes',
-    graphics.kitty_sequence({ 2, 4 }, 20, 9, 7, path),
+  expect('2.2 the path placement bytes',
+    graphics.kitty_path_sequence({ 2, 4 }, 20, 9, 7, path),
     SAVE .. ESC .. '[3;5H'
       .. ESC .. '_Gi=7,a=T,t=f,f=100,p=7,c=20,r=9,C=1,q=2;'
       .. vim.base64.encode(path) .. ESC .. ST .. RESTORE)
   local wide = 'C:/图片/图.png'
   truthy('2.2 a non-ASCII path is sent as its bytes',
-    graphics.kitty_sequence({ 0, 0 }, 1, 1, 1, wide):find(vim.base64.encode(wide), 1, true)
+    graphics.kitty_path_sequence({ 0, 0 }, 1, 1, 1, wide):find(vim.base64.encode(wide), 1, true)
       ~= nil)
+
+  -- The data transmission carries the picture itself, and names PNG as what it
+  -- is: without `f=100` kitty reads the payload as raw RGBA of no known size
+  -- and refuses the whole placement.
+  expect('2.2 the data placement bytes',
+    graphics.kitty_sequence({ 2, 4 }, 20, 9, 7, 'abc'),
+    SAVE .. ESC .. '[3;5H'
+      .. ESC .. '_Ga=T,t=d,f=100,i=7,p=7,c=20,r=9,C=1,q=2,m=0;'
+      .. vim.base64.encode('abc') .. ESC .. ST .. RESTORE)
+
+  -- One sequence carries at most 4096 base64 characters. A larger picture is
+  -- sent as chunks: only the first carries the keys, every one but the last
+  -- says more is coming, and the cursor is still restored after the last.
+  local picture = string.rep('x', graphics.KITTY_CHUNK)
+  local encoded = vim.base64.encode(picture)
+  truthy('2.2 the fixture is more than one chunk', #encoded > graphics.KITTY_CHUNK)
+  local sequence = graphics.kitty_sequence({ 0, 0 }, 1, 1, 1, picture)
+  local head = SAVE .. ESC .. '[1;1H'
+    .. ESC .. '_Ga=T,t=d,f=100,i=1,p=1,c=1,r=1,C=1,q=2,m=1;'
+    .. encoded:sub(1, graphics.KITTY_CHUNK) .. ESC .. ST
+  expect('2.2 a chunked transmission says more is coming', sequence:sub(1, #head), head)
+  local rest = encoded:sub(graphics.KITTY_CHUNK + 1)
+  local tail = ESC .. '_Gm=0;' .. rest .. ESC .. ST .. RESTORE
+  expect('2.2 and its last chunk ends the transmission and restores the cursor',
+    sequence:sub(-#tail), tail)
+
   expect('2.2 the delete bytes',
     graphics.kitty_delete(7), ESC .. '_Ga=d,d=I,i=7,q=2' .. ESC .. ST)
 end)
@@ -5047,6 +5075,7 @@ section('2.3', function()
   truthy('2.3 a readable file plans a Kitty placement', kitty ~= nil)
   expect('2.3 with the path', kitty and kitty.path, resolved)
   expect('2.3 and no bytes', kitty and kitty.data, nil)
+  expect('2.3 and nothing for the plugin to encode', kitty and kitty.encode, false)
   truthy('2.3 and an id to place and delete by', type(kitty and kitty.id) == 'number')
 
   expect('2.3 a missing file plans nothing',
@@ -5062,13 +5091,15 @@ section('2.3', function()
   expect('2.3 an empty destination plans nothing',
     graphics.plan({ target = '' }, dir, 'kitty'), nil)
 
-  -- The path transport decodes PNG and nothing else, refusing the rest with
-  -- `EBADPNG`: a file it cannot decode plans nothing, so the popup keeps its
-  -- artwork instead of placing a picture that would never be drawn.
+  -- The path transmission decodes PNG and nothing else, refusing the rest with
+  -- `EBADPNG`: a file of another format is planned to be carried as the engine's
+  -- PNG encode instead, so the popup still shows the picture.
   local other = temp_file('photo.jpg', 'not a png at all')
-  expect('2.3 a path-carrying plan needs a PNG',
-    graphics.plan({ target = 'photo.jpg' }, other, 'kitty'), nil)
-  truthy('2.3 while the byte-carrying one takes it',
+  local encoded = graphics.plan({ target = 'photo.jpg' }, other, 'kitty')
+  truthy('2.3 a file the path transmission cannot decode still plans a placement',
+    encoded ~= nil)
+  expect('2.3 as something the plugin encodes as PNG', encoded and encoded.encode, true)
+  truthy('2.3 while the byte-carrying one takes the file itself',
     graphics.plan({ target = 'photo.jpg' }, other, 'osc') ~= nil)
   vim.fn.delete(other, 'rf')
 
@@ -5113,7 +5144,21 @@ section('2.4', function()
     graphics.place(win, { tier = 'kitty', id = 3, path = 'p.png' })
     expect('2.4 a Kitty placement is one send', #sends, 1)
     expect('2.4 carrying the path and the box', sends[1],
-      graphics.kitty_sequence({ 2, 3 }, 10, 5, 3, 'p.png'))
+      graphics.kitty_path_sequence({ 2, 3 }, 10, 5, 3, 'p.png'))
+
+    -- A file the path transmission cannot decode is encoded at the window's
+    -- own box, as PNG, and the picture travels as the sequence's payload.
+    local real_thumbnail = graphics.thumbnail
+    graphics.thumbnail = function(path, cols, rows, background, crop, format)
+      expect('2.4 the encode is asked for PNG', format, 'png')
+      expect('2.4 at the window\'s box', cols .. 'x' .. rows, '10x5')
+      return 'PNGDATA'
+    end
+    sends = {}
+    graphics.place(win, { tier = 'kitty', id = 4, path = 'p.jpg', encode = true })
+    graphics.thumbnail = real_thumbnail
+    expect('2.4 a file that is not a PNG is carried as data', sends[1],
+      graphics.kitty_sequence({ 2, 3 }, 10, 5, 4, 'PNGDATA'))
 
     -- A bordered float reports its *frame's* corner, one cell above and left of
     -- its first text cell. `screenpos` is the independent measure of where the
@@ -5517,6 +5562,16 @@ section('3.2', function()
     return nil
   end
 
+  --- Whether `cmd` carries a flag that takes no value.
+  local function has_flag(cmd, flag)
+    for _, arg in ipairs(cmd or {}) do
+      if arg == flag then
+        return true
+      end
+    end
+    return false
+  end
+
   --- The engine command one render with `opts` produces, forced past the cache
   --- so a case whose options resemble the last one's still spawns.
   local function command_for(opts)
@@ -5572,11 +5627,15 @@ section('3.2', function()
   -- A card nothing is painted over is compact, and wide enough to hold the
   -- hint written on it. This runner has no UI, so `auto` is that case.
   local hint = config.image_hint_text()
+  local compact = command_for({ image_inline = 'auto' })
   expect('3.2 a card on a terminal that cannot paint is three rows',
-    find_arg(command_for({ image_inline = 'auto' }), '--image-card-rows'), '3')
+    find_arg(compact, '--image-card-rows'), '3')
   expect('3.2 and at least as wide as the hint it carries',
-    find_arg(command_for({ image_inline = 'auto' }), '--image-card-min-width'),
+    find_arg(compact, '--image-card-min-width'),
     tostring(vim.fn.strdisplaywidth(hint) + 2))
+  -- Its caption is all the reader gets, so it keeps it.
+  truthy('3.2 and keeps its caption, since nothing is painted over it',
+    not has_flag(compact, '--no-image-card-caption'))
   expect('3.2 with neither image key bound there is no width floor',
     find_arg(command_for({
       image_inline = 'auto',
@@ -5590,10 +5649,18 @@ section('3.2', function()
   -- A picture painted over the card is measured for the artwork's box, so the
   -- card keeps it; a card forced on the same terminal stays compact.
   local restore = drawing_terminal()
+  local painted = command_for({ image_inline = 'auto' })
   expect('3.2 a painted card keeps the artwork box',
-    find_arg(command_for({ image_inline = 'auto' }), '--image-card-rows'), nil)
+    find_arg(painted, '--image-card-rows'), nil)
+  -- And it carries no caption: the picture is drawn over these cells, and a
+  -- transparent pixel would show the text as letters inside the picture.
+  truthy('3.2 a card under a picture carries no caption',
+    has_flag(painted, '--no-image-card-caption'))
+  local forced = command_for({ image_inline = 'card' })
   expect('3.2 a card forced on a painting terminal stays compact',
-    find_arg(command_for({ image_inline = 'card' }), '--image-card-rows'), '3')
+    find_arg(forced, '--image-card-rows'), '3')
+  truthy('3.2 and keeps its caption, since nothing is painted over it',
+    not has_flag(forced, '--no-image-card-caption'))
   restore()
 
   vim.o.termguicolors = termguicolors
@@ -6240,6 +6307,16 @@ section('5.2', function()
   expect('5.2 and its column', slice and slice.origin[2], sp.col - 1)
   local origin = slice and slice.origin
 
+  -- A window in another tab page is not on screen, but `screenpos` answers as
+  -- if it were: measured, the hidden window's first row comes back at the same
+  -- row and column as the current window's. Placing there painted a document's
+  -- picture over whatever tab the reader had switched to, which is what a hand
+  -- check saw when `:checkhealth` opened its tab over R.
+  vim.cmd('tabnew')
+  expect('5.2 a window in another tab page has no slice', graphics.slice(win, rect), nil)
+  vim.cmd('tabclose')
+  truthy('5.2 and has one again when its tab is showing', graphics.slice(win, rect) ~= nil)
+
   -- Scrolled so its first rows are above the window: the slice starts where the
   -- window does and carries the rows that are left.
   vim.api.nvim_win_set_cursor(win, { rect.top + rect.height, 0 })
@@ -6341,7 +6418,7 @@ section('5.3', function()
     for _ = 1, 5 do
       vim.api.nvim_exec_autocmds('WinScrolled', {})
     end
-    vim.wait(config.options.resize_debounce + 200)
+    vim.wait(config.options.settle_debounce + 200)
   end
 
   local ok, err = pcall(function()
@@ -6394,6 +6471,37 @@ section('5.3', function()
     sends, paints = {}, 0
     burst()
     expect('5.3 scrolled back, it is placed again', placements(), 1)
+
+    -- The wait before the picture comes back is `settle_debounce`, not the
+    -- re-render's `resize_debounce`: what it costs is a card flashing where the
+    -- picture belongs. Held at a second, a scroll paints nothing inside the
+    -- re-render's hundred milliseconds; restored, the next one paints.
+    config.setup({ image_mode = 'blocks', image_inline = 'auto', settle_debounce = 1000 })
+    sends, paints = {}, 0
+    vim.api.nvim_exec_autocmds('WinScrolled', {})
+    vim.wait(300)
+    expect('5.3 the settle waits its own debounce, not the re-render\'s', placements(), 0)
+    config.setup({ image_mode = 'blocks', image_inline = 'auto' })
+    vim.api.nvim_exec_autocmds('WinScrolled', {})
+    truthy('5.3 and the default paints once its own wait is over',
+      wait_until(function() return placements() >= 1 end, 1000))
+    expect('5.3 once', placements(), 1)
+    vim.wait(200)
+
+    -- A window in another tab page is not on screen, and `screenpos` does not
+    -- say so: the settle used to place the document's picture over whatever tab
+    -- was showing, which is what a hand check saw when `:checkhealth` opened its
+    -- own tab over R and the picture covered the report.
+    sends, paints = {}, 0
+    vim.cmd('tabnew')
+    burst()
+    expect('5.3 nothing is placed for a window in another tab', placements(), 0)
+    expect('5.3 and that window is not painted at all', paints, 0)
+    vim.cmd('tabclose')
+    truthy('5.3 returning to its tab asks for the picture again',
+      wait_until(function() return placements() >= 1 end))
+    expect('5.3 once', placements(), 1)
+    vim.wait(200)
 
     -- Closing a window over the picture repaints what was underneath it.
     sends, paints = {}, 0
@@ -6520,9 +6628,10 @@ section('5.4', function()
   local thumb = 'THUMB'
   local requests = {}
   local real_run = graphics.run_thumbnail
-  graphics.run_thumbnail = function(exe, source, cols, rows, background, out, crop)
+  graphics.run_thumbnail = function(exe, source, cols, rows, background, out, crop, format)
     requests[#requests + 1] = {
       source = source, cols = cols, rows = rows, background = background, out = out, crop = crop,
+      format = format,
     }
     vim.fn.writefile({ thumb }, out, 'b')
     return true
@@ -6582,7 +6691,7 @@ section('5.4', function()
     local id = tonumber(placed:match('i=(%d+)'))
     truthy('5.4 carrying an image id', id ~= nil, placed)
     expect('5.4 the Kitty sequence is the whole payload', placed,
-      graphics.kitty_sequence(origin, rect.width, rect.height, id, path))
+      graphics.kitty_path_sequence(origin, rect.width, rect.height, id, path))
 
     -- A repaint replaces the same placement rather than stacking another on
     -- top of it.
@@ -6666,6 +6775,51 @@ section('5.4', function()
     sends = {}
     settle()
     expect('5.4 off the window, nothing is sent', #sends, 0)
+
+    -- A file the path transmission cannot decode goes as data instead: the
+    -- engine encodes it for the block's box, asked for as PNG because that is
+    -- what the data transmission decodes, and the payload is that encode rather
+    -- than the file the terminal would have been handed.
+    graphics.env = function()
+      return { TERM = 'xterm-kitty' }
+    end
+    config.setup({ image_mode = 'blocks', image_inline = 'auto' })
+    local gif = repo .. '/tests/fixtures/images/image_animation.gif'
+    local gif_doc = vim.fn.tempname() .. '.md'
+    vim.fn.writefile({ '![an animation](' .. gif:gsub('\\', '/') .. ')' }, gif_doc)
+    -- The encode is asked for while R is entered, so the requests are counted
+    -- from before the toggle: a second settle finds the answer in the cache.
+    requests = {}
+    truthy('5.4 in R on a picture that is not a PNG', reset_to(gif_doc))
+    local gif_st = current_state()
+    vim.wo[gif_st.win].scrolloff = 0
+    local gif_rect = graphics.rect(gif_st.doc, 0)
+    truthy('5.4 the block has a rectangle', gif_rect ~= nil)
+    if gif_rect then
+      vim.api.nvim_win_set_cursor(gif_st.win, { gif_rect.top + 1, 0 })
+      vim.fn.winrestview({ topline = gif_rect.top + 1 })
+      vim.wait(200)
+      local gif_slice = graphics.slice(gif_st.win, gif_rect)
+      local gif_origin = gif_slice and gif_slice.origin
+      truthy('5.4 the block has a screen origin', gif_origin ~= nil)
+      sends = {}
+      settle()
+      expect('5.4 one placement', #sends, 1)
+      local data_id = tonumber((sends[1] or ''):match('i=(%d+)'))
+      expect('5.4 as the engine\'s PNG encode', sends[1],
+        graphics.kitty_sequence(gif_origin, gif_rect.width, gif_rect.height, data_id, thumb))
+      local asked_png
+      for _, asked in ipairs(requests) do
+        if asked.source == vim.fs.normalize(gif) then
+          asked_png = asked
+        end
+      end
+      truthy('5.4 the picture was encoded', asked_png ~= nil, 'requests=' .. #requests)
+      expect('5.4 as PNG', asked_png and asked_png.format, 'png')
+      expect('5.4 for the block columns', asked_png and asked_png.cols, gif_rect.width)
+      expect('5.4 rows', asked_png and asked_png.rows, gif_rect.height)
+    end
+    vim.fn.delete(gif_doc)
   end)
 
   graphics.run_thumbnail = real_run
@@ -6933,8 +7087,9 @@ end)
 --------------------------------------------------------------------------------
 
 section('5.7', function()
-  -- WezTerm, the byte-carrying transport: it is the one that can be handed an
-  -- encode of part of the picture. Kitty is handed a path and keeps 5.3's rule.
+  -- WezTerm, the byte-carrying transport: it is the one that is painted over the
+  -- rows still on screen. Kitty keeps 5.3's rule — a cut block shows its card —
+  -- because what it places is the block's box, not the window's.
   local restore = drawing_terminal()
   graphics.env = function()
     return { TERM = 'xterm-256color', TERM_PROGRAM = 'WezTerm' }
