@@ -6245,7 +6245,29 @@ end)
 -- 5.2 A block's rectangle, and whether the window shows all of it
 --------------------------------------------------------------------------------
 
-section('5.2', function()
+--- Whether this runner can put a picture on a cell at all.
+---
+--- The transport needs the raw-bytes API — `nvim_ui_send`, added in Neovim 0.12
+--- — and a placement needs the cell, which `screenpos` gives only where the
+--- runtime computes the window layout: measured on a headless 0.10.4, `w0` is
+--- the cursor line whatever `winrestview` was told, and `screenpos` answers
+--- `0,0` for every row, while 0.12 answers both. `drawing_terminal` can make
+--- the plugin believe in a terminal, but not in a cell, so the sections whose
+--- subject is a placement are skipped where the transport itself does not
+--- exist — there is nothing for the plugin to get right there.
+local has_transport = vim.api.nvim_ui_send ~= nil
+
+--- A section whose subject is a placement on screen. Skipped, with a line
+--- saying so, where this runner has no screen to place on.
+local function screen_section(name, fn)
+  if not has_transport then
+    io.write('== section ' .. name .. ' (skipped: no nvim_ui_send)\n')
+    return
+  end
+  section(name, fn)
+end
+
+screen_section('5.2', function()
   local image_fixture = repo .. '/tests/fixtures/image.md'
   -- Artwork rather than a card: the boundary checks below need a block the
   -- window cannot show whole, and a compact card is three rows, which the
@@ -6375,7 +6397,7 @@ end)
 -- 5.3 Paint on settle, only what the window wholly shows
 --------------------------------------------------------------------------------
 
-section('5.3', function()
+screen_section('5.3', function()
   local restore = drawing_terminal()
   local sends = {}
   local paints = 0
@@ -6622,7 +6644,7 @@ end)
 -- 5.4 The payload of each transport, and the delete
 --------------------------------------------------------------------------------
 
-section('5.4', function()
+screen_section('5.4', function()
   -- A known picture, so that the bytes of both transports can be written out
   -- here and compared exactly rather than matched loosely.
   local thumb = 'THUMB'
@@ -6835,7 +6857,7 @@ end)
 -- 5.5 A paint that fails is quiet
 --------------------------------------------------------------------------------
 
-section('5.5', function()
+screen_section('5.5', function()
   local restore = drawing_terminal()
   -- The byte-carrying transport, because it is the one with a step that can
   -- fail: the thumbnail request. The path-carrying one only writes the path and
@@ -6961,7 +6983,7 @@ end)
 -- 5.6 A small file is painted as it is, not downscaled
 --------------------------------------------------------------------------------
 
-section('5.6', function()
+screen_section('5.6', function()
   local restore = drawing_terminal()
   graphics.env = function()
     return { TERM = 'xterm-256color', TERM_PROGRAM = 'WezTerm' }
@@ -7086,7 +7108,7 @@ end)
 -- 5.7 A block the window cuts in half is painted up to the cut
 --------------------------------------------------------------------------------
 
-section('5.7', function()
+screen_section('5.7', function()
   -- WezTerm, the byte-carrying transport: it is the one that is painted over the
   -- rows still on screen. Kitty keeps 5.3's rule — a cut block shows its card —
   -- because what it places is the block's box, not the window's.
