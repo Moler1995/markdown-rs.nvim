@@ -8,21 +8,28 @@ animated image plays, pauses and stops there.
 
 ### Requirement: The preview key opens an image
 
-While R is showing and the cursor is on an image's artwork, the preview key SHALL open a popup
-showing that image alone, on the same terms as the popup already opens for a diagram or a table.
-The popup SHALL be laid out at its own width and height, so the image is scaled to the popup rather
-than to the window, and it SHALL NOT be enlarged past its natural size.
+While R is showing and the cursor is on an image's artwork or card, the preview key SHALL open a
+popup showing that image alone when the terminal can draw the file in the editor — the conditions
+the graphics transport requires: an editor with the raw-bytes API, an attached UI, `graphics` not
+`'off'`, an identified terminal, and no multiplexer. The popup SHALL be on the same terms as the
+popup already opens for a diagram or a table: laid out at its own width and height, so the image is
+scaled to the popup rather than to the window, and never enlarged past its natural size.
 
 An image the engine cannot draw SHALL still open a popup, showing the reference's alt text.
 
-Where the terminal can draw images, the popup SHALL show the image file instead of the artwork:
-the same window, opened at the same size and position, with the file placed over its interior by
-the terminal. A reference that does not resolve to a readable local file SHALL still open the
-artwork's popup.
+Where the terminal cannot draw the file, the preview key SHALL NOT open a popup for an image,
+because a popup there could only show character artwork. It SHALL instead open the referenced file
+with the operating system's default application, resolving and reporting exactly as the
+open-image key does: a relative destination against the directory of the document holding the
+reference, an absolute path as given, and a destination that is not a local file or does not exist
+reported rather than fetched or launched.
+
+The behavior of the preview key on a diagram or a table SHALL NOT depend on the terminal.
 
 #### Scenario: Cursor on an image
 
-- **WHEN** the cursor is on a rendered image and the user presses the preview key
+- **WHEN** the terminal can draw the file, the cursor is on a rendered image and the user presses
+  the preview key
 - **THEN** a popup opens showing that image alone
 
 #### Scenario: A small image
@@ -41,6 +48,33 @@ artwork's popup.
   to a readable file
 - **THEN** the popup window is the one the artwork would have opened
 - **AND** the image file is shown over its interior
+
+#### Scenario: A terminal that cannot draw
+
+- **WHEN** `graphics = 'off'`, or the terminal is not one the plugin identifies, or a multiplexer
+  is in the way, and the cursor is on an image
+- **THEN** no popup opens
+- **AND** the referenced file is opened with the operating system's default application
+
+#### Scenario: A relative destination without a popup
+
+- **WHEN** the reference is `![](images/a.png)`, the document is `/docs/readme.md`, and the
+  terminal cannot draw the file
+- **THEN** `/docs/images/a.png` is opened
+
+#### Scenario: A file that cannot be opened
+
+- **WHEN** the terminal cannot draw, and the referenced file does not exist, or the reference is
+  not a local file
+- **THEN** no popup opens
+- **AND** nothing is launched
+- **AND** the plugin reports that the image cannot be opened
+
+#### Scenario: A diagram on a terminal that cannot draw
+
+- **WHEN** the cursor is within a `mermaid` fence's artwork on a terminal that cannot draw an
+  image file
+- **THEN** the popup opens showing the diagram, as on any other terminal
 
 ### Requirement: An animated image plays in the popup
 

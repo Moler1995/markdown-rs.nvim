@@ -45,6 +45,11 @@ width SHALL raise the card's columns to at least that many, capped at the page w
 own columns are kept unless a minimum width raises them, and the card's source attribution is
 unchanged either way.
 
+A caller MAY refuse the caption, for a card the terminal paints the picture over. A caption-less
+card SHALL be the surface alone on every row, with the same rows, columns, colours and source
+attribution the caption would have had: the picture is measured for that box, and a picture may be
+transparent, so a caption under it would read as letters inside the picture.
+
 The engine SHALL use the braille encoding unless the caller asks for another encoding.
 
 #### Scenario: Default encoding
@@ -125,6 +130,12 @@ The engine SHALL use the braille encoding unless the caller asks for another enc
 
 - **WHEN** a card is drawn for a file whose header cannot be read
 - **THEN** the caption names the file and reports no size
+
+#### Scenario: Card caption refused
+
+- **WHEN** an image is rendered with the card encoding and its caption refused
+- **THEN** every row of the box is the raised surface alone, with no text and no foreground colour
+- **AND** the box's rows, columns and source attribution are those the caption would have had
 
 ### Requirement: Decoding limits
 
@@ -211,8 +222,11 @@ The output SHALL be a single encoded picture whose pixel width to height ratio i
 columns to twice its rows, so that a terminal filling the box with it reproduces the picture's
 proportions. The picture SHALL be scaled to fit inside that rectangle without distortion, centred,
 and the remainder SHALL be filled with the requested background. The output SHALL be PNG when the
-picture has transparency and JPEG otherwise. The thumbnail mode SHALL NOT write to standard output,
-and its output SHALL be byte-identical for the same picture, box and background.
+picture has transparency and JPEG otherwise, unless the request names a format: `png` SHALL be
+written as PNG whatever the picture's transparency, and `jpeg` as JPEG, with any transparency
+composited over the requested background because the format has no alpha channel. The thumbnail
+mode SHALL NOT write to standard output, and its output SHALL be byte-identical for the same
+picture, box, background and format.
 
 The mode SHALL refuse a missing or unreadable file, an unsupported format, a box with no room for
 a cell, and an output path it cannot write, each with a non-zero exit and a diagnostic on standard
@@ -243,6 +257,14 @@ picture's own size — subject to the same decoding limits as every other image.
 
 - **WHEN** a picture with transparent pixels and one without are each asked for as a thumbnail
 - **THEN** the first is written as PNG and the second as JPEG
+
+#### Scenario: A format the caller names
+
+- **WHEN** an opaque picture is asked for with `--format png`
+- **THEN** the file written is a PNG
+- **AND** a transparent picture asked for with `--format jpeg` is a JPEG whose transparent pixels
+  take the requested background colour
+- **AND** a format the engine does not encode is refused, naming the option
 
 #### Scenario: A picture that cannot be read
 

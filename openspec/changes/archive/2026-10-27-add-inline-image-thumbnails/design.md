@@ -46,8 +46,9 @@ See `proposal.md` — Why. The pieces this design builds on, as they are today:
 **Non-Goals:**
 
 - Animation inline. The inline view is one still picture; the popup is where motion lives.
-- A thumbnail on the path-carrying transport: Kitty sends the original path, so the terminal
-  scales the file itself and no thumbnail is involved.
+- A thumbnail for a PNG on the path-carrying transport: Kitty sends the original path, so the
+  terminal scales the file itself. A file of any other format has no path transmission to use —
+  that sequence names PNG — so it travels as the engine's PNG encode of the block's box.
 - A thumbnail cache on disk, or one shared between editor sessions.
 - Changing the document's flow. `image_max_height` stays the only knob over how much room an image
   takes, and this change does not touch it.
@@ -87,9 +88,22 @@ The card's colours are theme tokens — the raised surface as the background, th
 for the caption — so a card in a light theme is light, and no palette or dither option applies to
 it.
 
+The card a picture is painted over is the one card without a caption. A picture may be
+transparent, and what a transparent pixel shows is what is under it: `tests/fixtures/image.md`'s
+16×16 RGBA sample, painted over its card, showed the caption as faint letters inside the picture —
+seen by hand in WezTerm. The plugin therefore asks the engine for a caption-less card exactly when
+it expects a picture over it (`config.card_shape`'s third answer), which is also the case where the
+hint is already not drawn. A card with no placement on it keeps its caption, because the caption is
+then all the reader gets.
+
 *Alternatives:* a border-drawn frame with the caption below it — two colours and box-drawing
 characters for the same information, and the box would have to shrink to keep the frame inside the
-width; the alt text everywhere — leaves exactly the case the reader complained about.
+width; the alt text everywhere — leaves exactly the case the reader complained about; flattening
+the picture's alpha over the card colour instead — the same clean rectangle, but only for what the
+engine re-encodes: a file under the threshold is sent unchanged, so the terminal would still draw
+its transparency over whatever is underneath, and closing that hole meant refusing that
+pass-through for every transparent PNG — the native resolution D3 sells, lost for the format that
+is most often transparent.
 
 ### D3 — The thumbnail is produced on demand, outside the wire
 
@@ -120,7 +134,12 @@ The thumbnail's pixel box is `cols × k` by `rows × 2k`: the same 2:1 cell assu
 lays the artwork out under, so a terminal whose cells are near that shape reproduces the picture's
 proportions, and one far from it stretches the picture by exactly the error the artwork already
 carries. `k` is chosen to make the width about 640 pixels, clamped so that the result stays under
-two megapixels — a bound on encode time and on the payload, not a quality setting.
+two megapixels — a bound on encode time and on the payload, not a quality setting — and capped at
+the source's own pixels per cell, so a picture smaller than its box is written at its own size. The
+cap is what keeps a small file looking the same whole and cut: whole, it is sent as itself and the
+terminal scales it once; cut, it is the engine's encode, and encoding a 16 × 16 file into 640
+pixels resamples every edge in it away — seen by hand as a blurry picture the moment a block touched
+the window's edge.
 
 The picture is scaled to fit inside that box and centred, with the remainder filled by the theme's
 background, so the placement is a clean rectangle: nothing of the card shows at an edge, and no
@@ -149,8 +168,15 @@ already compute.
 A placement is a paint over cells, so it has to be made after the window has painted, and it is
 lost to every repaint after it. The popup solved this by not moving; R cannot. The rule is
 therefore: place over the block's rows that are inside the window's visible rows, and after the
-viewport has stopped moving — one debounce, reused from the resize path, for scrolls, resizes,
-re-renders and cursor motions.
+viewport has stopped moving — one debounce for scrolls, resizes, re-renders and cursor motions.
+
+That debounce is `settle_debounce` (15 ms), not the re-render's `resize_debounce` (100 ms), although
+both coalesce bursts of the same events. The two waits cost the reader different things: a
+re-render that is late leaves the previous document on screen, while a placement that is late leaves
+a card where the picture belongs — a flicker on every scroll stop, measured as the 100 ms the shared
+knob used to spend, and visible by hand. One frame is enough to fold a burst into one paint, and a
+reader whose terminal struggles with the payloads — or whose scrolling over a cut block asks for a
+thumbnail of every slice — raises it again.
 
 Those rows are the window's own answer — `w0` and `w$`, not arithmetic on `topline` — because
 `scrolloff` and a partly drawn last line are easy to get wrong. A block the window cuts was
@@ -177,6 +203,15 @@ rectangle comparison `screenpos` already gives, against every float in the tabpa
 included; a covered block is treated exactly like a scrolled-out one, which also deletes its Kitty
 placement.
 
+A window is also not on screen while another tab page is current, and `screenpos` does not know
+it: measured, a hidden window's first row comes back at the same row and column as the current
+window's, because the position is computed from the layout rather than from what is displayed. A
+settle that ran while another tab was current therefore painted the document's picture over that
+tab — `:checkhealth` opens its own tab, and what a hand check saw was its report covered by the
+picture of the page left behind. The rule follows the float's: the settle compares tab pages
+before placing anything, and `TabEnter` asks for the pictures of the tab being entered, because a
+tab that was not showing had no placement to keep.
+
 *Alternatives:* re-place synchronously on every event — a payload per scroll row and per keystroke;
 freeze the viewport as the popup does — R is the reading surface and must scroll; keep the artwork
 underneath and let the terminal keep its paint — the same thing, with the wipe still visible.
@@ -184,8 +219,7 @@ underneath and let the terminal keep its paint — the same thing, with the wipe
 ### D7 — The card is what a failed or absent placement costs
 
 Nothing in this design hides a failure: a file that disappears, a block the path-carrying
-transport cannot crop, a file that transport cannot decode — it names PNG as the picture's format
-in its sequence, so every other format is refused and keeps its card — a terminal that cannot draw,
+transport cannot crop, an encode the engine refuses, a terminal that cannot draw,
 a `graphics = 'off'` — all of them leave the
 card in place, which is the document's own content and needs no paint. That is why the card comes first in the task order:
 it is the floor the rest of the change stands on.

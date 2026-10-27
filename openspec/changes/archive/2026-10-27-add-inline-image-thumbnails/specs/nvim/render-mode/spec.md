@@ -28,7 +28,10 @@ A card that nothing is placed over SHALL be three display rows tall, whatever th
 so every image in a document takes the same number of rows; a page with fewer rows than that gives
 the card the page's height instead. Its width SHALL be the width the artwork's box would have had,
 raised to fit the hint below, and SHALL never exceed the page width. A card that the terminal paints a picture over SHALL take
-the artwork's box exactly, columns and rows, so the placement covers all of it.
+the artwork's box exactly, columns and rows, so the placement covers all of it, and SHALL carry no
+caption: a picture may be transparent, and a transparent pixel would show the caption as letters
+inside the picture. A card nothing is painted over SHALL keep its caption, which is all the reader
+has then.
 
 A card or an alt text SHALL carry a hint that names the keys which open the picture, built from
 whichever of `keymaps.preview` and `keymaps.open_image` are bound, because neither says by itself
@@ -65,6 +68,13 @@ It SHALL NOT change the line's own bytes. With both keys bound to `false` there 
 - **WHEN** `image_inline = 'card'` and the terminal can draw
 - **THEN** the image's block is a card
 - **AND** that card is three rows tall, since nothing is placed over it
+
+#### Scenario: A transparent picture over its card
+
+- **WHEN** the terminal paints a picture with transparent pixels over an image's card
+- **THEN** the cells under the picture show the card's surface and no caption, so nothing of the
+  document reads through the picture
+- **AND** a card nothing is painted over still carries its caption
 
 #### Scenario: Card forced without graphics
 
@@ -123,10 +133,11 @@ cannot cut them. The file itself keeps its own resolution; the thumbnail is down
 block's cell box at about 640 pixels across, and the engine produces it. A GIF, a WebP and an
 APNG are never sent unchanged, because the inline view is one still picture and the terminal
 would play them; any other format is left to the engine, which decodes more than the terminal
-does. The path-carrying transport sends the file's path and is not affected by the threshold, but
-only for a PNG: that transport names the format in the sequence and decodes no other one, so a
-JPEG, a WebP, a GIF or a file of any other format SHALL keep its card there rather than be sent to
-be refused.
+does. The path-carrying transport SHALL send a PNG's path, which is not affected by the threshold
+and keeps the file's own resolution, and SHALL carry every other format as the engine's PNG
+encode, because that transport names the picture's format in the sequence and decodes PNG alone.
+A JPEG, a WebP, a GIF or a file of any other format is therefore painted there too, as a still
+frame of that encode.
 
 It SHALL draw that picture only while no floating window covers any of the block's cells, either.
 A float owns the cells under it, and the terminal draws whatever was placed last, so a picture
@@ -138,6 +149,10 @@ The placement SHALL follow the window: after a scroll, a window resize or a re-r
 on screen SHALL have their pictures placed again over the rows that are visible, and the blocks
 that are not on screen SHALL have none. A burst of scroll or resize events SHALL produce at most
 one placement per block.
+
+A window SHALL count as on screen only while its tab page is the current one. A window in another
+tab page SHALL have no picture placed, and entering a tab page SHALL place the pictures of the
+windows it shows.
 
 The plugin SHALL NOT ask the engine for the same thumbnail twice while the file is unchanged: a
 re-place, a scroll back to a block, or a re-render whose file has the same length and modification
@@ -157,11 +172,12 @@ a paint over the card, as the preview's is over its artwork.
 - **THEN** the picture of the file is placed over the block's cells
 - **AND** the block's content underneath is still its card
 
-#### Scenario: A file the path transport cannot decode
+#### Scenario: A format the path transport cannot name
 
 - **WHEN** the image is a JPEG on a path-carrying terminal, and the viewport settles
-- **THEN** the block keeps its card and nothing is placed over it
-- **AND** no error is reported, because the card is what the reader was already looking at
+- **THEN** the engine's PNG encode of it is placed over the block's cells
+- **AND** the encode was asked for as PNG, at the block's own box
+- **AND** no error is reported
 
 #### Scenario: A block cut by the window's last row
 
@@ -218,6 +234,13 @@ a paint over the card, as the preview's is over its artwork.
 - **WHEN** the document is edited elsewhere and rendered again, and the image file is unchanged
 - **THEN** the picture is placed again for the blocks on screen
 - **AND** the engine is not asked for the thumbnail a second time for a slice it already has
+
+#### Scenario: Another tab page is showing
+
+- **WHEN** the reader switches to another tab page while a window in the first one shows a block
+  whose picture is placed, and the viewport settles there
+- **THEN** nothing is placed over the tab page that is showing
+- **AND** the picture of the first tab page's block is placed again when that tab page is entered
 
 #### Scenario: A burst of scrolls
 
