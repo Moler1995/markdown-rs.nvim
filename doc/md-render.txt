@@ -151,6 +151,23 @@ Every top-level key in `config.defaults`, with its default. Set a keymap to
   `ascii`), `'braille'`, `'quads'`, `'blocks'`, `'ascii'` or `'off'`. `'off'`
   shows every image as its alt text. See |md-render-images|.
 
+`image_inline` (default `'auto'`)~
+  What R shows for an inline image: `'auto'` (a card everywhere, with the
+  picture painted over it where the terminal can draw), `'card'` (the compact
+  three-row card alone) or `'art'` (the artwork `image_mode` selects).
+  `image_mode = 'off'` outranks both `'auto'` and `'card'`. The preview popup is
+  unaffected. See |md-render-inline|.
+
+`image_inline_original_bytes` (default `2097152`)~
+  The largest file painted inline as it is instead of downscaled first. A file
+  at or below this size is sent to the terminal unchanged, at its own
+  resolution; a larger one becomes the engine's thumbnail, about 640 pixels
+  across, which is what keeps every settle cheap. Only a still PNG or JPEG is
+  sent this way: an animation would play itself inline, and every other format
+  is left to the engine, which decodes more than the terminal does. `0` always
+  asks for the thumbnail. The 8 MiB the OSC 1337 transport carries is a hard
+  cap on the option. See |md-render-inline|.
+
 `image_palette` (default `'auto'`)~
   Where cell colours come from: `'auto'` (`full` for one-colour cells,
   `adaptive` for two-colour cells), `'theme'`, `'adaptive'` or `'full'`.
@@ -178,9 +195,9 @@ Every top-level key in `config.defaults`, with its default. Set a keymap to
   them. `false` renders every image as its first frame.
 
 `graphics` (default `'auto'`)~
-  Whether an image's preview popup shows the file itself, drawn by the
-  terminal, instead of the artwork. `'auto'` uses the OSC 1337 protocol in
-  WezTerm and iTerm2, and the Kitty graphics protocol in kitty and Ghostty;
+  Whether the terminal draws image files itself, in the preview popup and
+  inline, instead of leaving the artwork. `'auto'` uses the OSC 1337 protocol
+  in WezTerm and iTerm2, and the Kitty graphics protocol in kitty and Ghostty;
   `'off'` never writes a graphics sequence. See |md-render-graphics|.
 
 `keymaps` (default below)~
@@ -255,15 +272,19 @@ R is the rendered view, S the source. "Both" means the map is set in each.
 
 |keymaps.preview| (R, default `<CR>`)~
   Preview the table, mermaid fence or image under the cursor in a popup; press
-  again to close. See |md-render-preview|.
+  again to close. On an image, where the terminal cannot draw the file itself,
+  the file is opened in the default application instead. See |md-render-preview|
+  and |md-render-inline|.
 
 |keymaps.open_image| (R, default `gx`)~
-  Open the image under the cursor with the system's default application.
-  Off an image the key goes back to Vim.
+  Open the image under the cursor with the system's default application. It
+  does the same on a terminal that can draw images; the transport is not
+  consulted. Off an image the key goes back to Vim.
 
 |keymaps.frame_next| (R and the popup, default `<C-n>`)~
   Show the next frame of the animated image under the cursor. In the popup it
-  steps while playback is paused.
+  steps while playback is paused. A card has no frames, so the key keeps its
+  ordinary meaning there.
 
 |keymaps.pause| (popup, default `<Space>`)~
   Pause or resume an animation playing in the popup. Bound only while an
@@ -349,11 +370,93 @@ meaning.
 ==============================================================================
 10. IMAGES AND ANIMATION                                 *md-render-images*
 
-A markdown image is drawn as character-cell artwork. PNG, JPEG, GIF, WebP, BMP,
-TIFF and ICO are supported. An image that cannot be drawn — a URL, a missing
-file, an unsupported format, one over the engine's limits — is shown as its alt
-text and nothing is reported: a picture the reader cannot see is not an error
-in the document. Images inside a table cell or a heading stay as alt text.
+A markdown image is drawn as a card: a box filled with the theme's raised
+surface, with the file's name and the size its header reports on the middle
+row. A card that no terminal paints the picture over is a compact placeholder,
+three rows tall and as wide as the picture's box; a card the picture is painted
+over takes the picture's box exactly, so the painting covers all of it. PNG,
+JPEG, GIF, WebP, BMP, TIFF and ICO are supported. An image that cannot be
+drawn — a URL, a missing file, an unsupported format, one over the engine's
+limits — is shown as its alt text instead of a card, and nothing is reported: a
+picture the reader cannot see is not an error in the document. Images inside a
+table cell or a heading stay as alt text.
+
+The card~
+  The compact card is three rows for every image, whatever its shape — or as
+  many rows as the page has, when it has fewer — so a document's placeholders
+  line up. Its width is the picture's box, raised to whatever its hint needs
+  and never wider than the window. Where a terminal paints the picture over the
+  card, the card takes exactly the box the artwork would have had, column for
+  column and row for row.
+
+  Switching |image_inline| re-renders the document without reflowing it: only
+  the picture's own rows change, and every one of them is attributed to the
+  reference's source line as the artwork's rows were.
+
+  The card carries a hint on its bottom row, a column in from its right edge:
+  `<CR>/gx open image`, naming whichever of |keymaps.preview| and
+  |keymaps.open_image| are bound — because neither a card nor an alt text says
+  by itself that a key opens the picture. With both set to `false` there is no
+  hint, and a compact card is then just the picture's box. The hint is virtual
+  text: it is drawn over the row at
+  the `MdRenderHint` group, which links to `Comment`, and never changes the
+  line's own bytes, so the card stays exactly as wide as the engine drew it. An
+  alt text — an image the engine cannot draw, and any image with |image_mode| =
+  `'off'` — carries the hint after its last row instead. The character-cell
+  artwork is left alone, and so is a card a terminal paints the picture over:
+  the picture says enough, and text under it would be erased by the next
+  placement.
+
+Inline pictures                                          *md-render-inline*
+  |image_inline| decides what happens to the card:
+
+  - `'auto'` (default) keeps the card on every terminal and, where the
+    terminal can draw (|md-render-graphics|), paints the picture over it.
+  - `'card'` keeps the card and paints nothing, on any terminal.
+  - `'art'` leaves the image to |image_mode|: the character-cell artwork, or
+    alt text with `'off'`.
+
+  A picture is painted over the rows of the block the window shows, and only
+  once the viewport has been still for |resize_debounce| milliseconds.
+  Scrolling, resizing, a re-render and a cursor move all ask for that one
+  repaint, so a wheel or a held key costs a burst one picture. A block the
+  window cuts in half is painted up to the edge: the engine cuts the shown rows
+  out of the whole block's picture, so what is on screen is the same picture at
+  the same scale — continuing above and below the window — rather than the
+  whole picture squeezed into the part that is left. The Kitty transport is
+  handed the file itself and cannot crop, so there a block is painted only
+  while it is wholly visible and keeps its card otherwise.
+
+  A floating window over the block owns its cells, so the block keeps its card
+  while one covers it, and gets its picture back when that window closes. This
+  is what keeps the preview popup's own image on top: the terminal draws
+  whatever was placed last, so a picture repainted under an open popup would
+  cover it.
+
+  What is painted is the file itself while it is no larger than
+  |image_inline_original_bytes| — at its own resolution, with no encode behind
+  it — and otherwise a thumbnail of it about 640 pixels across. A block the
+  window cuts is always the engine's encode, whatever the file's size: a
+  file's own bytes carry the whole picture, and the terminal cannot cut them.
+  On the Kitty transport the terminal reads the original file either way, but
+  only a PNG: that transport names the picture's format in the sequence and
+  decodes no other one, so a JPEG, a WebP or a file of any other format keeps
+  its card there.
+
+  The paint is not the buffer's content. Every motion, search, yank and edit
+  command acts on the card's text — an edit command cannot reach the file
+  through a picture — and the picture returns when the scroll stops. A full
+  redraw the plugin did not cause, `:redraw!` or `CTRL-L`, clears an OSC 1337
+  picture until the next scroll; a Kitty placement survives the redraw and is
+  deleted when its block leaves the window or R is left. A paint that fails —
+  an unreadable file, a terminal that ignores the placement — leaves the card
+  and says nothing.
+
+  On an image, |keymaps.preview| opens the popup where the terminal can draw
+  and otherwise opens the file in the default application, which is what
+  |keymaps.open_image| does everywhere. The preview popup itself is not
+  affected by |image_inline|. A card has no frames, so |keymaps.frame_next|
+  keeps its ordinary meaning there.
 
 Fitting~
   The image is fitted to the window's text width and height, and to
@@ -396,6 +499,10 @@ Native drawing                                          *md-render-graphics*
   artwork was laid out in, so its proportions can differ from the file's own by
   the terminal's cell shape. Nothing of the artwork is left showing at an edge.
 
+  The same transport is what paints an inline picture over its card. There the
+  OSC 1337 transport sends an encoded thumbnail in the block's cell box, and
+  the Kitty transport sends the file's path.
+
   `graphics = 'off'`, an unidentified terminal, a tmux or screen session, a
   URL or `data:` reference, or a file the plugin cannot read all leave the
   artwork visible and say nothing. An image over 8 MiB is not sent to the OSC
@@ -433,6 +540,8 @@ Native drawing                                          *md-render-graphics*
     failure);
   - which transport the preview popup draws images with, or which condition
     turned graphics off (a warning, not a failure);
+  - what an inline image becomes — a card, a card with the picture painted
+    over it, or the artwork — and why (a warning, not a failure);
   - the configured filetypes.
 
 It runs the engine twice, with a timeout, and never renders the buffer you are

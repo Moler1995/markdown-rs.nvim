@@ -173,6 +173,12 @@ local function preview_key(tag, want_open)
   return preview_report(tag, want_open)
 end
 
+--- Report the inline-picture state, waiting for the settle first.
+local function inline_report(tag)
+  md_call(string.format("inline_report('%s')", tag))
+  return read_report(tag)
+end
+
 --------------------------------------------------------------------------------
 -- Start the server and load the steps
 --------------------------------------------------------------------------------
@@ -599,6 +605,54 @@ local function body()
     tonumber(wide_diagram.popup_width) < tonumber(wide_diagram.popup_widest),
     string.format('popup window %s, content %s',
       wide_diagram.popup_width, wide_diagram.popup_widest))
+
+  ----------------------------------------------------------------------------
+  -- 6.4, an inline picture follows the viewport
+  ----------------------------------------------------------------------------
+
+  -- The one thing `nvim -l` cannot show: the settle is driven by `WinScrolled`
+  -- and `CursorMoved` arriving in the main loop, so a picture painted again
+  -- after a scroll exists only where a real loop runs. The terminal is stood in
+  -- for — no headless server has a UI — but the events, the debounce and the
+  -- wholly-visible rule are the plugin's own.
+  md_call('inline_reset()')
+  local rest = inline_report('inline_rest')
+  expect('6.4 the picture is wholly visible at rest', rest.visible, 'true')
+  truthy('6.4 and the settle placed it', tonumber(rest.placements) >= 1,
+    string.format('placements %s', rest.placements))
+  truthy('6.4 after a paint', tonumber(rest.paints) >= 1,
+    string.format('paints %s', rest.paints))
+
+  -- Partly visible: the top of the block is above the window's first row, so
+  -- the rectangle has no origin and the paint has to leave the card alone. The
+  -- scroll is one key with a count, so the burst is one final position; a
+  -- stream of single-row scrolls could be interrupted by a settle while the
+  -- block was still whole, and the check would then be about a race.
+  local partial = tonumber(rest.rect_top) + math.max(1, math.floor(tonumber(rest.rect_height) / 2))
+  step(string.format('%d<C-e>', partial))
+  local cut = inline_report('inline_partial')
+  expect('6.4 a partly visible block keeps the card', cut.placements, rest.placements)
+  expect('6.4 and no rectangle is on screen', cut.visible, 'false')
+  truthy('6.4 with the settle having run', tonumber(cut.paints) > tonumber(rest.paints),
+    string.format('paints %s, was %s', cut.paints, rest.paints))
+  truthy('6.4 and the placement taken off', tonumber(cut.deletes) >= 1,
+    string.format('deletes %s', cut.deletes))
+
+  -- Off the screen: nothing to place, and nothing left to take off.
+  step(string.format('%d<C-e>', tonumber(rest.rect_height)))
+  local away = inline_report('inline_away')
+  expect('6.4 a block scrolled out is not placed', away.placements, cut.placements)
+  expect('6.4 and stays off screen', away.visible, 'false')
+
+  -- Back: the settle places it again, which is the whole point of repainting
+  -- once the viewport comes to rest.
+  step('99<C-y>')
+  local back = inline_report('inline_back')
+  expect('6.4 the block is wholly visible again', back.visible, 'true')
+  truthy('6.4 and the settle placed it again', tonumber(back.placements) > tonumber(away.placements),
+    string.format('placements %s, was %s', back.placements, away.placements))
+
+  md_call('inline_restore()')
 end
 
 local ok, err = pcall(body)

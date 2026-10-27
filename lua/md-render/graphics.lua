@@ -35,6 +35,18 @@ local M = {}
 local ESC = string.char(27)
 -- The two-byte string terminator both protocols end with: `ESC \`.
 local ST = string.char(92)
+-- Save and restore the cursor around a placement: `DECSC` and `DECRC`.
+--
+-- Neovim's TUI remembers where it last put the cursor and skips a move that it
+-- believes is redundant. A raw CSI move sent behind its back therefore leaves
+-- the real cursor where the picture goes while the TUI still believes it is
+-- where the last frame left it — and the next text it writes without a move
+-- (a message echoed with `nvim_echo`, most visibly) lands on the picture
+-- instead of the message line. Measured in WezTerm: the status hint appeared
+-- over a card's cells and stayed there after being cleared. Restoring the
+-- cursor after the placement keeps the TUI's belief true.
+local SAVE_CURSOR = ESC .. '7'
+local RESTORE_CURSOR = ESC .. '8'
 
 --- The largest file an OSC placement carries, in bytes.
 ---
@@ -222,6 +234,29 @@ local function read_file(path, size)
   return data
 end
 
+--- The first eight bytes of every PNG.
+local PNG_SIGNATURE = '\137PNG\r\n\26\n'
+
+--- True when `path` is a PNG, read from its own bytes.
+---
+--- The path-carrying transport names the picture's format in the sequence
+--- (`f=100`), and kitty decodes only PNG there: any other file is answered with
+--- `EBADPNG:Not a PNG file` and nothing is drawn. A file that is not a PNG is
+--- therefore left as its card rather than sent to be refused. The bytes are
+--- read, not the name, because a `.png` that is not one would be refused too.
+function M.is_png(path)
+  if type(path) ~= 'string' or path == '' then
+    return false
+  end
+  local fd = vim.uv.fs_open(path, 'r', 438)
+  if not fd then
+    return false
+  end
+  local ok, head = pcall(vim.uv.fs_read, fd, #PNG_SIGNATURE, 0)
+  vim.uv.fs_close(fd)
+  return ok and type(head) == 'string' and head == PNG_SIGNATURE
+end
+
 --- How many graphics the module has described, so each gets its own id.
 ---
 --- A Kitty placement is named by an image id and a placement id, and re-placing
@@ -235,9 +270,9 @@ local next_id = 0
 --- an OSC plan carries the base64 the terminal needs, so a resize re-places it
 --- without touching the disk; a Kitty plan carries the path, because that is
 --- all its transport ever sends. A destination that is not a local file, one
---- that does not stat as a readable file, and one over `M.MAX_BYTES` on the
---- byte-carrying transport all mean nil — the popup keeps its artwork and says
---- nothing.
+--- that does not stat as a readable file, one over `M.MAX_BYTES` on the
+--- byte-carrying transport, and on the path-carrying one a file that is not a
+--- PNG all mean nil — the popup keeps its artwork and says nothing.
 function M.plan(ref, base, tier)
   tier = tier or M.tier()
   if not tier or not ref then
@@ -266,70 +301,341 @@ function M.plan(ref, base, tier)
       return nil
     end
     graphic.data = vim.base64.encode(data)
-  else
+  elseif M.is_png(path) then
     next_id = next_id + 1
     graphic.id = next_id
+  else
+    return nil
   end
 
   return graphic
 end
 
 --------------------------------------------------------------------------------
--- The sequences
+-- Inline payloads: the file itself, or a thumbnail of it
 --------------------------------------------------------------------------------
 
---- The cursor move that puts the next write at 0-based `position`.
-local function move_to(position)
-  return ESC .. '[' .. (position[1] + 1) .. ';' .. (position[2] + 1) .. 'H'
+--- The most thumbnails held in memory at once.
+---
+--- Each entry is one encoded picture, sized for the block it was asked about
+--- (a few hundred kilobytes at most), so the bound is about memory rather than
+--- about counting anything a reader watches. A document with many distinct
+--- pictures is read in a viewport's worth anyway; eviction is what keeps a long
+--- session from accumulating every one it ever scrolled past.
+M.THUMBNAIL_CACHE_LIMIT = 32
+
+local thumbnails = {}
+local thumbnail_order = {}
+
+--- Run the engine's `thumbnail` mode, writing the picture to `out`.
+---
+--- Returns true, or false and the engine's own message. Replaced by the
+--- headless suite, which has no engine and records the request instead: this is
+--- the one side effect the cache exists to avoid repeating, so it is also the
+--- one the checks count.
+function M.run_thumbnail(exe, source, cols, rows, background, out, crop)
+  local args = { exe, 'thumbnail', source, '--box', cols .. 'x' .. rows }
+  if crop then
+    args[#args + 1] = '--crop'
+    args[#args + 1] = crop.top .. 'x' .. crop.rows
+  end
+  args[#args + 1] = '--out'
+  args[#args + 1] = out
+  args[#args + 1] = '--background'
+  args[#args + 1] = background
+  local res = vim.system(args, { text = true }):wait()
+  if res.code ~= 0 then
+    return false, vim.trim(res.stderr or '')
+  end
+  return true
 end
 
---- The OSC 1337 sequence showing `data` in a `cols` x `rows` cell box.
+--- The identity a file is cached under.
 ---
---- Both dimensions are given, which is what makes the file stretch to the box
---- rather than derive one side from the terminal's true cell size (measured: a
---- width-only placement overflows a popup whose cells are not exactly 2:1).
---- `preserveAspectRatio=0` is what actually makes it stretch: WezTerm defaults
---- the parameter to *true*, and with it the given height is ignored and derived
---- from the width, which left the image letterboxed and the popup's last rows
---- showing the character artwork underneath (measured by hand). The box is the
---- one the artwork was laid out in, so filling it puts the two drawings on the
---- same pixels.
---- `doNotMoveCursor=1` leaves the cursor where Neovim put it; the placement is a
---- paint, not a move.
-function M.osc_sequence(position, cols, rows, data)
-  return move_to(position)
-    .. ESC .. ']1337;File=inline=1;width=' .. cols .. ';height=' .. rows
-    .. ';preserveAspectRatio=0;doNotMoveCursor=1:' .. data .. ESC .. ST
+--- The picture's own contents are left out: length and modification time are
+--- what a file system reports for a rewrite, and stat'ing is what a paint can
+--- afford.
+local function file_key(path, stat)
+  return table.concat({ path, stat.size, stat.mtime.sec, stat.mtime.nsec }, '\0')
 end
 
---- The Kitty sequence transmitting `path` and placing it as image `id`.
+--- The identity a thumbnail is cached under.
 ---
---- `t=f` says the payload is a path rather than the file's bytes, and the path
---- itself is base64 because the payload is binary-safe by definition. `C=1` is
---- "do not move the cursor", the counterpart of `doNotMoveCursor`; `q=2`
---- suppresses both the OK and the error reply, because there is no reply reader.
---- The image id and the placement id are the same number: the sequence places
---- exactly the image it transmits, and `M.kitty_delete` can free both.
-function M.kitty_sequence(position, cols, rows, id, path)
-  return move_to(position)
-    .. ESC .. '_Gi=' .. id .. ',a=T,t=f,p=' .. id
-    .. ',c=' .. cols .. ',r=' .. rows .. ',C=1,q=2;'
-    .. vim.base64.encode(path) .. ESC .. ST
+--- The box is part of it because the same picture at another size is another
+--- encode, and so is the crop: the rows a half-scrolled block shows are another
+--- picture, and scrolling a row is another request. The background is
+--- deliberately not: it is the theme's, and a theme change re-renders the
+--- document through a path that is not this cache.
+local function thumbnail_key(path, stat, cols, rows, crop)
+  local top = crop and crop.top or 0
+  local height = crop and crop.rows or rows
+  return file_key(path, stat) .. '\0' .. cols .. '\0' .. rows .. '\0' .. top .. '\0' .. height
 end
 
---- The Kitty sequence deleting image `id` and its placement.
+--- Mark `key` as the most recently used entry of `order`.
+local function touch(order, key)
+  for i = #order, 1, -1 do
+    if order[i] == key then
+      table.remove(order, i)
+      break
+    end
+  end
+  order[#order + 1] = key
+end
+
+--- Keep `value` under `key`, dropping the least recently used past `limit`.
+local function remember(store, order, limit, key, value)
+  touch(order, key)
+  store[key] = value
+  while #order > limit do
+    local oldest = table.remove(order, 1)
+    store[oldest] = nil
+  end
+end
+
+--- The encoded picture for `path` in a `cols` x `rows` cell box, or nil.
 ---
---- Required, not defensive: a Kitty placement is attached to the cells it
---- covers and survives their being rewritten, so closing the popup would leave
---- it on screen. `d=I` deletes the image and every placement of it, which is
---- exactly the one `M.place` made.
-function M.kitty_delete(id)
-  return ESC .. '_Ga=d,d=I,i=' .. id .. ',q=2' .. ESC .. ST
+--- `background` is the `#rrggbb` the engine letterboxes with, so the placement
+--- is a clean rectangle over the card rather than one with the card showing at
+--- its edges. `path` should already be resolved: it is made absolute here only
+--- because the cache is keyed on it, and two spellings of one file would
+--- otherwise be two entries and two engine runs.
+---
+--- Every failure answers nil and says nothing: no engine, an unreadable file, a
+--- refusal, an output that did not arrive. The card is already on screen, which
+--- is exactly what a failed paint is supposed to cost.
+---
+--- `crop` asks for part of the box, as `{ top, rows }` in its cells: a block the
+--- window cuts in half is painted with the rows still on screen, cut exactly
+--- where the window's edge is, instead of squeezed or left as a card.
+function M.thumbnail(path, cols, rows, background, crop)
+  if not path or path == '' or not cols or not rows or cols < 1 or rows < 1 then
+    return nil
+  end
+  if not link.is_absolute(path) then
+    path = vim.fn.fnamemodify(path, ':p')
+  end
+  local stat = vim.uv.fs_stat(path)
+  if not stat or stat.type ~= 'file' or stat.size == 0 then
+    return nil
+  end
+
+  local key = thumbnail_key(path, stat, cols, rows, crop)
+  local cached = thumbnails[key]
+  if cached then
+    touch(thumbnail_order, key)
+    return cached
+  end
+
+  local exe = require('md-render.engine').resolve(config.options.engine)
+  if not exe then
+    return nil
+  end
+
+  -- The engine writes a file rather than a stream: its stdout carries the
+  -- document in every other mode, and a picture is not something a caller can
+  -- tell apart from a broken document by looking at a prefix.
+  local out = vim.fn.tempname()
+  local ok = M.run_thumbnail(exe, path, cols, rows, background or '#000000', out, crop)
+  local bytes
+  if ok then
+    local read_ok, blob = pcall(vim.fn.readblob, out)
+    if read_ok and type(blob) == 'string' and #blob > 0 then
+      bytes = blob
+    end
+  end
+  pcall(vim.fn.delete, out)
+
+  if not bytes then
+    return nil
+  end
+  remember(thumbnails, thumbnail_order, M.THUMBNAIL_CACHE_LIMIT, key, bytes)
+  return bytes
+end
+
+--- The most files kept for sending as they are, at once.
+---
+--- Bounded by count rather than by bytes: the option that lets a file through
+--- is a byte count, so this is a handful of files of at most that size.
+M.ORIGINAL_CACHE_LIMIT = 16
+
+local originals = {}
+local original_order = {}
+
+--- True when `data` is a still picture the terminal draws by itself.
+---
+--- PNG and JPEG are the two formats every OSC 1337 client decodes. A PNG
+--- carrying an `acTL` chunk is an APNG, which WezTerm and iTerm2 would play by
+--- itself; the inline view is one still picture, so that one keeps its
+--- thumbnail. Anything else is left to the engine, which decodes formats the
+--- terminal may not and always writes a still frame.
+local function still_picture(data)
+  if data:sub(1, 8) == '\137PNG\r\n\26\n' then
+    return not data:find('acTL', 1, true)
+  end
+  return data:sub(1, 3) == '\255\216\255'
+end
+
+--- The file's own bytes, when sending them as they are is the better trade, or
+--- nil.
+---
+--- A file no larger than `image_inline_original_bytes` is sent unchanged: the
+--- picture keeps the resolution it has, instead of the fixed-width thumbnail
+--- the engine would encode, and the payload is small enough that a settle
+--- re-sending it costs less than the engine run it replaces. Everything else —
+--- a larger file, an animation, a nested format, a file that cannot be read —
+--- answers nil and is left to `M.thumbnail`.
+---
+--- Cached like a thumbnail: a settle repaints blocks that did not change, and
+--- re-reading the file each time would be the one cost this path exists to
+--- avoid. `path` should already be resolved; it is made absolute here only
+--- because the cache is keyed on it.
+function M.original(path)
+  if not path or path == '' then
+    return nil
+  end
+  if not link.is_absolute(path) then
+    path = vim.fn.fnamemodify(path, ':p')
+  end
+  local stat = vim.uv.fs_stat(path)
+  if not stat or stat.type ~= 'file' or stat.size == 0 then
+    return nil
+  end
+  -- A value that is not a number is no reason for a paint to raise: the card is
+  -- already on screen, and the thumbnail is the safe answer.
+  local limit = math.min(tonumber(config.options.image_inline_original_bytes) or 0, M.MAX_BYTES)
+  if limit <= 0 or stat.size > limit then
+    return nil
+  end
+
+  local key = file_key(path, stat)
+  local cached = originals[key]
+  if cached then
+    touch(original_order, key)
+    return cached
+  end
+
+  local data = read_file(path, stat.size)
+  if not data or not still_picture(data) then
+    return nil
+  end
+  remember(originals, original_order, M.ORIGINAL_CACHE_LIMIT, key, data)
+  return data
+end
+
+--- What is painted over a block on the byte-carrying transport.
+---
+--- The file itself when it is small enough to send unchanged, and otherwise the
+--- thumbnail the engine encodes for exactly this box — scaled to about 640
+--- pixels across and letterboxed with the card's own surface. Every failure
+--- answers nil, which leaves the card.
+---
+--- `crop` is the part of the box the window is showing. A file's own bytes carry
+--- the whole picture, so a crop always goes through the engine, which cuts the
+--- rows out of the box: the terminal cannot crop what it is handed.
+function M.inline_bytes(path, cols, rows, background, crop)
+  if not crop then
+    local data = M.original(path)
+    if data then
+      return data
+    end
+  end
+  return M.thumbnail(path, cols, rows, background, crop)
 end
 
 --------------------------------------------------------------------------------
--- Placing and removing
+-- Where a block is
 --------------------------------------------------------------------------------
+
+--- The text of one wire line, its spans concatenated.
+local function line_text(line)
+  local parts = {}
+  for _, span in ipairs(line.spans or {}) do
+    parts[#parts + 1] = span[2]
+  end
+  return table.concat(parts)
+end
+
+--- The rectangle `source`'s block occupies in `doc`, as `{ top, height, width }`.
+---
+--- `top` is the first display row, 0-based as the document counts them, and
+--- `height` is how many rows the block produced. The engine attributes every
+--- row of a block to the block's source line and blocks are laid out in order,
+--- so the run is found by walking out from the first matching row rather than
+--- by looking for edges. `width` is the widest of those rows in display
+--- columns: the paint is a rectangle, and a card's rows are not padded.
+---
+--- Empty rows are excluded from both ends. The engine attributes the blank
+--- separator after a block to that block's source line — there is no other line
+--- it could belong to — and it is not a cell of the picture: counting it would
+--- make a block one row taller than the document shows, and a picture that
+--- exactly fills the window could then never be placed at all.
+---
+--- A reference the engine could not draw has one row of alt text, which is the
+--- same rectangle shape, so the caller does not have to know which it got.
+function M.rect(doc, source)
+  if not doc or not doc.lines or source == nil then
+    return nil
+  end
+  local top, last, width
+  for i, line in ipairs(doc.lines) do
+    if line.source == source then
+      local w = vim.fn.strdisplaywidth(line_text(line))
+      if w > 0 then
+        top = top or i - 1
+        last = i - 1
+        width = math.max(width or 0, w)
+      end
+    elseif top then
+      break
+    end
+  end
+  if not top then
+    return nil
+  end
+  return { top = top, height = last - top + 1, width = width }
+end
+
+--- The part of `rect` the window is showing, as `{ top, rows, origin }`, or nil
+--- when it shows none of it.
+---
+--- `top` is the first visible row, 0-based as the document counts rows; `rows`
+--- is how many of the block's rows are inside the window; `origin` is the
+--- screen cell that row starts at. All of the block gives `rect.top`,
+--- `rect.height` and the block's own corner; a block the window cuts in half
+--- gives the half that is on screen.
+---
+--- The visible rows are the window's own answer — `w0` and `w$` are the first
+--- and last lines it displays — rather than a row count added to `topline`,
+--- because `scrolloff` and a partly drawn last line are easy to get wrong by
+--- arithmetic. `screenpos` then turns the row into a cell: it is the
+--- independent measure of where a cell is, which is why the window's own
+--- position is not used.
+---
+--- The cursor line and `scrolloff` are not consulted: what the window shows is
+--- the question, not where the cursor is.
+function M.slice(win, rect)
+  if not rect or not vim.api.nvim_win_is_valid(win) then
+    return nil
+  end
+  local first, last = unpack(vim.api.nvim_win_call(win, function()
+    return { vim.fn.line('w0'), vim.fn.line('w$') }
+  end))
+  local top = math.max(rect.top + 1, first)
+  local bottom = math.min(rect.top + rect.height, last)
+  if bottom < top then
+    return nil
+  end
+  local position = vim.fn.screenpos(win, top, 1)
+  if not position or position.row == 0 then
+    return nil
+  end
+  return {
+    top = top - 1,
+    rows = bottom - top + 1,
+    origin = { position.row - 1, position.col - 1 },
+  }
+end
 
 --- The cells the window's border takes above and to the left of its text.
 ---
@@ -349,6 +655,288 @@ local function frame_offset(win)
   end
   return 1
 end
+
+--- Whether a floating window in `win`'s tabpage covers any cell of `rect`.
+---
+--- A placement is a paint over cells, and the terminal draws it wherever it was
+--- told, in front of whatever is there. A float over the block hides the block,
+--- so the picture has no business on screen — and on the cell-carrying
+--- transport it is worse than useless: WezTerm keeps one cell grid and one
+--- image layer for the whole tab, so a settle that re-placed the block after the
+--- preview popup opened drew the inline picture *over* the popup's own, which is
+--- what a hand check saw. Skipping the block leaves the popup's picture alone.
+---
+--- Every floating window counts, not only the preview: a hover, a completion
+--- menu or a `:help` float takes the same cells for the same reason. The frame
+--- is what a placement is a rectangle over, so the border is counted too.
+---
+--- Only the tabpage `win` is in is asked. A float in another tabpage is not on
+--- screen with the block, and `nvim_win_get_position` would answer about a grid
+--- nobody is looking at.
+function M.occluded(win, rect, origin)
+  if not rect or not origin or not vim.api.nvim_win_is_valid(win) then
+    return false
+  end
+  local bottom = origin[1] + rect.height - 1
+  local right = origin[2] + rect.width - 1
+  for _, other in ipairs(vim.api.nvim_tabpage_list_wins(vim.api.nvim_win_get_tabpage(win))) do
+    local config_other = vim.api.nvim_win_get_config(other)
+    if other ~= win and config_other.relative ~= '' and not config_other.hide then
+      local offset = frame_offset(other)
+      local frame = vim.api.nvim_win_get_position(other)
+      local top = frame[1] + offset
+      local left = frame[2] + offset
+      local other_bottom = top + vim.api.nvim_win_get_height(other) - 1
+      local other_right = left + vim.api.nvim_win_get_width(other) - 1
+      if top <= bottom and other_bottom >= origin[1]
+        and left <= right and other_right >= origin[2]
+      then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+--- The colour the picture is letterboxed with: the block's own background.
+---
+--- The card's first drawn row carries its surface in its span styles, which is
+--- the same colour the engine will letterbox with, so the placeholder and the
+--- picture agree without the plugin knowing any theme's palette. `nil` when the
+--- block has no background of its own, which is every artwork encoding and none
+--- of the cards.
+local function block_background(doc, rect)
+  local line = doc.lines[rect.top + 1]
+  for _, span in ipairs(line and line.spans or {}) do
+    local style = span[1] and doc.styles[span[1] + 1]
+    if style and style.bg then
+      return style.bg
+    end
+  end
+  return nil
+end
+
+--------------------------------------------------------------------------------
+-- Inline placements
+--------------------------------------------------------------------------------
+
+--- The inline Kitty placements, per window and source line.
+---
+--- A Kitty placement is anchored to the cells it was drawn over and outlives
+--- their being rewritten. That is what makes it have to be named when it should
+--- go: a block scrolled out of the window would otherwise keep its picture over
+--- whatever moved into those cells, and so would a window returning to the
+--- source. An OSC placement lives in the cells themselves, which any rewrite
+--- erases, so nothing is kept for it.
+local inline = {}
+
+--- Take every inline placement off `win`.
+---
+--- Called when the window stops showing R — a toggle to S, another document
+--- arriving in the window, the window closing — because the rewrite that
+--- follows does not remove a Kitty placement by itself.
+function M.clear(win)
+  local records = inline[win]
+  if not records then
+    return
+  end
+  inline[win] = nil
+  local sources = {}
+  for source in pairs(records) do
+    sources[#sources + 1] = source
+  end
+  -- Sorted so that a delete burst is in the same order whatever the hash table
+  -- did, which keeps the wire and any test that pins it reproducible.
+  table.sort(sources)
+  for _, source in ipairs(sources) do
+    M.send(M.kitty_delete(records[source].id))
+  end
+end
+
+--- Paint each image block in `win`, over the rows the window shows.
+---
+--- `doc` is the document R is showing, `lines` its source, and `base` the
+--- directory relative references resolve against. A block the window cuts in
+--- half is painted over the half on screen, with the picture cut at the same
+--- row: the byte-carrying transport has nothing that can crop, so the engine
+--- encodes the rows (`M.thumbnail`'s crop) exactly as the artwork would have
+--- shown them. The path-carrying transport hands the terminal a path and cannot
+--- cut it, so there only a wholly visible block is painted; the rest keep their
+--- card.
+---
+--- A block a floating window covers is left alone: the float is on top, and a
+--- picture painted over its cells goes on top of the float. The comparison is
+--- against the rows on screen, since the covered part is not being shown anyway.
+---
+--- One send per block, for the transport that needs one: the byte-carrying
+--- transport sends the file itself while the block is wholly visible and the
+--- file is small enough to send unchanged, and otherwise the engine's encode of
+--- the block's box — cut to the rows on screen when the window cuts it; the
+--- path-carrying one sends the path of a PNG file, which the terminal reads
+--- itself, and leaves a file of any other format as its card, because that
+--- transport decodes only PNG.
+--- A block that was placed and is not in this pass is deleted, because the
+--- rewrite that stopped showing it does not remove a Kitty placement.
+--- Nothing here waits, and nothing is reported: every failure — no transport, a
+--- destination that is not a local file, an unreadable file, an engine refusal —
+--- leaves the card, which is what the reader is already looking at.
+function M.paint(win, doc, lines, base)
+  local tier = M.tier()
+  if not tier or not doc or not doc.lines or not lines then
+    return
+  end
+
+  local wanted = {}
+  local seen = {}
+  for i = 1, #lines do
+    local source = i - 1
+    if not seen[source] then
+      seen[source] = true
+      local images = link.images(lines, source)
+      if #images > 0 then
+        local rect = M.rect(doc, source)
+        local slice = rect and M.slice(win, rect)
+        -- A floating window over the block owns those cells: the picture would
+        -- be drawn in front of the float's own content, which is the popup's
+        -- picture on the transport that keeps one image layer for the tab.
+        if slice and M.occluded(win,
+          { top = slice.top, height = slice.rows, width = rect.width },
+          slice.origin) then
+          slice = nil
+        end
+        local path = rect and M.resolve(images[1].target, base)
+        local stat = path and vim.uv.fs_stat(path)
+        if slice and stat and stat.type == 'file' and stat.size > 0 then
+          local whole = slice.rows == rect.height
+          if tier == 'osc' then
+            local crop = not whole
+              and { top = slice.top - rect.top, rows = slice.rows } or nil
+            -- The box is the block's, not the slice's: the engine fits the
+            -- picture in the whole card and then cuts the rows, so the part on
+            -- screen is the same picture at the same scale, continuing above and
+            -- below the window's edge. Handing it the slice's height would make
+            -- the crop fall outside the box it was measured against.
+            local bytes = M.inline_bytes(path, rect.width, rect.height,
+              block_background(doc, rect) or '#000000', crop)
+            if bytes then
+              M.send(M.osc_sequence(slice.origin, rect.width, slice.rows,
+                vim.base64.encode(bytes)))
+            end
+          elseif whole and M.is_png(path) then
+            -- The path transport carries a path and names PNG as its format;
+            -- kitty refuses every other file with `EBADPNG`, so a picture it
+            -- cannot decode keeps its card rather than being sent to fail.
+            -- The id is kept for as long as the block stays placed: sending the
+            -- same one again replaces the placement rather than adding a second
+            -- picture over it, so a repaint costs one image, not a growing pile.
+            local before = inline[win] and inline[win][source]
+            local id = before and before.id
+            if not id then
+              next_id = next_id + 1
+              id = next_id
+            end
+            M.send(M.kitty_sequence(slice.origin, rect.width, rect.height, id, path))
+            wanted[source] = { id = id }
+          end
+        end
+      end
+    end
+  end
+
+  if tier == 'osc' then
+    return
+  end
+
+  -- Whatever was placed and is not in this pass is off the screen now — the
+  -- block scrolled out, lost its image, or the document no longer places one
+  -- there — and a Kitty placement has to be deleted rather than overwritten.
+  local previous = inline[win]
+  if previous then
+    local stale = {}
+    for source in pairs(previous) do
+      if not wanted[source] then
+        stale[#stale + 1] = source
+      end
+    end
+    table.sort(stale)
+    for _, source in ipairs(stale) do
+      M.send(M.kitty_delete(previous[source].id))
+      previous[source] = nil
+    end
+  end
+  inline[win] = next(wanted) == nil and nil or wanted
+end
+
+--------------------------------------------------------------------------------
+-- The sequences
+--------------------------------------------------------------------------------
+
+--- The cursor move that puts the next write at 0-based `position`.
+---
+--- Always paired with `SAVE_CURSOR` and `RESTORE_CURSOR` by the sequences
+--- below: the move exists for the placement to anchor at, not for the TUI.
+local function move_to(position)
+  return ESC .. '[' .. (position[1] + 1) .. ';' .. (position[2] + 1) .. 'H'
+end
+
+--- The OSC 1337 sequence showing `data` in a `cols` x `rows` cell box.
+---
+--- Both dimensions are given, which is what makes the file stretch to the box
+--- rather than derive one side from the terminal's true cell size (measured: a
+--- width-only placement overflows a popup whose cells are not exactly 2:1).
+--- `preserveAspectRatio=0` is what actually makes it stretch: WezTerm defaults
+--- the parameter to *true*, and with it the given height is ignored and derived
+--- from the width, which left the image letterboxed and the popup's last rows
+--- showing the character artwork underneath (measured by hand). The box is the
+--- one the artwork was laid out in, so filling it puts the two drawings on the
+--- same pixels.
+--- `doNotMoveCursor=1` leaves the cursor at the placement's origin; the
+--- save/restore around the whole sequence is what puts it back where the TUI
+--- last left it, so the TUI's next write lands where it says it will.
+function M.osc_sequence(position, cols, rows, data)
+  return SAVE_CURSOR .. move_to(position)
+    .. ESC .. ']1337;File=inline=1;width=' .. cols .. ';height=' .. rows
+    .. ';preserveAspectRatio=0;doNotMoveCursor=1:' .. data .. ESC .. ST
+    .. RESTORE_CURSOR
+end
+
+--- The Kitty sequence transmitting `path` and placing it as image `id`.
+---
+--- `t=f` says the payload is a path rather than the file's bytes, and the path
+--- itself is base64 because the payload is binary-safe by definition. `f=100`
+--- is not optional: omitted, kitty takes the file for raw RGBA, whose width and
+--- height are zero when unnamed, and refuses the whole transmission with
+--- `EINVAL:Zero width/height not allowed` — measured against kitty 0.32, where
+--- a path placement without it draws nothing at all. `100` is PNG, the only
+--- format the path transport decodes (`M.is_png` is what callers check).
+--- `C=1` is "do not move the cursor", the counterpart of `doNotMoveCursor`;
+--- `q=2` suppresses both the OK and the error reply, because there is no reply
+--- reader. The image id and the placement id are the same number: the sequence
+--- places exactly the image it transmits, and `M.kitty_delete` can free both.
+---
+--- The save/restore around the sequence has the same reason as the OSC one:
+--- the move is for the placement to anchor at, not for the editor to adopt.
+function M.kitty_sequence(position, cols, rows, id, path)
+  return SAVE_CURSOR .. move_to(position)
+    .. ESC .. '_Gi=' .. id .. ',a=T,t=f,f=100,p=' .. id
+    .. ',c=' .. cols .. ',r=' .. rows .. ',C=1,q=2;'
+    .. vim.base64.encode(path) .. ESC .. ST
+    .. RESTORE_CURSOR
+end
+
+--- The Kitty sequence deleting image `id` and its placement.
+---
+--- Required, not defensive: a Kitty placement is attached to the cells it
+--- covers and survives their being rewritten, so closing the popup would leave
+--- it on screen. `d=I` deletes the image and every placement of it, which is
+--- exactly the one `M.place` made.
+function M.kitty_delete(id)
+  return ESC .. '_Ga=d,d=I,i=' .. id .. ',q=2' .. ESC .. ST
+end
+
+--------------------------------------------------------------------------------
+-- Placing and removing
+--------------------------------------------------------------------------------
 
 --- Place `graphic` over `win`'s interior.
 ---

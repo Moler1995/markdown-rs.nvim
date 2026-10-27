@@ -192,6 +192,38 @@ fn rendering_an_image_twice_is_byte_identical() {
     assert_eq!(first, second);
 }
 
+/// A compact card is the picture's width at the height the caller asked for,
+/// and every row of it still belongs to the reference's own source line.
+#[test]
+fn a_compact_card_takes_its_height_and_keeps_the_source_mapping() {
+    for name in ["image_sample.png", "image_sample.jpg"] {
+        let doc = render(
+            &image_document(name),
+            80,
+            ImageOptions {
+                encoding: ImageEncoding::Card,
+                card_rows: 3,
+                ..ImageOptions::default()
+            },
+        );
+        let rows: Vec<&WireLine> = doc
+            .lines
+            .iter()
+            .filter(|line| line.source == Some(0) && display_width(line) > 0)
+            .collect();
+        assert_eq!(rows.len(), 3, "{name}: a compact card is three rows");
+        let width = display_width(rows[0]);
+        assert!(
+            rows.iter().all(|line| display_width(line) == width),
+            "{name}: every card row is the picture's width"
+        );
+        assert!(
+            rows.iter().all(|line| line.source == Some(0)),
+            "{name}: every card row belongs to the reference"
+        );
+    }
+}
+
 /// A palette colour in the wire format: `#rrggbb`, the same spelling
 /// `wire::color_to_wire` uses for `Color::Rgb`.
 fn colour_hex(colour: &md_render::style::Color) -> String {

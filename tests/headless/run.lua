@@ -723,10 +723,15 @@ section('10.2', function()
   local width = vim.api.nvim_win_get_width(st.win)
     - (vim.fn.getwininfo(st.win)[1].textoff or 0)
   local height = image_height(st.win)
-  local encoding = config.image_encoding()
+  -- What the render was keyed on: the presentation, not `image_mode` on its
+  -- own. With the default `image_inline` that is the card, and a key built from
+  -- `image_encoding()` would fail to find the document it just cached.
+  local encoding = config.image_inline_encoding()
   local tick = vim.api.nvim_buf_get_changedtick(source)
   local theme = config.options.theme
-  local image = config.image_options()
+  -- Built the way the render builds it, card shape included: this runner has
+  -- no UI, so a card here is the compact one.
+  local image = config.image_options(graphics.available())
 
   truthy('10.2 the render is cached under its whole key',
     state.cached(source, tick, width, height, encoding, theme, false, image) ~= nil)
@@ -740,7 +745,9 @@ section('10.2', function()
     state.cached(source, tick + 1, width, height, encoding, theme, false, image), nil)
   expect('10.2 another theme is a different render',
     state.cached(source, tick, width, height, encoding, 'nord', false, image), nil)
-  for _, field in ipairs({ 'palette', 'background', 'dither', 'min_rows', 'sharpen' }) do
+  for _, field in ipairs({
+    'palette', 'background', 'dither', 'min_rows', 'sharpen', 'card_rows', 'card_min_width',
+  }) do
     local changed = vim.deepcopy(image)
     if type(changed[field]) == 'boolean' then
       changed[field] = not changed[field]
@@ -2592,9 +2599,11 @@ section('14.1', function()
 
   local termguicolors = vim.o.termguicolors
 
-  -- 5.4: `auto` follows 'termguicolors' at request time.
+  -- 5.4: `auto` follows 'termguicolors' at request time. `art` because the
+  -- encoding it resolves to is what this section is about; the default
+  -- presentation would be a card on either kind of terminal.
   vim.o.termguicolors = false
-  config.setup({})
+  config.setup({ image_inline = 'art' })
   truthy('14.1 in R on a document with an image', reset_to(image_fixture))
   local win = vim.api.nvim_get_current_win()
   local cmd = commands[#commands]
@@ -2708,7 +2717,7 @@ section('14.5', function()
   -- 5.6: a shorter window means a shorter image, and the picture keeps its
   -- shape rather than being cropped.
   local image_fixture = repo .. '/tests/fixtures/image.md'
-  config.setup({ image_mode = 'blocks' })
+  config.setup({ image_mode = 'blocks', image_inline = 'art' })
   truthy('14.5 in R on a document with an image', reset_to(image_fixture))
   local st = current_state()
   local height = vim.api.nvim_win_get_height(st.win)
@@ -2774,7 +2783,7 @@ section('14.6', function()
     return rows, widest
   end
 
-  config.setup({ image_mode = 'blocks', image_max_height = 4 })
+  config.setup({ image_mode = 'blocks', image_inline = 'art', image_max_height = 4 })
   truthy('14.6 in R with a 4-row cap', reset_to(image_fixture))
   local height = vim.api.nvim_win_get_height(current_state().win)
   truthy('14.6 the window is taller than the cap', height > 4,
@@ -2790,7 +2799,7 @@ section('14.6', function()
 
   -- `false` means no cap. nil could not: `setup` merges tables, and a nil value
   -- is indistinguishable from a missing key.
-  config.setup({ image_mode = 'blocks', image_max_height = false })
+  config.setup({ image_mode = 'blocks', image_inline = 'art', image_max_height = false })
   truthy('14.6 in R with the cap off', reset_to(image_fixture))
   expect('14.6 without the cap the engine gets the page height',
     find_arg(commands[#commands], '--image-max-height'),
@@ -3077,7 +3086,9 @@ section('2.4', function()
     return nil
   end
 
-  config.setup({ image_mode = 'blocks' })
+  -- The artwork itself: `art` keeps the dots these checks look for. The
+  -- default presentation is the subject of 3.1-3.6 of the inline-image change.
+  config.setup({ image_mode = 'blocks', image_inline = 'art' })
   truthy('2.4 in R on a document with a drawn image', reset_to(image_fixture))
 
   local rendered, st = rows()
@@ -3167,7 +3178,7 @@ local function render_doc(source, path, view)
 end
 
 section('3.1', function()
-  config.setup({ image_mode = 'blocks' })
+  config.setup({ image_mode = 'blocks', image_inline = 'art' })
   truthy('3.1 in R on the animated fixture', reset_to(animated_fixture))
   local st = current_state()
   local first = artwork_row(st)
@@ -3232,7 +3243,7 @@ end)
 --------------------------------------------------------------------------------
 
 section('3.2', function()
-  config.setup({ image_mode = 'blocks' })
+  config.setup({ image_mode = 'blocks', image_inline = 'art' })
   truthy('3.2 in R on the animated fixture', reset_to(animated_fixture))
   local st = current_state()
   local row = artwork_row(st)
@@ -3295,7 +3306,7 @@ section('3.3', function()
   -- enters the main loop, so a pending operator (`g@`) is flushed by the time
   -- the feed returns and cannot be observed. A `w` that moves the cursor is the
   -- same proof — the key reached Vim rather than being swallowed.
-  config.setup({ image_mode = 'blocks', keymaps = { frame_next = 'w' } })
+  config.setup({ image_mode = 'blocks', image_inline = 'art', keymaps = { frame_next = 'w' } })
   truthy('3.3 in R on the animated fixture', reset_to(animated_fixture))
   local st = current_state()
   local row = artwork_row(st)
@@ -3317,7 +3328,8 @@ section('3.3', function()
 
   -- Even on the artwork it is fetched, not consumed. `image_animation = false`
   -- takes the key out of the plugin's hands entirely.
-  config.setup({ image_mode = 'blocks', keymaps = { frame_next = 'w' }, image_animation = false })
+  config.setup({ image_mode = 'blocks', image_inline = 'art', keymaps = { frame_next = 'w' },
+    image_animation = false })
   truthy('3.3 in R with animation off', reset_to(animated_fixture))
   st = current_state()
   vim.api.nvim_win_set_cursor(st.win, { artwork_row(st) + 1, 0 })
@@ -3335,7 +3347,7 @@ end)
 --------------------------------------------------------------------------------
 
 section('3.4', function()
-  config.setup({ image_mode = 'blocks' })
+  config.setup({ image_mode = 'blocks', image_inline = 'art' })
   truthy('3.4 in R on the animated fixture', reset_to(animated_fixture))
   local st = current_state()
   local row = artwork_row(st)
@@ -3365,7 +3377,7 @@ end)
 --------------------------------------------------------------------------------
 
 section('3.5', function()
-  config.setup({ image_mode = 'blocks' })
+  config.setup({ image_mode = 'blocks', image_inline = 'art' })
   truthy('3.5 in R on the animated fixture', reset_to(animated_fixture))
   local st = current_state()
   local row = artwork_row(st)
@@ -3402,7 +3414,7 @@ end)
 --------------------------------------------------------------------------------
 
 section('3.6', function()
-  config.setup({ image_mode = 'blocks' })
+  config.setup({ image_mode = 'blocks', image_inline = 'art' })
   local path = repo .. '/tests/fixtures/too-large-animation.md'
   truthy('3.6 in R on the over-cap fixture', reset_to(path))
   local st = current_state()
@@ -3445,7 +3457,7 @@ end)
 --------------------------------------------------------------------------------
 
 section('3.7', function()
-  config.setup({ image_mode = 'blocks' })
+  config.setup({ image_mode = 'blocks', image_inline = 'art' })
   local path = repo .. '/tests/fixtures/animated.md'
   truthy('3.7 in R on the animated fixture', reset_to(path))
   local st = current_state()
@@ -3508,7 +3520,7 @@ end)
 --------------------------------------------------------------------------------
 
 section('3.8', function()
-  config.setup({ image_mode = 'blocks' })
+  config.setup({ image_mode = 'blocks', image_inline = 'art' })
   local path = repo .. '/tests/fixtures/sampled-animation.md'
   truthy('3.8 in R on the sampled fixture', reset_to(path))
   local st = current_state()
@@ -3541,7 +3553,7 @@ end)
 --------------------------------------------------------------------------------
 
 section('4.1', function()
-  config.setup({ image_mode = 'blocks' })
+  config.setup({ image_mode = 'blocks', image_inline = 'art' })
 
   local opened = {}
   local real_open = vim.ui.open
@@ -3658,7 +3670,7 @@ end)
 --------------------------------------------------------------------------------
 
 section('4.3', function()
-  config.setup({ image_mode = 'blocks' })
+  config.setup({ image_mode = 'blocks', image_inline = 'art' })
 
   local real_open = vim.ui.open
   vim.ui.open = function()
@@ -3688,7 +3700,7 @@ end)
 local inline_fixture = repo .. '/tests/fixtures/inline-image.md'
 
 section('5.1', function()
-  config.setup({ image_mode = 'blocks' })
+  config.setup({ image_mode = 'blocks', image_inline = 'art' })
   truthy('5.1 in R on a document with an inline image', reset_to(inline_fixture))
   local st = current_state()
   -- The engine draws an inline image too, so the paragraph is a run of artwork
@@ -3783,37 +3795,69 @@ end)
 -- 5.2 The preview key on an image
 --------------------------------------------------------------------------------
 
+--- Pretend this runner is a terminal the plugin can draw in.
+---
+--- An *image's* popup is the picture the terminal draws; where the terminal
+--- cannot draw, the preview key takes the file to its own viewer instead. A
+--- headless runner can do neither, so the sections whose subject is the popup
+--- itself run as if a graphic were possible. Kitty rather than OSC 1337,
+--- because these sections are about the artwork's playback and only the
+--- path-reading transport asks the engine for frames. `send` is captured
+--- rather than written, so no sequence reaches the runner's own output.
+local function drawing_terminal()
+  local real = {
+    has_send = graphics.has_send,
+    uis = graphics.uis,
+    env = graphics.env,
+    send = graphics.send,
+  }
+  graphics.has_send = function() return true end
+  graphics.uis = function() return { {} } end
+  graphics.env = function() return { TERM = 'xterm-kitty' } end
+  graphics.send = function() end
+  return function()
+    graphics.has_send, graphics.uis, graphics.env, graphics.send =
+      real.has_send, real.uis, real.env, real.send
+  end
+end
+
 section('5.2', function()
   -- A motion stands in for the key so that "falls through" is observable under
   -- `nvim -l`, which never enters the main loop.
-  config.setup({ image_mode = 'blocks', keymaps = { preview = 'w' } })
-  truthy('5.2 in R on the animated fixture', reset_to(animated_fixture))
-  local st = current_state()
-  local art = artwork_row(st)
-  truthy('5.2 the artwork is drawn', art ~= nil)
-  vim.api.nvim_win_set_cursor(st.win, { art + 1, 0 })
+  local restore = drawing_terminal()
+  local ok, err = pcall(function()
+    config.setup({ image_mode = 'blocks', image_inline = 'art', keymaps = { preview = 'w' } })
+    truthy('5.2 in R on the animated fixture', reset_to(animated_fixture))
+    local st = current_state()
+    local art = artwork_row(st)
+    truthy('5.2 the artwork is drawn', art ~= nil)
+    vim.api.nvim_win_set_cursor(st.win, { art + 1, 0 })
 
-  feed('w')
-  truthy('5.2 the key on the artwork opens a popup', wait_until(preview.is_open))
-  local popup = preview.popup
-  expect('5.2 with the image kind', popup and popup.kind, 'image')
-  local shown = popup and table.concat(vim.api.nvim_buf_get_lines(popup.buf, 0, -1, false), '\n') or ''
-  truthy('5.2 showing the artwork',
-    shown:find('▀', 1, true) ~= nil or shown:find('▄', 1, true) ~= nil, shown)
-  truthy('5.2 and not the document around it', not shown:find('Before the picture', 1, true))
-  preview.close()
+    feed('w')
+    truthy('5.2 the key on the artwork opens a popup', wait_until(preview.is_open))
+    local popup = preview.popup
+    expect('5.2 with the image kind', popup and popup.kind, 'image')
+    local shown = popup and table.concat(vim.api.nvim_buf_get_lines(popup.buf, 0, -1, false), '\n') or ''
+    truthy('5.2 showing the artwork',
+      shown:find('▀', 1, true) ~= nil or shown:find('▄', 1, true) ~= nil, shown)
+    truthy('5.2 and not the document around it', not shown:find('Before the picture', 1, true))
+    preview.close()
 
-  -- Off the artwork the key is Vim's again.
-  local prose = rendered_row(st, 'Before the picture')
-  truthy('5.2 the prose row exists', prose ~= nil)
-  vim.api.nvim_win_set_cursor(st.win, { prose + 1, 0 })
-  local cursor = vim.api.nvim_win_get_cursor(st.win)
-  feed('w')
-  truthy('5.2 on prose the key reaches Vim',
-    not vim.deep_equal(vim.api.nvim_win_get_cursor(st.win), cursor))
-  expect('5.2 and no popup was opened', preview.is_open(), false)
-
+    -- Off the artwork the key is Vim's again.
+    local prose = rendered_row(st, 'Before the picture')
+    truthy('5.2 the prose row exists', prose ~= nil)
+    vim.api.nvim_win_set_cursor(st.win, { prose + 1, 0 })
+    local cursor = vim.api.nvim_win_get_cursor(st.win)
+    feed('w')
+    truthy('5.2 on prose the key reaches Vim',
+      not vim.deep_equal(vim.api.nvim_win_get_cursor(st.win), cursor))
+    expect('5.2 and no popup was opened', preview.is_open(), false)
+  end)
+  restore()
   config.setup({})
+  if not ok then
+    error(err, 0)
+  end
 end)
 
 --------------------------------------------------------------------------------
@@ -3822,18 +3866,26 @@ end)
 
 --- Open the preview on the artwork row of `path` and return the popup, or nil.
 local function open_image_popup(path)
-  truthy('in R on ' .. vim.fn.fnamemodify(path, ':t'), reset_to(path))
-  local st = current_state()
-  local art = artwork_row(st)
-  if not art then
-    return nil
+  local restore = drawing_terminal()
+  local ok, popup = pcall(function()
+    truthy('in R on ' .. vim.fn.fnamemodify(path, ':t'), reset_to(path))
+    local st = current_state()
+    local art = artwork_row(st)
+    if not art then
+      return nil
+    end
+    vim.api.nvim_win_set_cursor(st.win, { art + 1, 0 })
+    feed(config.options.keymaps.preview)
+    if not wait_until(preview.is_open) then
+      return nil
+    end
+    return preview.popup
+  end)
+  restore()
+  if not ok then
+    error(popup, 0)
   end
-  vim.api.nvim_win_set_cursor(st.win, { art + 1, 0 })
-  feed(config.options.keymaps.preview)
-  if not wait_until(preview.is_open) then
-    return nil
-  end
-  return preview.popup
+  return popup
 end
 
 --- The popup's artwork rows, joined.
@@ -3870,7 +3922,7 @@ section('5.3', function()
   expect('5.3 a 20 ms delay is kept', preview.frame_delay(delays, 2), 20)
   expect('5.3 a 120 ms delay is kept', preview.frame_delay(delays, 3), 120)
 
-  config.setup({ image_mode = 'blocks' })
+  config.setup({ image_mode = 'blocks', image_inline = 'art' })
   local popup = open_image_popup(animated_fixture)
   truthy('5.3 the popup opens', popup ~= nil)
   if not popup then
@@ -3919,7 +3971,7 @@ end)
 --------------------------------------------------------------------------------
 
 section('5.4', function()
-  config.setup({ image_mode = 'blocks' })
+  config.setup({ image_mode = 'blocks', image_inline = 'art' })
   local popup = open_image_popup(animated_fixture)
   truthy('5.4 the popup opens', popup ~= nil)
   if not popup then
@@ -4003,7 +4055,7 @@ local function timer_handles()
 end
 
 section('5.5', function()
-  config.setup({ image_mode = 'blocks' })
+  config.setup({ image_mode = 'blocks', image_inline = 'art' })
   local baseline = timer_handles()
 
   local popup = open_image_popup(animated_fixture)
@@ -4052,7 +4104,7 @@ end)
 --------------------------------------------------------------------------------
 
 section('5.6', function()
-  config.setup({ image_mode = 'blocks' })
+  config.setup({ image_mode = 'blocks', image_inline = 'art' })
   local baseline = timer_handles()
 
   -- A still PNG.
@@ -4084,7 +4136,7 @@ section('5.6', function()
   preview.close()
 
   -- An animated GIF with animation off is a still image too.
-  config.setup({ image_mode = 'blocks', image_animation = false })
+  config.setup({ image_mode = 'blocks', image_inline = 'art', image_animation = false })
   popup = open_image_popup(animated_fixture)
   truthy('5.6 animation off still opens a popup', popup ~= nil)
   if not popup then
@@ -4102,7 +4154,7 @@ end)
 --------------------------------------------------------------------------------
 
 section('5.8', function()
-  config.setup({ image_mode = 'blocks' })
+  config.setup({ image_mode = 'blocks', image_inline = 'art' })
   local before = #notifications
   local popup = open_image_popup(repo .. '/tests/fixtures/too-large-animation.md')
   truthy('5.8 a refused animation still opens a popup', popup ~= nil)
@@ -4741,13 +4793,22 @@ end)
 
 local ESC = string.char(27)
 local ST = string.char(92)
+-- The cursor save/restore every placement is wrapped in: `DECSC` and `DECRC`.
+local SAVE = ESC .. '7'
+local RESTORE = ESC .. '8'
 
 --- A fresh directory holding one file of `bytes`, for the plan checks.
+---
+--- Written through `fs_write` rather than `writefile`, which translates a `NL`
+--- in the text and would not give back the bytes it was handed: the checks here
+--- compare exact byte strings, and a PNG's signature contains one.
 local function temp_file(name, bytes)
   local dir = vim.fn.tempname()
   vim.fn.mkdir(dir, 'p')
   local path = dir .. '/' .. name
-  vim.fn.writefile({ bytes }, path, 'b')
+  local fd = assert(vim.uv.fs_open(path, 'w', 420))
+  assert(vim.uv.fs_write(fd, bytes, 0))
+  vim.uv.fs_close(fd)
   return dir, path
 end
 
@@ -4794,7 +4855,8 @@ end
 --- what closing the popup sends is recorded too.
 local function open_image(tag, path, tier, opts)
   preview.close()
-  config.setup(vim.tbl_extend('force', { image_mode = 'blocks' }, opts or {}))
+  config.setup(vim.tbl_extend('force', { image_mode = 'blocks', image_inline = 'art' },
+    opts or {}))
   truthy(tag .. ' reset to ' .. vim.fn.fnamemodify(path, ':t'), reset_to(path))
   local st = current_state()
   local row = artwork_row(st)
@@ -4925,12 +4987,16 @@ end)
 section('2.1', function()
   expect('2.1 the exact bytes',
     graphics.osc_sequence({ 0, 0 }, 10, 5, 'AAAA'),
-    ESC .. '[1;1H'
+    SAVE .. ESC .. '[1;1H'
       .. ESC .. ']1337;File=inline=1;width=10;height=5;preserveAspectRatio=0;doNotMoveCursor=1:AAAA'
-      .. ESC .. ST)
-  local head = ESC .. '[7;4H'
-  expect('2.1 the cursor move is 1-based',
+      .. ESC .. ST .. RESTORE)
+  local head = SAVE .. ESC .. '[7;4H'
+  expect('2.1 the cursor move is 1-based, between a save and a restore',
     graphics.osc_sequence({ 6, 3 }, 1, 1, 'x'):sub(1, #head), head)
+  local tail = ESC .. ST .. RESTORE
+  local sequence = graphics.osc_sequence({ 6, 3 }, 1, 1, 'x')
+  expect('2.1 and the cursor is restored after it',
+    sequence:sub(-#tail), tail)
   local payload = vim.base64.encode('abc')
   truthy('2.1 the payload is carried as given',
     graphics.osc_sequence({ 0, 0 }, 2, 2, payload):find(':' .. payload .. ESC .. ST, 1, true)
@@ -4945,9 +5011,9 @@ section('2.2', function()
   local path = 'C:/tmp/a.png'
   expect('2.2 the placement bytes',
     graphics.kitty_sequence({ 2, 4 }, 20, 9, 7, path),
-    ESC .. '[3;5H'
-      .. ESC .. '_Gi=7,a=T,t=f,p=7,c=20,r=9,C=1,q=2;'
-      .. vim.base64.encode(path) .. ESC .. ST)
+    SAVE .. ESC .. '[3;5H'
+      .. ESC .. '_Gi=7,a=T,t=f,f=100,p=7,c=20,r=9,C=1,q=2;'
+      .. vim.base64.encode(path) .. ESC .. ST .. RESTORE)
   local wide = 'C:/图片/图.png'
   truthy('2.2 a non-ASCII path is sent as its bytes',
     graphics.kitty_sequence({ 0, 0 }, 1, 1, 1, wide):find(vim.base64.encode(wide), 1, true)
@@ -4961,7 +5027,10 @@ end)
 --------------------------------------------------------------------------------
 
 section('2.3', function()
-  local dir, path = temp_file('pic.png', 'abc')
+  -- The path-carrying transport names PNG as the format and decodes nothing
+  -- else, so the fixture has to be a PNG's bytes, not merely its name.
+  local bytes = '\137PNG\r\n\26\nabc'
+  local dir, path = temp_file('pic.png', bytes)
   local ref = { target = 'pic.png' }
 
   -- `fs_stat` and `vim.fs.joinpath` normalize separators, so the resolved path
@@ -4971,7 +5040,7 @@ section('2.3', function()
   local osc = graphics.plan(ref, dir, 'osc')
   truthy('2.3 a readable file plans an OSC placement', osc ~= nil)
   expect('2.3 with the resolved path', osc and osc.path, resolved)
-  expect('2.3 carrying the encoded bytes', osc and osc.data, vim.base64.encode('abc'))
+  expect('2.3 carrying the encoded bytes', osc and osc.data, vim.base64.encode(bytes))
   expect('2.3 and its transport', osc and osc.tier, 'osc')
 
   local kitty = graphics.plan(ref, dir, 'kitty')
@@ -4992,6 +5061,16 @@ section('2.3', function()
     graphics.plan({ target = 'data:image/png;base64,AAAA' }, dir, 'kitty'), nil)
   expect('2.3 an empty destination plans nothing',
     graphics.plan({ target = '' }, dir, 'kitty'), nil)
+
+  -- The path transport decodes PNG and nothing else, refusing the rest with
+  -- `EBADPNG`: a file it cannot decode plans nothing, so the popup keeps its
+  -- artwork instead of placing a picture that would never be drawn.
+  local other = temp_file('photo.jpg', 'not a png at all')
+  expect('2.3 a path-carrying plan needs a PNG',
+    graphics.plan({ target = 'photo.jpg' }, other, 'kitty'), nil)
+  truthy('2.3 while the byte-carrying one takes it',
+    graphics.plan({ target = 'photo.jpg' }, other, 'osc') ~= nil)
+  vim.fn.delete(other, 'rf')
 
   expect('2.3 a relative destination joins the document directory',
     graphics.resolve('pic.png', dir), vim.fs.joinpath(dir, 'pic.png'))
@@ -5366,6 +5445,1870 @@ section('4.2', function()
   if not ok then
     error(err, 0)
   end
+end)
+
+--------------------------------------------------------------------------------
+-- 3.1 The image_inline option
+--------------------------------------------------------------------------------
+
+section('3.1', function()
+  config.setup({})
+  expect('3.1 image_inline defaults to auto', config.defaults.image_inline, 'auto')
+
+  for _, value in ipairs({ 'auto', 'card', 'art' }) do
+    local resolved = config.setup({ image_inline = value })
+    expect('3.1 setup accepts ' .. value, resolved.image_inline, value)
+  end
+
+  -- Every accepted value resolves to something the engine takes, so none of
+  -- them can be refused by the engine for being itself.
+  config.setup({ image_inline = 'auto' })
+  expect('3.1 auto resolves to the card', config.image_inline_encoding(), 'card')
+  config.setup({ image_inline = 'card' })
+  expect('3.1 card resolves to the card', config.image_inline_encoding(), 'card')
+  config.setup({ image_inline = 'art', image_mode = 'blocks' })
+  expect('3.1 art resolves to the artwork', config.image_inline_encoding(), 'blocks')
+
+  -- An unknown value is not quietly turned into one of the three: it is sent
+  -- to the engine as the encoding, and the engine refuses it by name, which is
+  -- how a bad image_mode is refused today.
+  config.setup({ image_inline = 'dots' })
+  local image_fixture = repo .. '/tests/fixtures/image.md'
+  local before = #notifications
+  vim.cmd('edit! ' .. vim.fn.fnameescape(image_fixture))
+  md.attach(vim.api.nvim_get_current_buf(), vim.api.nvim_get_current_win())
+
+  local refused, message = false, nil
+  wait_until(function()
+    for i = before + 1, #notifications do
+      if notifications[i].level >= vim.log.levels.ERROR then
+        refused, message = true, notifications[i].msg
+        return true
+      end
+    end
+    return false
+  end)
+  truthy('3.1 an unknown value is refused', refused)
+  truthy('3.1 by name', message and message:find('dots', 1, true) ~= nil, message)
+  truthy('3.1 and R is not entered on a failed render', not showing_rendered())
+
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 3.2 The presentation the render asks for
+--------------------------------------------------------------------------------
+
+section('3.2', function()
+  local image_fixture = repo .. '/tests/fixtures/image.md'
+  local inner = vim.system
+  local commands = {}
+  vim.system = function(cmd, opts, on_exit)
+    commands[#commands + 1] = cmd
+    return inner(cmd, opts, on_exit)
+  end
+
+  local function find_arg(cmd, flag)
+    for i, arg in ipairs(cmd or {}) do
+      if arg == flag then
+        return cmd[i + 1]
+      end
+    end
+    return nil
+  end
+
+  --- The engine command one render with `opts` produces, forced past the cache
+  --- so a case whose options resemble the last one's still spawns.
+  local function command_for(opts)
+    config.setup(opts)
+    if not reset_to(image_fixture) then
+      return nil
+    end
+    local st = current_state()
+    state.forget_cache(st.source)
+    local before = #commands
+    md.show_rendered()
+    if not wait_until(function() return #commands > before end) then
+      return nil
+    end
+    return commands[#commands]
+  end
+
+  --- The `--image-encoding` one render with `opts` produces.
+  local function encoding_for(opts)
+    return find_arg(command_for(opts), '--image-encoding')
+  end
+
+  local termguicolors = vim.o.termguicolors
+  vim.o.termguicolors = true
+
+  -- `art` is the old behaviour, so image_mode's own encoding comes through.
+  expect('3.2 art with braille asks for braille',
+    encoding_for({ image_inline = 'art', image_mode = 'braille' }), 'braille')
+  expect('3.2 art with auto asks for braille on a true-colour terminal',
+    encoding_for({ image_inline = 'art', image_mode = 'auto' }), 'braille')
+  expect('3.2 art with off asks for off',
+    encoding_for({ image_inline = 'art', image_mode = 'off' }), 'off')
+
+  -- `auto` and `card` both ask for the card, whatever image_mode would draw.
+  expect('3.2 auto with braille asks for the card',
+    encoding_for({ image_inline = 'auto', image_mode = 'braille' }), 'card')
+  expect('3.2 card with blocks asks for the card',
+    encoding_for({ image_inline = 'card', image_mode = 'blocks' }), 'card')
+
+  -- `image_mode = 'off'` outranks both: no picture means no card either.
+  expect('3.2 auto with image_mode off asks for off',
+    encoding_for({ image_inline = 'auto', image_mode = 'off' }), 'off')
+  expect('3.2 card with image_mode off asks for off',
+    encoding_for({ image_inline = 'card', image_mode = 'off' }), 'off')
+
+  -- The resolution never consults availability, so a terminal that could not
+  -- draw (this runner has no UI) and `graphics = 'off'` change nothing.
+  expect('3.2 auto asks for the card with graphics off',
+    encoding_for({ image_inline = 'auto', graphics = 'off' }), 'card')
+  expect('3.2 art asks for the artwork with graphics off',
+    encoding_for({ image_inline = 'art', image_mode = 'quads', graphics = 'off' }), 'quads')
+
+  -- A card nothing is painted over is compact, and wide enough to hold the
+  -- hint written on it. This runner has no UI, so `auto` is that case.
+  local hint = config.image_hint_text()
+  expect('3.2 a card on a terminal that cannot paint is three rows',
+    find_arg(command_for({ image_inline = 'auto' }), '--image-card-rows'), '3')
+  expect('3.2 and at least as wide as the hint it carries',
+    find_arg(command_for({ image_inline = 'auto' }), '--image-card-min-width'),
+    tostring(vim.fn.strdisplaywidth(hint) + 2))
+  expect('3.2 with neither image key bound there is no width floor',
+    find_arg(command_for({
+      image_inline = 'auto',
+      keymaps = { preview = false, open_image = false },
+    }), '--image-card-min-width'), nil)
+
+  -- Artwork has no card, so it asks for no card shape.
+  expect('3.2 artwork asks for no card shape',
+    find_arg(command_for({ image_inline = 'art', image_mode = 'blocks' }), '--image-card-rows'), nil)
+
+  -- A picture painted over the card is measured for the artwork's box, so the
+  -- card keeps it; a card forced on the same terminal stays compact.
+  local restore = drawing_terminal()
+  expect('3.2 a painted card keeps the artwork box',
+    find_arg(command_for({ image_inline = 'auto' }), '--image-card-rows'), nil)
+  expect('3.2 a card forced on a painting terminal stays compact',
+    find_arg(command_for({ image_inline = 'card' }), '--image-card-rows'), '3')
+  restore()
+
+  vim.o.termguicolors = termguicolors
+  vim.system = inner
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 3.3 The presentation is part of the render cache key
+--------------------------------------------------------------------------------
+
+section('3.3', function()
+  local image_fixture = repo .. '/tests/fixtures/image.md'
+  config.setup({ image_inline = 'card', image_mode = 'blocks' })
+  truthy('3.3 in R with a card', reset_to(image_fixture))
+  local before = engine_calls
+
+  -- `auto` and `card` resolve to the same presentation, and neither the
+  -- palette nor any other image option moves with them, so the document the
+  -- cache holds is still the right one.
+  config.setup({ image_inline = 'auto', image_mode = 'blocks' })
+  md.show_rendered()
+  vim.wait(300)
+  expect('3.3 two values that resolve alike do not re-render', engine_calls, before)
+
+  -- Under `auto`/`card`, image_mode only chooses what would have been drawn,
+  -- and nothing is: the card is the same card either way.
+  config.setup({ image_inline = 'auto', image_mode = 'quads' })
+  md.show_rendered()
+  vim.wait(300)
+  expect('3.3 image_mode under the card does not re-render', engine_calls, before)
+
+  -- A different presentation is a different document.
+  config.setup({ image_inline = 'art', image_mode = 'blocks' })
+  md.show_rendered()
+  truthy('3.3 switching to art re-renders',
+    wait_until(function() return engine_calls > before end))
+  local after_art = engine_calls
+
+  -- `image_mode = 'off'` outranks the card, so it is a different presentation
+  -- once more.
+  config.setup({ image_inline = 'auto', image_mode = 'off' })
+  md.show_rendered()
+  truthy("3.3 switching to 'off' re-renders",
+    wait_until(function() return engine_calls > after_art end))
+
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 3.4 A card changes the picture's rows and the document's narrowest width
+--------------------------------------------------------------------------------
+
+section('3.4', function()
+  local image_fixture = repo .. '/tests/fixtures/image.md'
+
+  local function rendered_with(inline)
+    config.setup({ image_mode = 'braille', image_inline = inline })
+    if not reset_to(image_fixture) then
+      return nil
+    end
+    -- The document is captured here, not read off the state later: the state
+    -- table is the one live record, and the second render replaces its `doc`.
+    local st = current_state()
+    return st, vim.api.nvim_buf_get_lines(st.rendered, 0, -1, false), st.doc
+  end
+
+  -- The source line the image reference is on, so the rows it produced can be
+  -- told from the prose around them.
+  local source_lines = vim.fn.readfile(image_fixture)
+  local image_line
+  for i, text in ipairs(source_lines) do
+    if text:find('!%[') then
+      image_line = i - 1
+      break
+    end
+  end
+  truthy('3.4 the fixture has an image reference', image_line ~= nil)
+
+  local card, card_text, card_doc = rendered_with('card')
+  truthy('3.4 a card document renders', card ~= nil)
+  if not card then
+    config.setup({})
+    return
+  end
+
+  -- Search and yank are the buffer's: take them while the card is showing, and
+  -- compare them with the artwork's after it is rendered.
+  local card_row
+  for i, line in ipairs(card_doc.lines) do
+    if line.source == image_line then
+      card_row = card_row or i - 1
+    end
+  end
+  truthy('3.4 the card occupies rows of its own', card_row ~= nil)
+  vim.api.nvim_win_set_cursor(card.win, { 1, 0 })
+  local searched = vim.fn.search('After the picture', 'W')
+  truthy('3.4 prose is still searchable', searched > 0)
+  local yanked = card_text[searched]
+
+  local art, art_text, art_doc = rendered_with('art')
+  truthy('3.4 the artwork document renders', art ~= nil)
+  if not art then
+    config.setup({})
+    return
+  end
+
+  -- The compact card is shorter than the artwork — that is what it is for — so
+  -- the two documents are compared over everything that is not the picture,
+  -- and the card's own rows are checked against the reference's line.
+  --
+  -- The width is the one thing the card may add: it carries the hint, so it can
+  -- be wider than the picture it stands in for. It is never wider than the page.
+  truthy('3.4 the card is no narrower than the artwork',
+    card_doc.layout_width >= art_doc.layout_width)
+  truthy('3.4 and no wider than the page', card_doc.layout_width <= card_doc.width)
+
+  local function outside_image(doc, rendered)
+    local kept = {}
+    for i, line in ipairs(doc.lines) do
+      if line.source ~= image_line then
+        kept[#kept + 1] = { text = rendered[i], source = line.source }
+      end
+    end
+    return kept
+  end
+  eq_table('3.4 every row outside the image is the same text on the same line',
+    outside_image(card_doc, card_text), outside_image(art_doc, art_text))
+
+  -- Drawn rows only: the blank line that closes the block inherits the
+  -- reference's source line, exactly as it does around the artwork.
+  local card_rows, mapped = 0, true
+  for i, line in ipairs(card_doc.lines) do
+    if line.source == image_line then
+      if render.source_line_for(card_doc, i - 1) ~= image_line then
+        mapped = false
+      end
+      local text = {}
+      for _, span in ipairs(line.spans) do
+        text[#text + 1] = span[2]
+      end
+      if vim.fn.strdisplaywidth(table.concat(text)) > 0 then
+        card_rows = card_rows + 1
+      end
+    end
+  end
+  expect('3.4 the card is three rows tall', card_rows, 3)
+  truthy('3.4 every card row maps back to the reference', mapped)
+
+  -- The reference is still there to follow from the card's first row.
+  local ref = card_row and link.image_at_row(source_lines, card_doc, card_row)
+  truthy('3.4 the card row resolves to the image reference', ref ~= nil)
+  expect('3.4 with its destination', ref and ref.raw, 'images/image_sample.png')
+
+  -- Search still finds the prose, and a yank of it is the same text. The row
+  -- itself is not the same one — the card is shorter than the artwork — which
+  -- is why it is the text that is compared, not the row.
+  vim.api.nvim_win_set_cursor(art.win, { 1, 0 })
+  local art_searched = vim.fn.search('After the picture', 'W')
+  truthy('3.4 search still finds the prose', art_searched > 0)
+  expect('3.4 and a yank of it is the same text', art_text[art_searched], yanked)
+
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 3.5 image_inline leaves the popup alone
+--------------------------------------------------------------------------------
+
+section('3.5', function()
+  local geometry = preview.geometry('image', 80)
+  local block = { kind = 'image', lines = { '![a small image](images/image_sample.png)' } }
+
+  -- The arguments the popup builds come from `image_mode` alone.
+  for _, value in ipairs({ 'auto', 'card', 'art' }) do
+    config.setup({ image_mode = 'blocks', image_inline = value })
+    local view = preview.view(block, geometry, nil, nil)
+    expect('3.5 ' .. value .. ' leaves the popup at image_mode\'s encoding',
+      view.encoding, 'blocks')
+    expect('3.5 ' .. value .. ' leaves the popup width alone', view.width, geometry.inner)
+    expect('3.5 ' .. value .. ' leaves the popup height alone',
+      view.height, geometry.max_h - 2)
+  end
+
+  -- A card document's block still opens a popup that draws the file, on either
+  -- transport, and places it once.
+  local real = graphics.send
+  local sends = {}
+  graphics.send = function(bytes)
+    sends[#sends + 1] = bytes
+  end
+  local ok, err = pcall(function()
+    for _, tier in ipairs({ 'osc', 'kitty' }) do
+      for _, value in ipairs({ 'auto', 'card', 'art' }) do
+        preview.close()
+        sends = {}
+        local tag = string.format('3.5 %s/%s', value, tier)
+        config.setup({ image_mode = 'blocks', image_inline = value })
+        truthy(tag .. ': in R', reset_to(inline_fixture))
+        local st = current_state()
+
+        -- The image block's first row, found by the source line it anchors to
+        -- rather than by dots a card does not have.
+        local source_lines = vim.api.nvim_buf_get_lines(st.source, 0, -1, false)
+        local row
+        for i, line in ipairs(st.doc.lines) do
+          local src = line.source
+          if src and source_lines[src + 1] and source_lines[src + 1]:find('!%[') then
+            row = i - 1
+            break
+          end
+        end
+        truthy(tag .. ': the image block is found', row ~= nil)
+        local found = row and preview.locate(st.doc, row, source_lines)
+        truthy(tag .. ': it resolves to an image block', found and found.kind == 'image')
+        if not found then
+          return
+        end
+
+        local base = vim.fn.fnamemodify(inline_fixture, ':p:h')
+        local graphic = graphics.plan(found.ref, base, tier)
+        local view = preview.view(found, geometry, base, graphic)
+        local doc, done, failure
+        preview.render_block(config.options, found, view, function(e, d)
+          failure, doc, done = e, d, true
+        end)
+        truthy(tag .. ': the popup render answers',
+          wait_until(function() return done end), tostring(failure))
+        if not doc then
+          return
+        end
+
+        preview.open(doc, geometry, found, graphic)
+        local shown = table.concat(
+          vim.api.nvim_buf_get_lines(preview.popup.buf, 0, -1, false), '\n')
+        truthy(tag .. ': the popup shows the artwork',
+          shown:find('▀', 1, true) ~= nil or shown:find('▄', 1, true) ~= nil, shown)
+        expect(tag .. ': and places the file once', #sends, 1)
+        preview.close()
+      end
+    end
+  end)
+  graphics.send = real
+  preview.close()
+  config.setup({})
+  if not ok then
+    error(err, 0)
+  end
+end)
+
+--------------------------------------------------------------------------------
+-- 4.1 The preview key on an image follows the transport
+--------------------------------------------------------------------------------
+
+section('4.1', function()
+  config.setup({ image_mode = 'blocks', image_inline = 'art' })
+  truthy('4.1 in R on the animated fixture', reset_to(animated_fixture))
+  local st = current_state()
+  local row = artwork_row(st)
+  truthy('4.1 the artwork is drawn', row ~= nil)
+
+  local opened = {}
+  local real_open = vim.ui.open
+  vim.ui.open = function(path)
+    opened[#opened + 1] = path
+    return {}
+  end
+
+  local function press()
+    preview.close()
+    vim.api.nvim_win_set_cursor(st.win, { row + 1, 0 })
+    feed(config.options.keymaps.preview)
+    vim.wait(300)
+  end
+
+  -- The transport's own conditions, one at a time, with the rest of the
+  -- terminal left in order: each must route the key out rather than open a
+  -- popup, and `image_inline = 'art'` is deliberately kept throughout.
+  local real = {
+    has_send = graphics.has_send,
+    uis = graphics.uis,
+    env = graphics.env,
+  }
+  local function good_send() return true end
+  local function good_uis() return { {} } end
+  local function good_env() return { TERM = 'xterm-kitty' } end
+
+  local function condition(tag, opts)
+    graphics.has_send = opts.has_send or good_send
+    graphics.uis = opts.uis or good_uis
+    graphics.env = opts.env or good_env
+    config.setup({ image_mode = 'blocks', image_inline = 'art', graphics = opts.graphics })
+    local before = #opened
+    press()
+    expect('4.1 ' .. tag .. ': no popup', preview.is_open(), false)
+    expect('4.1 ' .. tag .. ': one file handed to the desktop', #opened, before + 1)
+    graphics.has_send, graphics.uis, graphics.env = real.has_send, real.uis, real.env
+  end
+
+  condition('without nvim_ui_send', { has_send = function() return false end })
+  condition('without an attached UI', { uis = function() return {} end })
+  condition("with graphics 'off'", { graphics = 'off' })
+  condition('behind a multiplexer', { env = function()
+    return { TERM = 'xterm-kitty', TMUX = '/tmp/tmux-1000/default,1,0' }
+  end })
+  condition('in a terminal it cannot identify', { env = function()
+    return { TERM = 'xterm-256color' }
+  end })
+
+  -- Where every condition holds, the popup opens as it always has and nothing
+  -- is handed out.
+  graphics.has_send, graphics.uis, graphics.env = good_send, good_uis, good_env
+  local before = #opened
+  press()
+  truthy('4.1 a drawable terminal opens the popup', wait_until(preview.is_open))
+  expect('4.1 and launches nothing', #opened, before)
+  preview.close()
+  graphics.has_send, graphics.uis, graphics.env = real.has_send, real.uis, real.env
+
+  vim.ui.open = real_open
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 4.2 The routed key resolves and reports exactly as the open-image key does
+--------------------------------------------------------------------------------
+
+section('4.2', function()
+  config.setup({ image_mode = 'blocks', image_inline = 'art', graphics = 'off' })
+
+  local opened = {}
+  local real_open = vim.ui.open
+  vim.ui.open = function(path)
+    opened[#opened + 1] = path
+    return {}
+  end
+
+  local function latest()
+    return notifications[#notifications] or {}
+  end
+
+  --- Press the preview key on the first row `find` names and report what the
+  --- that press produced with `tag`.
+  local function press_on(tag, find)
+    preview.close()
+    local st = current_state()
+    local row = find(st)
+    truthy(tag .. ': the image row is found', row ~= nil)
+    vim.api.nvim_win_set_cursor(st.win, { (row or 0) + 1, 0 })
+    local sends, notes = #opened, #notifications
+    feed(config.options.keymaps.preview)
+    vim.wait(300)
+    return st, sends, notes
+  end
+
+  -- Relative: resolved against the document's directory.
+  truthy('4.2 in R on the animated fixture', reset_to(animated_fixture))
+  local _, sends, notes = press_on('4.2 relative', function(st)
+    return artwork_row(st)
+  end)
+  expect('4.2 a relative reference opens one file', #opened, sends + 1)
+  truthy('4.2 resolved beside the document',
+    same_path(opened[sends + 1], repo .. '/tests/fixtures/images/image_animation.gif'), opened[sends + 1])
+  expect('4.2 silently', #notifications, notes)
+  expect('4.2 and opens no popup', preview.is_open(), false)
+
+  -- Absolute: used as given.
+  local abs = repo .. '/tests/fixtures/images/image_sample.png'
+  local tmp = vim.fn.tempname() .. '.md'
+  vim.fn.writefile({ '![absolute](' .. abs .. ')' }, tmp)
+  truthy('4.2 in R on an absolute reference', reset_to(tmp))
+  local _, asends, anotes = press_on('4.2 absolute', artwork_row)
+  expect('4.2 an absolute reference opens one file', #opened, asends + 1)
+  truthy('4.2 used as written', same_path(opened[asends + 1], abs), opened[asends + 1])
+  expect('4.2 silently', #notifications, anotes)
+  vim.fn.delete(tmp)
+
+  -- Remote: reported, never fetched.
+  truthy('4.2 in R on a remote reference', reset_to(repo .. '/tests/fixtures/remote-image.md'))
+  local _, rsends, rnotes = press_on('4.2 remote', function(st)
+    return rendered_row(st, 'a remote picture')
+  end)
+  expect('4.2 a remote reference launches nothing', #opened, rsends)
+  expect('4.2 and is reported exactly once', #notifications, rnotes + 1)
+  truthy('4.2 as not a local file', latest().msg:find('is not a local file', 1, true) ~= nil,
+    latest().msg)
+  expect('4.2 and opens no popup', preview.is_open(), false)
+
+  -- A `data:` URI is not a local file either.
+  local data_path = vim.fn.tempname() .. '.md'
+  vim.fn.writefile({ '![a data picture](data:image/png;base64,AAAA)' }, data_path)
+  truthy('4.2 in R on a data URI', reset_to(data_path))
+  local _, dsends, dnotes = press_on('4.2 data', function(st)
+    return rendered_row(st, 'a data picture')
+  end)
+  expect('4.2 a data URI launches nothing', #opened, dsends)
+  expect('4.2 and is reported exactly once', #notifications, dnotes + 1)
+  truthy('4.2 as not a local file', latest().msg:find('is not a local file', 1, true) ~= nil,
+    latest().msg)
+  expect('4.2 and opens no popup', preview.is_open(), false)
+  vim.fn.delete(data_path)
+
+  -- Missing: reported, nothing launched.
+  truthy('4.2 in R on a missing reference', reset_to(repo .. '/tests/fixtures/missing-image.md'))
+  local _, msends, mnotes = press_on('4.2 missing', function(st)
+    return rendered_row(st, 'a missing image')
+  end)
+  expect('4.2 a missing file launches nothing', #opened, msends)
+  expect('4.2 and is reported exactly once', #notifications, mnotes + 1)
+  truthy('4.2 as no such file', latest().msg:find('no such file', 1, true) ~= nil, latest().msg)
+  expect('4.2 and opens no popup', preview.is_open(), false)
+
+  -- Not a file: reported, nothing launched.
+  truthy('4.2 in R on a directory reference', reset_to(repo .. '/tests/fixtures/directory-image.md'))
+  local _, xsends, xnotes = press_on('4.2 directory', function(st)
+    return rendered_row(st, 'a directory')
+  end)
+  expect('4.2 a directory launches nothing', #opened, xsends)
+  expect('4.2 and is reported exactly once', #notifications, xnotes + 1)
+  truthy('4.2 as not a file', latest().msg:find('not a file', 1, true) ~= nil, latest().msg)
+  expect('4.2 and opens no popup', preview.is_open(), false)
+
+  vim.ui.open = real_open
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 4.3 Only images are routed; every other key is what it always was
+--------------------------------------------------------------------------------
+
+section('4.3', function()
+  -- Availability off throughout: these are the blocks and keys that do not
+  -- consult it.
+  config.setup({ image_mode = 'blocks', image_inline = 'art', graphics = 'off' })
+  local plugin_fixture = repo .. '/tests/fixtures/plugin.md'
+
+  local opened = {}
+  local real_open = vim.ui.open
+  vim.ui.open = function(path)
+    opened[#opened + 1] = path
+    return {}
+  end
+
+  local diagram = open_diagram(plugin_fixture, '4.3')
+  truthy('4.3 a mermaid fence opens its popup without graphics',
+    diagram ~= nil and diagram.kind == 'mermaid', diagram and diagram.kind)
+  preview.close()
+
+  -- A table is a block too: wrapping, not clipping, so it has no viewer to
+  -- route out to.
+  truthy('4.3 in R on the table', reset_to(plugin_fixture))
+  local st = current_state()
+  local source_lines = vim.api.nvim_buf_get_lines(st.source, 0, -1, false)
+  local table_line
+  for i, text in ipairs(source_lines) do
+    if text:match('^|%s*a%s*|') then
+      table_line = i - 1
+      break
+    end
+  end
+  truthy('4.3 the fixture has a table', table_line ~= nil)
+  local table_row = table_line and render.row_for_source(st.doc, table_line)
+  truthy('4.3 the table has a display row', table_row ~= nil)
+  vim.api.nvim_win_set_cursor(st.win, { (table_row or 0) + 1, 0 })
+  feed(config.options.keymaps.preview)
+  truthy('4.3 a table opens its popup without graphics', wait_until(preview.is_open))
+  expect('4.3 and it is the table', preview.popup and preview.popup.kind, 'table')
+  expect('4.3 and launches nothing', #opened, 0)
+  preview.close()
+
+  -- On prose the key is Vim's. A `w` stands in for "the ordinary action", since
+  -- `nvim -l` never enters the main loop and a pending operator could not be
+  -- observed.
+  config.setup({ image_mode = 'blocks', graphics = 'off', keymaps = { preview = 'w' } })
+  truthy('4.3 in R on prose', reset_to(plugin_fixture))
+  st = current_state()
+  local prose = rendered_row(st, 'First paragraph')
+  truthy('4.3 the prose row exists', prose ~= nil)
+  vim.api.nvim_win_set_cursor(st.win, { (prose or 0) + 1, 0 })
+  local cursor = vim.api.nvim_win_get_cursor(st.win)
+  feed('w')
+  truthy('4.3 on prose the preview key reaches Vim',
+    not vim.deep_equal(vim.api.nvim_win_get_cursor(st.win), cursor))
+  expect('4.3 and opens no popup', preview.is_open(), false)
+  expect('4.3 and launches nothing', #opened, 0)
+
+  -- The open-image key does not ask the transport anything: on a terminal that
+  -- could draw it still hands the file out rather than opening a popup.
+  local restore = drawing_terminal()
+  config.setup({ image_mode = 'blocks', image_inline = 'art' })
+  truthy('4.3 in R on the artwork with a drawable terminal', reset_to(animated_fixture))
+  st = current_state()
+  vim.api.nvim_win_set_cursor(st.win, { artwork_row(st) + 1, 0 })
+  feed(config.options.keymaps.open_image)
+  vim.wait(300)
+  expect('4.3 the open-image key still launches the file', #opened, 1)
+  expect('4.3 and opens no popup', preview.is_open(), false)
+  restore()
+
+  vim.ui.open = real_open
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 5.1 The thumbnail request and its cache
+--------------------------------------------------------------------------------
+
+section('5.1', function()
+  local requests = {}
+  local failure = nil
+  local real_run = graphics.run_thumbnail
+  graphics.run_thumbnail = function(exe, source, cols, rows, background, out)
+    requests[#requests + 1] = {
+      source = source, cols = cols, rows = rows, background = background, out = out,
+    }
+    if failure then
+      return false, failure
+    end
+    vim.fn.writefile({ 'THUMB' }, out, 'b')
+    return true
+  end
+
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir, 'p')
+  local picture = dir .. '/picture.png'
+  vim.fn.writefile({ 'PNG' }, picture, 'b')
+
+  local bytes = graphics.thumbnail(picture, 40, 10, '#101010')
+  expect('5.1 a thumbnail is requested once', #requests, 1)
+  truthy('5.1 and its bytes are returned', bytes ~= nil and #bytes > 0)
+  if #requests == 1 then
+    expect("5.1 for the block's columns", requests[1].cols, 40)
+    expect("5.1 for the block's rows", requests[1].rows, 10)
+    expect('5.1 with the requested background', requests[1].background, '#101010')
+    expect('5.1 and the temporary file is gone', vim.fn.filereadable(requests[1].out), 0)
+  end
+
+  -- The same picture in the same box is the same answer.
+  local again = graphics.thumbnail(picture, 40, 10, '#101010')
+  expect('5.1 a repeat asks nothing again', #requests, 1)
+  expect('5.1 and answers the same bytes', again, bytes)
+
+  -- Another box is another picture.
+  graphics.thumbnail(picture, 20, 5, '#101010')
+  expect('5.1 another box is another request', #requests, 2)
+
+  -- A rewrite changes the mtime, so it is a new picture.
+  local now = os.time() + 10
+  vim.uv.fs_utime(picture, now, now)
+  local fresher = graphics.thumbnail(picture, 40, 10, '#101010')
+  expect('5.1 a changed file is requested again', #requests, 3)
+  truthy('5.1 and answered', fresher ~= nil)
+  expect('5.1 with its temporary file gone too', vim.fn.filereadable(requests[3].out), 0)
+
+  -- A refusal is quiet: no bytes, no message, and the temporary name is not
+  -- left behind either.
+  local noted = #notifications
+  failure = 'md-render: cannot read it'
+  local refused = graphics.thumbnail(picture, 41, 11, '#101010')
+  failure = nil
+  expect('5.1 a refusal answers nothing', refused, nil)
+  expect('5.1 with no message', #notifications, noted)
+  expect('5.1 and no temporary file', vim.fn.filereadable(requests[#requests].out), 0)
+
+  -- The cache is bounded, and the entry it drops is the least recently used.
+  for i = 1, graphics.THUMBNAIL_CACHE_LIMIT + 1 do
+    local path = string.format('%s/evict-%d.png', dir, i)
+    vim.fn.writefile({ 'PNG' }, path, 'b')
+    graphics.thumbnail(path, 2, 1, '#000000')
+  end
+  local before = #requests
+  graphics.thumbnail(dir .. '/evict-2.png', 2, 1, '#000000')
+  expect('5.1 a recently used entry is still cached', #requests, before)
+  graphics.thumbnail(dir .. '/evict-1.png', 2, 1, '#000000')
+  expect('5.1 the least recently used entry was evicted', #requests, before + 1)
+
+  graphics.run_thumbnail = real_run
+  vim.fn.delete(dir, 'rf')
+end)
+
+--------------------------------------------------------------------------------
+-- 5.2 A block's rectangle, and whether the window shows all of it
+--------------------------------------------------------------------------------
+
+section('5.2', function()
+  local image_fixture = repo .. '/tests/fixtures/image.md'
+  -- Artwork rather than a card: the boundary checks below need a block the
+  -- window cannot show whole, and a compact card is three rows, which the
+  -- runner's window shows entirely however it is scrolled.
+  config.setup({ image_mode = 'blocks', image_inline = 'art' })
+  truthy('5.2 in R on the image fixture', reset_to(image_fixture))
+  local st = current_state()
+
+  local source_lines = vim.api.nvim_buf_get_lines(st.source, 0, -1, false)
+  local image_line
+  for i, text in ipairs(source_lines) do
+    if text:find('!%[') then
+      image_line = i - 1
+      break
+    end
+  end
+  truthy('5.2 the fixture has an image reference', image_line ~= nil)
+
+  local rect = graphics.rect(st.doc, image_line)
+  truthy('5.2 the block has a rectangle', rect ~= nil)
+  if not rect then
+    config.setup({})
+    return
+  end
+
+  local function row_width(line)
+    local parts = {}
+    for _, span in ipairs(line.spans) do
+      parts[#parts + 1] = span[2]
+    end
+    return vim.fn.strdisplaywidth(table.concat(parts))
+  end
+
+  local rows, widest = 0, 0
+  for _, line in ipairs(st.doc.lines) do
+    if line.source == image_line and row_width(line) > 0 then
+      rows = rows + 1
+      widest = math.max(widest, row_width(line))
+    end
+  end
+  expect("5.2 with the block's drawn rows", rect.height, rows)
+  expect('5.2 and its widest row', rect.width, widest)
+  expect("5.2 starting at the block's first row",
+    st.doc.lines[rect.top + 1] and row_width(st.doc.lines[rect.top + 1]) > 0, true)
+  local after = st.doc.lines[rect.top + rect.height + 1]
+  truthy('5.2 and ending at its last drawn row',
+    after == nil or after.source ~= image_line or row_width(after) == 0)
+
+  local win = st.win
+  vim.wo[win].scrolloff = 0
+  vim.api.nvim_win_set_cursor(win, { rect.top + 1, 0 })
+  vim.fn.winrestview({ topline = rect.top + 1 })
+  local slice = graphics.slice(win, rect)
+  truthy('5.2 a wholly visible block has a slice', slice ~= nil, vim.inspect(rect))
+  expect('5.2 covering all of its rows', slice and slice.rows, rect.height)
+  expect('5.2 from its first row', slice and slice.top, rect.top)
+  local sp = vim.fn.screenpos(win, rect.top + 1, 1)
+  expect('5.2 at the row screenpos names', slice and slice.origin[1], sp.row - 1)
+  expect('5.2 and its column', slice and slice.origin[2], sp.col - 1)
+  local origin = slice and slice.origin
+
+  -- Scrolled so its first rows are above the window: the slice starts where the
+  -- window does and carries the rows that are left.
+  vim.api.nvim_win_set_cursor(win, { rect.top + rect.height, 0 })
+  vim.fn.winrestview({ topline = rect.top + 3 })
+  slice = graphics.slice(win, rect)
+  truthy('5.2 a block with rows above the window still has a slice', slice ~= nil)
+  expect('5.2 starting two rows in', slice and slice.top, rect.top + 2)
+  expect('5.2 and two rows shorter', slice and slice.rows, rect.height - 2)
+  expect('5.2 at the window top',
+    slice and slice.origin[1], vim.fn.screenpos(win, rect.top + 3, 1).row - 1)
+
+  -- Scrolled so its last row is below the window: the slice stops at the
+  -- window's last line.
+  vim.api.nvim_win_set_cursor(win, { rect.top + 1, 0 })
+  vim.fn.winrestview({ topline = math.max(1, rect.top) })
+  slice = graphics.slice(win, rect)
+  truthy('5.2 a block with its last row below the window still has a slice', slice ~= nil)
+  expect('5.2 from its own first row', slice and slice.top, rect.top)
+  expect("5.2 to the window's last line", slice and slice.top + slice.rows, vim.fn.line('w$'))
+  truthy('5.2 which is short of the block', slice and slice.rows < rect.height)
+
+  -- Scrolled past it: nothing of the block is on screen, so there is nothing to
+  -- paint. The cursor goes with the view: `winrestview` leaves it where it was,
+  -- and a cursor above the window pulls the view back when the window is next
+  -- validated, which would leave the block on screen after all.
+  local past = math.min(rect.top + rect.height + 2, vim.api.nvim_buf_line_count(
+    vim.api.nvim_win_get_buf(win)))
+  vim.api.nvim_win_set_cursor(win, { past, 0 })
+  vim.fn.winrestview({ topline = past })
+  expect('5.2 a block scrolled out has no slice', graphics.slice(win, rect), nil)
+
+  -- `scrolloff` moves the view without changing what is visible: a block that
+  -- fits with room for the margin is still wholly visible, and one that fills
+  -- the window cannot be, which is why this case uses a shorter picture.
+  config.setup({ image_mode = 'blocks', image_inline = 'art', image_max_height = 3 })
+  truthy('5.2 in R on a short image block', reset_to(image_fixture))
+  st = current_state()
+  local short = graphics.rect(st.doc, image_line)
+  truthy('5.2 the short block has a rectangle', short ~= nil)
+  truthy('5.2 and it is shorter than the window',
+    short and short.height < vim.api.nvim_win_get_height(st.win))
+  if short then
+    vim.wo[st.win].scrolloff = 4
+    vim.api.nvim_win_set_cursor(st.win, { 1, 0 })
+    vim.fn.winrestview({ topline = 1 })
+    local whole = graphics.slice(st.win, short)
+    expect('5.2 scrolloff leaves a wholly visible block whole',
+      whole and whole.rows, short.height)
+  end
+  vim.wo[st.win].scrolloff = 0
+
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 5.3 Paint on settle, only what the window wholly shows
+--------------------------------------------------------------------------------
+
+section('5.3', function()
+  local restore = drawing_terminal()
+  local sends = {}
+  local paints = 0
+  graphics.send = function(bytes)
+    sends[#sends + 1] = bytes
+  end
+  -- Counted separately from the sends so that "one paint, two blocks" and
+  -- "two paints" are told apart when a check fails.
+  local real_paint = graphics.paint
+  graphics.paint = function(win, doc, lines, base)
+    paints = paints + 1
+    return real_paint(win, doc, lines, base)
+  end
+
+  --- The sends of each kind: a placement shows a picture, a delete takes one
+  --- off. Counting them apart is what lets a check say "nothing was placed"
+  --- while the block's own delete went out.
+  local function placements()
+    local n = 0
+    for _, send in ipairs(sends) do
+      if not send:find('a=d', 1, true) then
+        n = n + 1
+      end
+    end
+    return n
+  end
+
+  local function deletes()
+    local n = 0
+    for _, send in ipairs(sends) do
+      if send:find('a=d', 1, true) then
+        n = n + 1
+      end
+    end
+    return n
+  end
+
+  --- A burst of scroll events, then long enough for one settle to have run.
+  local function burst()
+    for _ = 1, 5 do
+      vim.api.nvim_exec_autocmds('WinScrolled', {})
+    end
+    vim.wait(config.options.resize_debounce + 200)
+  end
+
+  local ok, err = pcall(function()
+    local image_fixture = repo .. '/tests/fixtures/image.md'
+    config.setup({ image_mode = 'blocks', image_inline = 'auto' })
+    truthy('5.3 in R on the image fixture', reset_to(image_fixture))
+    local st = current_state()
+    local win = st.win
+    vim.wo[win].scrolloff = 0
+
+    local source_lines = vim.api.nvim_buf_get_lines(st.source, 0, -1, false)
+    local image_line
+    for i, text in ipairs(source_lines) do
+      if text:find('!%[') then
+        image_line = i - 1
+        break
+      end
+    end
+    local rect = graphics.rect(st.doc, image_line)
+    truthy('5.3 the block has a rectangle', rect ~= nil)
+    if not rect then
+      return
+    end
+
+    -- The block is taller than what is left of the window on entry, so putting
+    -- it wholly in view is the reader's scroll; the mountain of events that a
+    -- scroll really is collapses into one placement.
+    vim.api.nvim_win_set_cursor(win, { rect.top + 1, 0 })
+    vim.fn.winrestview({ topline = rect.top + 1 })
+    vim.wait(200)
+    sends, paints = {}, 0
+    burst()
+    expect('5.3 one placement for a burst of scrolls', placements(), 1)
+    expect('5.3 and one paint for the burst', paints, 1)
+
+    -- Partly visible: the settle runs, and places nothing over the card.
+    vim.api.nvim_win_set_cursor(win, { rect.top + rect.height, 0 })
+    vim.fn.winrestview({ topline = rect.top + 3 })
+    vim.wait(200)
+    sends, paints = {}, 0
+    burst()
+    expect('5.3 none for a partly visible block', placements(), 0)
+    expect('5.3 and its placement is deleted', deletes(), 1)
+    expect('5.3 though the settle ran', paints, 1)
+
+    -- Back in the window: placed again, from the cache.
+    vim.api.nvim_win_set_cursor(win, { rect.top + 1, 0 })
+    vim.fn.winrestview({ topline = rect.top + 1 })
+    vim.wait(200)
+    sends, paints = {}, 0
+    burst()
+    expect('5.3 scrolled back, it is placed again', placements(), 1)
+
+    -- Closing a window over the picture repaints what was underneath it.
+    sends, paints = {}, 0
+    local float = vim.api.nvim_open_win(st.source, false, {
+      relative = 'editor', row = 1, col = 1, width = 10, height = 3, style = 'minimal',
+    })
+    vim.api.nvim_win_close(float, true)
+    truthy('5.3 a close asks for the picture again',
+      wait_until(function() return #sends >= 1 end))
+    vim.wait(200)
+    expect('5.3 once', placements(), 1)
+    expect('5.3 in one paint', paints, 1)
+
+    -- A floating window over the block owns its cells. The transport that
+    -- keeps one image layer for the tab draws whatever was placed last on top,
+    -- so a settle re-placing the inline picture while the preview popup was
+    -- open put it over the popup's own — measured by hand in WezTerm. Nothing
+    -- is placed under a float, and the placement already there is taken off.
+    local slice = graphics.slice(win, rect)
+    local origin = slice and slice.origin
+    truthy('5.3 the block has an origin for the float', origin ~= nil)
+    local over = vim.api.nvim_open_win(st.source, false, {
+      relative = 'editor', row = origin and origin[1] or 0, col = origin and origin[2] or 0,
+      width = rect.width, height = rect.height, style = 'minimal',
+    })
+    local frame = vim.api.nvim_win_get_position(over)
+    expect('5.3 the float is where the block starts', frame[1], origin and origin[1])
+    expect('5.3 and at its column', frame[2], origin and origin[2])
+    truthy('5.3 which makes it cover the block', graphics.occluded(win, rect, origin))
+    vim.wait(200)
+    sends, paints = {}, 0
+    burst()
+    expect('5.3 nothing is placed under a float', placements(), 0)
+    expect('5.3 and the placement it had is deleted', deletes(), 1)
+    expect('5.3 though the settle ran', paints, 1)
+    sends, paints = {}, 0
+    burst()
+    expect('5.3 and nothing on the next settle either', placements(), 0)
+    expect('5.3 with nothing left to delete', deletes(), 0)
+
+    -- Closing it gives the cells back, and the picture with them.
+    vim.api.nvim_win_close(over, true)
+    sends, paints = {}, 0
+    burst()
+    expect('5.3 closing the float places it again', placements(), 1)
+
+    -- A float that covers none of the block is not in the way: the popup may
+    -- be open over another part of the page and the block keeps its picture.
+    local beside = vim.api.nvim_open_win(st.source, false, {
+      relative = 'editor',
+      row = origin and origin[1] or 0,
+      col = (origin and origin[2] or 0) + rect.width + 2,
+      width = 5, height = 3, style = 'minimal',
+    })
+    truthy('5.3 beside the block, it is not in the way',
+      not graphics.occluded(win, rect, origin))
+    sends, paints = {}, 0
+    burst()
+    expect('5.3 and the picture is placed', placements(), 1)
+    vim.api.nvim_win_close(beside, true)
+    vim.wait(200)
+    sends = {}
+
+    -- Two blocks, both wholly visible: one placement each. This is also the
+    -- re-render path: entering R is what paints the picture with nobody having
+    -- scrolled.
+    local two = vim.fn.tempname() .. '.md'
+    local sample = repo .. '/tests/fixtures/images/image_sample.png'
+    vim.fn.writefile({
+      '# Two',
+      '',
+      '![one](' .. sample .. ')',
+      '',
+      '![two](' .. sample .. ')',
+      '',
+    }, two)
+    config.setup({ image_mode = 'blocks', image_inline = 'auto', image_max_height = 2 })
+    sends, paints = {}, 0
+    truthy('5.3 in R on two images', reset_to(two))
+    st = current_state()
+    local found = {}
+    local lines = vim.api.nvim_buf_get_lines(st.source, 0, -1, false)
+    for i, text in ipairs(lines) do
+      if text:find('!%[') then
+        found[#found + 1] = graphics.rect(st.doc, i - 1)
+      end
+    end
+    expect('5.3 both references are found', #found, 2)
+    local visible = 0
+    for _, r in ipairs(found) do
+      local piece = r and graphics.slice(st.win, r)
+      if piece and piece.rows == r.height then
+        visible = visible + 1
+      end
+    end
+    expect('5.3 both blocks are wholly visible', visible, 2)
+    truthy('5.3 entering R places both', wait_until(function() return placements() >= 2 end))
+    vim.wait(200)
+    expect('5.3 one placement for each, unasked for', placements(), 2)
+    expect('5.3 in one paint', paints, 1)
+    sends, paints = {}, 0
+    burst()
+    expect('5.3 and the same again for a burst', placements(), 2)
+    expect('5.3 in one paint', paints, 1)
+    vim.fn.delete(two)
+  end)
+
+  graphics.paint = real_paint
+  restore()
+  config.setup({})
+  vim.wait(200)
+  if not ok then
+    error(err, 0)
+  end
+end)
+
+--------------------------------------------------------------------------------
+-- 5.4 The payload of each transport, and the delete
+--------------------------------------------------------------------------------
+
+section('5.4', function()
+  -- A known picture, so that the bytes of both transports can be written out
+  -- here and compared exactly rather than matched loosely.
+  local thumb = 'THUMB'
+  local requests = {}
+  local real_run = graphics.run_thumbnail
+  graphics.run_thumbnail = function(exe, source, cols, rows, background, out, crop)
+    requests[#requests + 1] = {
+      source = source, cols = cols, rows = rows, background = background, out = out, crop = crop,
+    }
+    vim.fn.writefile({ thumb }, out, 'b')
+    return true
+  end
+  local restore = drawing_terminal()
+  local sends = {}
+  graphics.send = function(bytes)
+    sends[#sends + 1] = bytes
+  end
+
+  --- One scroll event, and long enough for its settle to have run.
+  local function settle()
+    vim.api.nvim_exec_autocmds('WinScrolled', {})
+    vim.wait(config.options.resize_debounce + 200)
+  end
+
+  local ok, err = pcall(function()
+    local image_fixture = repo .. '/tests/fixtures/image.md'
+    config.setup({ image_mode = 'blocks', image_inline = 'auto' })
+    truthy('5.4 in R on the image fixture', reset_to(image_fixture))
+    local st = current_state()
+    local win = st.win
+    vim.wo[win].scrolloff = 0
+
+    local line
+    for i, text in ipairs(vim.api.nvim_buf_get_lines(st.source, 0, -1, false)) do
+      if text:find('!%[') then
+        line = i - 1
+        break
+      end
+    end
+    local rect = graphics.rect(st.doc, line)
+    truthy('5.4 the block has a rectangle', rect ~= nil)
+    if not rect then
+      return
+    end
+    local base = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(st.source), ':p:h')
+    local path = graphics.resolve('images/image_sample.png', base)
+    truthy('5.4 the picture resolves to a file', path ~= nil and vim.uv.fs_stat(path) ~= nil)
+
+    local function show_block()
+      vim.api.nvim_win_set_cursor(win, { rect.top + 1, 0 })
+      vim.fn.winrestview({ topline = rect.top + 1 })
+      vim.wait(200)
+    end
+
+    -- The Kitty transport sends the path, at the block's origin, in a box the
+    -- size of the block's cells, under an id of its own.
+    show_block()
+    local slice = graphics.slice(win, rect)
+    local origin = slice and slice.origin
+    truthy('5.4 the block has a screen origin', origin ~= nil)
+    sends = {}
+    settle()
+    expect('5.4 one placement', #sends, 1)
+    local placed = sends[1] or ''
+    local id = tonumber(placed:match('i=(%d+)'))
+    truthy('5.4 carrying an image id', id ~= nil, placed)
+    expect('5.4 the Kitty sequence is the whole payload', placed,
+      graphics.kitty_sequence(origin, rect.width, rect.height, id, path))
+
+    -- A repaint replaces the same placement rather than stacking another on
+    -- top of it.
+    sends = {}
+    settle()
+    expect('5.4 a repaint keeps the id', #sends, 1)
+    expect('5.4 and sends the same sequence', sends[1], placed)
+
+    -- Leaving the window deletes it by name: a Kitty placement is not erased
+    -- by rewriting the cells. The cursor is put at the new top line, because a
+    -- view the cursor sits above is not the view the window keeps.
+    vim.api.nvim_win_set_cursor(win, { rect.top + 3, 0 })
+    vim.fn.winrestview({ topline = rect.top + 3 })
+    vim.wait(200)
+    sends = {}
+    settle()
+    expect('5.4 off the window, one send', #sends, 1)
+    expect('5.4 and it is the delete', sends[1], graphics.kitty_delete(id))
+
+    -- Returning to the source takes R off the screen, and the placement with it.
+    show_block()
+    sends = {}
+    settle()
+    local again = tonumber((sends[1] or ''):match('i=(%d+)'))
+    truthy('5.4 back in view, placed again', again ~= nil, sends[1] or '')
+    sends = {}
+    md.toggle(win)
+    expect('5.4 leaving R deletes its placement', #sends, 1)
+    expect('5.4 once', sends[1], graphics.kitty_delete(again))
+
+    -- The OSC transport sends the thumbnail bytes, in the same box and at the
+    -- same origin, and it is the bytes the engine produced. The threshold for
+    -- sending a file unchanged is set to zero here: this section is about the
+    -- thumbnail's box, and the fixture is small enough that its own bytes would
+    -- otherwise be the payload (5.6 is where that choice is checked).
+    graphics.env = function()
+      return { TERM = 'xterm-256color', TERM_PROGRAM = 'WezTerm' }
+    end
+    config.setup({
+      image_mode = 'blocks', image_inline = 'auto', image_inline_original_bytes = 0,
+    })
+    md.show_rendered(win)
+    truthy('5.4 back in R', wait_until(showing_rendered))
+    -- The settle that entering R asks for is allowed to happen here, before the
+    -- view is put on the block, so that the requests counted below are the
+    -- block's own whatever order the two settles land in.
+    vim.wait(config.options.resize_debounce + 200)
+    show_block()
+    sends = {}
+    settle()
+    expect('5.4 one send', #sends, 1)
+    truthy('5.4 a thumbnail was requested', #requests >= 1, 'requests=' .. #requests)
+    local asked = requests[#requests] or {}
+    expect('5.4 for the block columns', asked.cols, rect.width)
+    expect('5.4 rows', asked.rows, rect.height)
+    local background
+    for _, span in ipairs(st.doc.lines[rect.top + 1].spans or {}) do
+      local style = span[1] and st.doc.styles[span[1] + 1]
+      if style and style.bg then
+        background = style.bg
+        break
+      end
+    end
+    truthy('5.4 the card carries a surface colour', background ~= nil)
+    expect('5.4 which is the letterbox', asked.background, background)
+    slice = graphics.slice(win, rect)
+    origin = slice and slice.origin
+    truthy('5.4 the block is in view again', origin ~= nil)
+    expect('5.4 and it is the whole block', slice and slice.rows, rect.height)
+    expect('5.4 the OSC sequence is the whole payload', sends[1],
+      graphics.osc_sequence(origin, rect.width, rect.height, vim.base64.encode(thumb)))
+
+    -- Nothing has to be deleted on this transport: the picture is in the cells.
+    -- A block still showing some rows is painted over those rows (5.7), so
+    -- "off" has to mean past its last one.
+    local beyond = math.min(rect.top + rect.height + 2,
+      vim.api.nvim_buf_line_count(vim.api.nvim_win_get_buf(win)))
+    vim.api.nvim_win_set_cursor(win, { beyond, 0 })
+    vim.fn.winrestview({ topline = beyond })
+    vim.wait(200)
+    sends = {}
+    settle()
+    expect('5.4 off the window, nothing is sent', #sends, 0)
+  end)
+
+  graphics.run_thumbnail = real_run
+  restore()
+  config.setup({})
+  vim.wait(200)
+  if not ok then
+    error(err, 0)
+  end
+end)
+
+--------------------------------------------------------------------------------
+-- 5.5 A paint that fails is quiet
+--------------------------------------------------------------------------------
+
+section('5.5', function()
+  local restore = drawing_terminal()
+  -- The byte-carrying transport, because it is the one with a step that can
+  -- fail: the thumbnail request. The path-carrying one only writes the path and
+  -- the terminal answers nothing.
+  graphics.env = function()
+    return { TERM = 'xterm-256color', TERM_PROGRAM = 'WezTerm' }
+  end
+  local sends = {}
+  graphics.send = function(bytes)
+    sends[#sends + 1] = bytes
+  end
+
+  local mode = 'refuse'
+  local real_run = graphics.run_thumbnail
+  graphics.run_thumbnail = function(_, _, _, _, _, out)
+    if mode == 'refuse' then
+      return false, 'md-render: cannot read it'
+    end
+    if mode == 'empty' then
+      vim.fn.writefile({}, out, 'b')
+      return true
+    end
+    vim.fn.writefile({ 'THUMB' }, out, 'b')
+    return true
+  end
+
+  local function settle()
+    vim.api.nvim_exec_autocmds('WinScrolled', {})
+    vim.wait(config.options.resize_debounce + 200)
+  end
+
+  local ok, err = pcall(function()
+    -- Its own directory, so that the thumbnail cache has no entry for it and
+    -- every case below really reaches the failing step.
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir, 'p')
+    local picture = dir .. '/picture.png'
+    vim.uv.fs_copyfile(repo .. '/tests/fixtures/images/image_sample.png', picture)
+    local document = dir .. '/quiet.md'
+    vim.fn.writefile({
+      '# Quiet',
+      '',
+      '![a picture](' .. picture:gsub('\\', '/') .. ')',
+      '',
+    }, document)
+
+    -- The thumbnail step is the subject here, so the file is never sent
+    -- unchanged: it is small, and 5.6's threshold would skip the step under
+    -- test.
+    config.setup({
+      image_mode = 'blocks', image_inline = 'auto', image_max_height = 2,
+      image_inline_original_bytes = 0,
+    })
+    truthy('5.5 in R on the temporary picture', reset_to(document))
+    local st = current_state()
+    local line
+    for i, text in ipairs(vim.api.nvim_buf_get_lines(st.source, 0, -1, false)) do
+      if text:find('!%[') then
+        line = i - 1
+        break
+      end
+    end
+    local rect = graphics.rect(st.doc, line)
+    truthy('5.5 the card is in the window',
+      rect ~= nil and graphics.slice(st.win, rect) ~= nil)
+
+    local content = vim.api.nvim_buf_get_lines(st.rendered, 0, -1, false)
+    local maps = vim.api.nvim_buf_get_keymap(st.rendered, 'n')
+
+    local function unchanged(tag)
+      eq_table('5.5 ' .. tag .. ' leaves the card alone',
+        vim.api.nvim_buf_get_lines(st.rendered, 0, -1, false), content)
+      eq_table('5.5 and its keys', vim.api.nvim_buf_get_keymap(st.rendered, 'n'), maps)
+    end
+
+    -- The engine refuses to make the thumbnail.
+    sends = {}
+    local noted = #notifications
+    settle()
+    expect('5.5 a refusal sends nothing', #sends, 0)
+    expect('5.5 and says nothing', #notifications, noted)
+    unchanged('a refusal')
+
+    -- The engine answers with an empty file: no bytes, so nothing to place.
+    mode = 'empty'
+    sends = {}
+    noted = #notifications
+    settle()
+    expect('5.5 an empty answer sends nothing', #sends, 0)
+    expect('5.5 and says nothing', #notifications, noted)
+    unchanged('an empty answer')
+
+    -- The file is gone. Nothing is asked about it in the first place.
+    vim.fn.delete(picture)
+    sends = {}
+    noted = #notifications
+    settle()
+    expect('5.5 a missing file sends nothing', #sends, 0)
+    expect('5.5 and says nothing', #notifications, noted)
+    unchanged('a missing file')
+
+    -- The control: the same paint with a picture that can be made does place
+    -- one, so the zeros above are quiet rather than unwired.
+    vim.uv.fs_copyfile(repo .. '/tests/fixtures/images/image_sample.png', picture)
+    mode = 'ok'
+    sends = {}
+    settle()
+    expect('5.5 a picture that can be made is placed', #sends, 1)
+
+    vim.fn.delete(dir, 'rf')
+  end)
+
+  graphics.run_thumbnail = real_run
+  restore()
+  config.setup({})
+  vim.wait(200)
+  if not ok then
+    error(err, 0)
+  end
+end)
+
+--------------------------------------------------------------------------------
+-- 5.6 A small file is painted as it is, not downscaled
+--------------------------------------------------------------------------------
+
+section('5.6', function()
+  local restore = drawing_terminal()
+  graphics.env = function()
+    return { TERM = 'xterm-256color', TERM_PROGRAM = 'WezTerm' }
+  end
+  local sends = {}
+  graphics.send = function(bytes)
+    sends[#sends + 1] = bytes
+  end
+  local requests = {}
+  local real_run = graphics.run_thumbnail
+  graphics.run_thumbnail = function(_, source, cols, rows, _, out, crop)
+    requests[#requests + 1] = { source = source, cols = cols, rows = rows, crop = crop }
+    vim.fn.writefile({ 'THUMB' }, out, 'b')
+    return true
+  end
+
+  local ok, err = pcall(function()
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir, 'p')
+    local picture = dir .. '/picture.png'
+    vim.uv.fs_copyfile(repo .. '/tests/fixtures/images/image_sample.png', picture)
+    local animated = repo .. '/tests/fixtures/images/image_animation.gif'
+    local size = vim.uv.fs_stat(picture).size
+    local original_bytes = vim.fn.readblob(picture)
+
+    local document = dir .. '/payload.md'
+    vim.fn.writefile({
+      '# Payload',
+      '',
+      '![a picture](' .. picture:gsub('\\', '/') .. ')',
+      '',
+    }, document)
+
+    -- The default threshold is above this fixture, so its own bytes are what a
+    -- settle sends — at its own resolution, with no encode behind it.
+    config.setup({ image_mode = 'blocks', image_inline = 'auto', image_max_height = 4 })
+    truthy('5.6 the default lets a small file through',
+      size <= config.options.image_inline_original_bytes)
+    expect("5.6 and answers the file's own bytes", graphics.original(picture), original_bytes)
+
+    truthy('5.6 in R on the picture', reset_to(document))
+    local st = current_state()
+    vim.wo[st.win].scrolloff = 0
+    local line
+    for i, text in ipairs(vim.api.nvim_buf_get_lines(st.source, 0, -1, false)) do
+      if text:find('!%[') then
+        line = i - 1
+        break
+      end
+    end
+    local rect = graphics.rect(st.doc, line)
+    truthy('5.6 the block has a rectangle', rect ~= nil)
+    if not rect then
+      return
+    end
+    -- The block at the top of the window, as 5.4 does: `nvim -l` never repaints,
+    -- so what `screenpos` reports as visible is whatever the window showed when
+    -- it was last drawn.
+    vim.api.nvim_win_set_cursor(st.win, { rect.top + 1, 0 })
+    vim.fn.winrestview({ topline = rect.top + 1 })
+    local slice = graphics.slice(st.win, rect)
+    truthy('5.6 with a rectangle in the window', slice ~= nil, vim.inspect(rect))
+    if not slice then
+      return
+    end
+    expect('5.6 the whole block is in view', slice.rows, rect.height)
+    local origin = slice.origin
+    sends, requests = {}, {}
+    vim.api.nvim_exec_autocmds('WinScrolled', {})
+    vim.wait(config.options.resize_debounce + 200)
+    truthy('5.6 the picture is placed', #sends >= 1, 'sends=' .. #sends)
+    expect('5.6 as the file itself', sends[1],
+      graphics.osc_sequence(origin, rect.width, rect.height, vim.base64.encode(original_bytes)))
+    expect('5.6 and no thumbnail is asked for', #requests, 0)
+
+    -- A threshold below the file's own size takes it back to the thumbnail.
+    config.setup({
+      image_mode = 'blocks', image_inline = 'auto', image_inline_original_bytes = size - 1,
+    })
+    expect('5.6 under the threshold the file is not sent', graphics.original(picture), nil)
+    requests = {}
+    expect('5.6 and the thumbnail is',
+      graphics.inline_bytes(picture, 8, 4, '#101010'), 'THUMB')
+    expect('5.6 asked for once', #requests, 1)
+
+    -- Zero never sends a file unchanged.
+    config.setup({ image_mode = 'blocks', image_inline = 'auto', image_inline_original_bytes = 0 })
+    requests = {}
+    -- A box the cache has not seen, so the count is this call's.
+    graphics.inline_bytes(picture, 9, 5, '#101010')
+    expect('5.6 zero always takes the thumbnail', #requests, 1)
+    expect('5.6 and sends no file', graphics.original(picture), nil)
+
+    -- An animated picture is one still frame inline, so it keeps its thumbnail
+    -- whatever its size: the original would play itself.
+    config.setup({ image_mode = 'blocks', image_inline = 'auto' })
+    truthy('5.6 the animation is small enough to qualify',
+      vim.uv.fs_stat(animated).size <= config.options.image_inline_original_bytes)
+    expect('5.6 yet an animation is not sent unchanged', graphics.original(animated), nil)
+    requests = {}
+    expect('5.6 and its thumbnail is made',
+      graphics.inline_bytes(animated, 8, 4, '#000000'), 'THUMB')
+    expect('5.6 once', #requests, 1)
+
+    -- A file that is gone answers nothing, and the card is what is left.
+    vim.fn.delete(picture)
+    expect('5.6 a missing file is not sent', graphics.original(picture), nil)
+
+    vim.fn.delete(dir, 'rf')
+  end)
+
+  graphics.run_thumbnail = real_run
+  restore()
+  config.setup({})
+  vim.wait(200)
+  if not ok then
+    error(err, 0)
+  end
+end)
+
+--------------------------------------------------------------------------------
+-- 5.7 A block the window cuts in half is painted up to the cut
+--------------------------------------------------------------------------------
+
+section('5.7', function()
+  -- WezTerm, the byte-carrying transport: it is the one that can be handed an
+  -- encode of part of the picture. Kitty is handed a path and keeps 5.3's rule.
+  local restore = drawing_terminal()
+  graphics.env = function()
+    return { TERM = 'xterm-256color', TERM_PROGRAM = 'WezTerm' }
+  end
+  local sends = {}
+  graphics.send = function(bytes)
+    sends[#sends + 1] = bytes
+  end
+  local requests = {}
+  local real_run = graphics.run_thumbnail
+  graphics.run_thumbnail = function(_, source, cols, rows, background, out, crop)
+    requests[#requests + 1] = {
+      source = source, cols = cols, rows = rows, background = background, crop = crop,
+    }
+    vim.fn.writefile({ 'THUMB' }, out, 'b')
+    return true
+  end
+
+  local ok, err = pcall(function()
+    -- A picture of this section's own. The fixture is rendered by earlier
+    -- sections, and both the document cache and the thumbnail cache would answer
+    -- from what they saw then: the first would hand back a box shaped by
+    -- another section's options, the second an encode cut from another crop.
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir, 'p')
+    local picture = dir .. '/picture.png'
+    vim.uv.fs_copyfile(repo .. '/tests/fixtures/images/image_sample.png', picture)
+    local document = dir .. '/cut.md'
+    vim.fn.writefile({
+      '# Cut',
+      '',
+      '![a picture](' .. picture:gsub('\\', '/') .. ')',
+      '',
+      'After the picture.',
+      '',
+    }, document)
+
+    -- The thumbnail step is the subject, so a file small enough to send
+    -- unchanged would skip it (5.6 is where that choice is checked).
+    config.setup({
+      image_mode = 'blocks', image_inline = 'auto', image_inline_original_bytes = 0,
+    })
+    truthy('5.7 in R on the picture', reset_to(document))
+    -- The settle entering R asks for is allowed to land before the view moves.
+    -- Left pending, it fires after the view is put on the block and fills the
+    -- thumbnail cache with the very encode the checks below count.
+    vim.wait(config.options.resize_debounce + 200)
+    local st = current_state()
+    local win = st.win
+    vim.wo[win].scrolloff = 0
+
+    local line
+    for i, text in ipairs(vim.api.nvim_buf_get_lines(st.source, 0, -1, false)) do
+      if text:find('!%[') then
+        line = i - 1
+        break
+      end
+    end
+    local rect = graphics.rect(st.doc, line)
+    truthy('5.7 the block has a rectangle', rect ~= nil)
+    if not rect then
+      return
+    end
+    -- The rendered page is taller than this window, so the block always has
+    -- rows the window does not show: the engine never makes an image taller
+    -- than the page, and the cut comes from scrolling.
+    truthy('5.7 the block starts below the first line', rect.top > 0, vim.inspect(rect))
+
+    --- One settled scroll with the view already put where the check wants it.
+    local function settle()
+      vim.wait(200)
+      sends, requests = {}, {}
+      vim.api.nvim_exec_autocmds('WinScrolled', {})
+      vim.wait(config.options.resize_debounce + 200)
+    end
+
+    -- The document two lines in: the block still starts inside the window and
+    -- its last rows are below it, so the encode carries the top of the picture
+    -- and stops at the window's edge. (Not the first line: entering R has
+    -- already painted that view, and its encode is cached.)
+    vim.api.nvim_win_set_cursor(win, { 2, 0 })
+    vim.fn.winrestview({ topline = 2 })
+    local cut = graphics.slice(win, rect)
+    truthy('5.7 the block has a slice', cut ~= nil)
+    expect('5.7 with fewer rows than the block', cut and cut.rows < rect.height, true)
+    settle()
+    expect('5.7 one placement', #sends, 1)
+    truthy('5.7 from a thumbnail', #requests >= 1, 'requests=' .. #requests)
+    local asked = requests[#requests] or {}
+    expect('5.7 for the block columns', asked.cols, rect.width)
+    -- The box the engine fits into is the whole block's: cutting its rows is
+    -- what keeps the slice at the picture's own scale.
+    expect('5.7 for the whole block rows', asked.rows, rect.height)
+    expect('5.7 cut from the top of the block', asked.crop and asked.crop.top, 0)
+    expect('5.7 by the number of rows on screen', asked.crop and asked.crop.rows, cut and cut.rows)
+    expect('5.7 placed at the first visible row', sends[1],
+      graphics.osc_sequence(cut and cut.origin, rect.width, cut and cut.rows,
+        vim.base64.encode('THUMB')))
+
+    -- Scrolled so the block's first rows are above the window: the encode is
+    -- the other end of the picture. The cursor goes to the new top line, so the
+    -- view the window reports is not one the cursor would scroll out of.
+    vim.api.nvim_win_set_cursor(win, { rect.top + 3, 0 })
+    vim.fn.winrestview({ topline = rect.top + 3 })
+    local lower = graphics.slice(win, rect)
+    truthy('5.7 a block with rows above the window still has a slice', lower ~= nil)
+    expect('5.7 starting two rows in', lower and lower.top, rect.top + 2)
+    settle()
+    expect('5.7 one placement again', #sends, 1)
+    asked = requests[#requests] or {}
+    expect('5.7 cut two rows in', asked.crop and asked.crop.top, 2)
+    expect('5.7 and as tall as what is left', asked.crop and asked.crop.rows, lower and lower.rows)
+    expect('5.7 at the window top', sends[1],
+      graphics.osc_sequence(lower and lower.origin, rect.width, lower and lower.rows,
+        vim.base64.encode('THUMB')))
+
+    -- The same view again is the same encode: the crop is part of the cache key,
+    -- because the rows on screen are a different picture, not the same one.
+    settle()
+    expect('5.7 the same view is cached', #requests, 0)
+    expect('5.7 and placed from the cache', #sends, 1)
+
+    -- Past the block there is nothing to paint. The last line is the furthest
+    -- the view can go, so the destination is clamped rather than assumed.
+    local last = vim.api.nvim_buf_line_count(vim.api.nvim_win_get_buf(win))
+    local beyond = math.min(rect.top + rect.height + 2, last)
+    vim.api.nvim_win_set_cursor(win, { beyond, 0 })
+    vim.fn.winrestview({ topline = beyond })
+    settle()
+    expect('5.7 off the window, nothing is sent', #sends, 0)
+
+    vim.fn.delete(dir, 'rf')
+  end)
+
+  graphics.run_thumbnail = real_run
+  restore()
+  config.setup({})
+  vim.wait(200)
+  if not ok then
+    error(err, 0)
+  end
+end)
+
+--------------------------------------------------------------------------------
+-- 6.2 The health report names what an inline image becomes
+--------------------------------------------------------------------------------
+
+section('6.2', function()
+  local health = require('md-render.health')
+
+  local function find(report, name)
+    for _, item in ipairs(report.checks) do
+      if item.name == name then
+        return item
+      end
+    end
+  end
+
+  local function probe_with(opts)
+    config.setup(opts)
+    local report = health.probe()
+    return report, find(report, 'image_inline')
+  end
+
+  -- `nvim -l` has no UI, so nothing can draw: the default is a card on its own.
+  local report, entry = probe_with({ image_mode = 'blocks', image_inline = 'auto' })
+  expect('6.2 the default resolves to a card', report.image_inline, 'card')
+  truthy('6.2 the entry is reported', entry ~= nil)
+  truthy('6.2 as a warning', entry ~= nil and entry.severity == 'warn', entry and entry.severity)
+  truthy('6.2 saying why nothing is painted',
+    entry ~= nil and entry.detail:find('on its own', 1, true) ~= nil, entry and entry.detail)
+  expect('6.2 and it does not fail the report', report.ok, true)
+
+  -- A terminal that can draw paints the picture over the card.
+  local restore = drawing_terminal()
+  report, entry = probe_with({ image_mode = 'blocks', image_inline = 'auto' })
+  expect('6.2 with graphics the presentation is still a card', report.image_inline, 'card')
+  truthy('6.2 painted over', entry ~= nil and entry.ok == true, entry and entry.detail)
+  truthy('6.2 and the entry says so',
+    entry ~= nil and entry.detail:find('painted over', 1, true) ~= nil, entry and entry.detail)
+  expect('6.2 with the report still ok', report.ok, true)
+
+  -- The card alone, asked for on purpose: a resolution, not a degradation.
+  report, entry = probe_with({ image_mode = 'blocks', image_inline = 'card' })
+  expect('6.2 card resolves to the card', report.image_inline, 'card')
+  truthy('6.2 and is not a warning about the terminal',
+    entry ~= nil and entry.ok == true, entry and entry.detail)
+  truthy('6.2 because the option asked for it',
+    entry ~= nil and entry.detail:find("image_inline = 'card'", 1, true) ~= nil,
+    entry and entry.detail)
+
+  -- `art` passes the artwork encoding through.
+  report, entry = probe_with({ image_mode = 'blocks', image_inline = 'art' })
+  expect('6.2 art resolves to the artwork encoding', report.image_inline, 'blocks')
+  truthy('6.2 and the entry names it',
+    entry ~= nil and entry.ok == true
+      and entry.detail:find('blocks', 1, true) ~= nil, entry and entry.detail)
+
+  -- `image_mode = 'off'` outranks the card.
+  report, entry = probe_with({ image_mode = 'off', image_inline = 'auto' })
+  expect('6.2 image_mode off resolves to alt text', report.image_inline, 'off')
+  truthy('6.2 and the entry names that too',
+    entry ~= nil and entry.ok == true
+      and entry.detail:find('alt text', 1, true) ~= nil, entry and entry.detail)
+
+  restore()
+  config.setup({})
+end)
+
+--------------------------------------------------------------------------------
+-- 7.1 The image hint: a card or an alt text says which key opens it
+--------------------------------------------------------------------------------
+
+section('7.1', function()
+  local fixture = repo .. '/tests/fixtures/image.md'
+
+  --- The image hint on `st`'s rendered row, or nil.
+  ---
+  --- The hint is virtual text drawn over its row rather than a highlight over
+  --- its cells: a card's row is a band of surface cells with the caption
+  --- centred in it, so an underline marked cells that are not text and never
+  --- said which key to press.
+  local function hinted(st, row)
+    for _, m in ipairs(vim.api.nvim_buf_get_extmarks(st.rendered, render.ns,
+        { row, 0 }, { row, -1 }, { details = true })) do
+      if m[4].virt_text then
+        return m[4]
+      end
+    end
+  end
+
+  --- How many of `st`'s rendered rows carry a hint.
+  local function hinted_rows(st)
+    local count = 0
+    for _, m in ipairs(vim.api.nvim_buf_get_extmarks(st.rendered, render.ns,
+        0, -1, { details = true })) do
+      if m[4].virt_text then
+        count = count + 1
+      end
+    end
+    return count
+  end
+
+  --- The 0-based display rows attributed to source line `lnum`, blanks dropped.
+  local function drawn_rows(st, lnum)
+    local rows = {}
+    for i, l in ipairs(st.doc.lines) do
+      if l.source == lnum then
+        local parts = {}
+        for _, span in ipairs(l.spans or {}) do
+          parts[#parts + 1] = span[2]
+        end
+        if table.concat(parts) ~= '' then
+          rows[#rows + 1] = i - 1
+        end
+      end
+    end
+    return rows
+  end
+
+  --- The 0-based source line of the fixture's image reference.
+  local function image_line(st)
+    for i, text in ipairs(vim.api.nvim_buf_get_lines(st.source, 0, -1, false)) do
+      if text:find('!%[', 1) then
+        return i - 1
+      end
+    end
+  end
+
+  --- The card's rectangle as its top row, the row the hint is written on — the
+  --- bottom of what is drawn — and its display width.
+  local function card_of(st)
+    local rect = graphics.rect(st.doc, image_line(st))
+    if not rect then
+      return nil
+    end
+    return rect.top, rect.top + rect.height - 1, rect.width
+  end
+
+  --- Render the fixture from scratch, so a changed option or a changed terminal
+  --- reaches the hint rather than being answered from the cache.
+  local function rerender()
+    local current = current_state()
+    if current and current.source then
+      state.forget_cache(current.source)
+    end
+    return reset_to(fixture)
+  end
+
+  -- A card is a box of surface cells with a caption on its middle row. Nothing
+  -- about it says a key opens the picture, so the bottom row carries the keys
+  -- to press — on the card, inside the box, rather than beside it.
+  config.setup({ image_mode = 'blocks', image_inline = 'auto' })
+  truthy('7.1 in R on the image fixture', rerender())
+  local st = current_state()
+  local top, bottom, box = card_of(st)
+  truthy('7.1 the reference is a card', top ~= nil)
+  expect('7.1 a card nothing is painted over is three rows', bottom - top + 1, 3)
+  local hint = hinted(st, bottom)
+  truthy("7.1 the card's bottom row says a key opens it", hint ~= nil)
+  eq_table('7.1 the hint names the keys that are bound', hint and hint.virt_text,
+    { { ' <CR>/gx open image', 'MdRenderHint' } })
+  expect('7.1 the hint is drawn over its row, not into it',
+    hint and hint.virt_text_pos, 'win_col')
+  truthy('7.1 the hint is written inside the box',
+    hint ~= nil and hint.virt_text_win_col >= 0
+      and hint.virt_text_win_col + vim.fn.strdisplaywidth(' <CR>/gx open image') <= box)
+  expect('7.1 one hint for one reference', hinted_rows(st), 1)
+  expect("7.1 the caption's row is left alone", hinted(st, top + 1), nil)
+
+  -- On a terminal that paints the picture over the card there is nothing to
+  -- say: the picture is the evidence, and text over it would go at the next
+  -- placement. That card is the artwork's whole box, since the picture is
+  -- measured for it. A card forced on the same terminal has no picture, is
+  -- compact, and keeps its hint.
+  local restore = drawing_terminal()
+  config.setup({ image_inline = 'auto' })
+  truthy('7.1 on a terminal that can paint', rerender())
+  st = current_state()
+  expect('7.1 no hint under a painted picture', hinted_rows(st), 0)
+  top, bottom = card_of(st)
+  truthy('7.1 a painted card keeps the artwork box', bottom - top + 1 > 3)
+  config.setup({ image_inline = 'card' })
+  truthy('7.1 with the picture never painted', rerender())
+  st = current_state()
+  top, bottom = card_of(st)
+  expect('7.1 a forced card is compact', bottom - top + 1, 3)
+  truthy('7.1 a forced card on that terminal is hinted', hinted(st, bottom) ~= nil)
+  restore()
+
+  -- `image_mode = 'off'` keeps the alt text, which is prose the reader has no
+  -- reason to take for a control either. The hint follows the text on its last
+  -- row, leaving the prose itself alone.
+  config.setup({ image_mode = 'off', image_inline = 'auto' })
+  truthy('7.1 with image_mode off', rerender())
+  st = current_state()
+  local rows = drawn_rows(st, image_line(st))
+  truthy('7.1 the alt text has a row', #rows > 0)
+  local last = rows[#rows]
+  local alt = vim.api.nvim_buf_get_lines(st.rendered, last, last + 1, false)[1]
+  local alt_hint = hinted(st, last)
+  truthy('7.1 the alt text says a key opens it', alt_hint ~= nil)
+  expect('7.1 the hint follows the alt text', alt_hint and alt_hint.virt_text_win_col,
+    vim.fn.strdisplaywidth(alt) + 1)
+  expect('7.1 one hint for the alt text', hinted_rows(st), 1)
+
+  -- `art` leaves the picture to `image_mode`; the artwork is a drawing, and an
+  -- annotation over its glyphs would repaint it. It is not hinted.
+  config.setup({ image_mode = 'blocks', image_inline = 'art' })
+  truthy('7.1 back to the artwork', rerender())
+  st = current_state()
+  top = card_of(st)
+  truthy('7.1 the artwork has a box', top ~= nil)
+  expect('7.1 artwork carries no hint', hinted_rows(st), 0)
+
+  -- The text follows the keys that are there: with only one bound it names only
+  -- that one.
+  config.setup({ keymaps = { preview = false } })
+  truthy('7.1 with only the open-image key bound', rerender())
+  st = current_state()
+  local _, bottom_row = card_of(st)
+  hint = hinted(st, bottom_row)
+  eq_table('7.1 the hint names only the keys that are bound', hint and hint.virt_text,
+    { { ' gx open image', 'MdRenderHint' } })
+
+  -- With neither key bound there is nothing to advertise, which is the rule the
+  -- follow hint already follows.
+  config.setup({ keymaps = { preview = false, open_image = false } })
+  truthy('7.1 with neither image key bound', rerender())
+  st = current_state()
+  truthy('7.1 the card is still there', graphics.rect(st.doc, image_line(st)) ~= nil)
+  expect('7.1 no hint for a key that is not there', hinted_rows(st), 0)
+
+  config.setup({})
 end)
 
 --------------------------------------------------------------------------------

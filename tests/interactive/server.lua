@@ -346,6 +346,128 @@ function M.settled(cols)
   quiescent()
 end
 
+--------------------------------------------------------------------------------
+-- Inline pictures
+--------------------------------------------------------------------------------
+
+--- The fixture with an image near the top and enough text below it for a scroll
+--- to take the block off the screen and back.
+local inline_scroll = repo .. '/tests/fixtures/inline-image-scroll.md'
+
+local graphics = require('md-render.graphics')
+local linkmod = require('md-render.link')
+local config = require('md-render.config')
+
+--- The transport inputs, before `inline_reset` replaced them.
+local real_graphics
+
+--- What the plugin asked the terminal to do since `inline_reset`.
+local inline = { paints = 0, placements = 0, deletes = 0 }
+
+--- Show the inline-image fixture with a terminal that can draw.
+---
+--- A headless server has no UI and no terminal implements a graphics protocol,
+--- so the three identity inputs are answered here: `has_send` and `uis` stand
+--- in for Neovim 0.12 attached to a terminal, and `env` names kitty. The kitty
+--- transport is the one that needs no engine call and whose placements are
+--- named, so a scroll that takes the block away has to delete it. Everything
+--- above those inputs is the plugin's own and runs in a real main loop: the
+--- autocmds, the debounce, the wholly-visible rule a path-carrying transport
+--- keeps. That is the part `nvim -l` cannot exercise, and the part this check is
+--- about.
+function M.inline_reset()
+  if not real_graphics then
+    real_graphics = {
+      has_send = graphics.has_send,
+      uis = graphics.uis,
+      env = graphics.env,
+      send = graphics.send,
+      paint = graphics.paint,
+    }
+  end
+  graphics.has_send = function() return true end
+  graphics.uis = function() return { {} } end
+  graphics.env = function() return { TERM = 'xterm-kitty' } end
+  graphics.send = function(bytes)
+    if bytes:find(',a=T', 1, true) then
+      inline.placements = inline.placements + 1
+    elseif bytes:find('a=d', 1, true) then
+      inline.deletes = inline.deletes + 1
+    end
+  end
+  graphics.paint = function(...)
+    inline.paints = inline.paints + 1
+    return real_graphics.paint(...)
+  end
+
+  inline.paints, inline.placements, inline.deletes = 0, 0, 0
+
+  preview.close()
+  if #vim.api.nvim_list_wins() > 1 then
+    vim.cmd('only')
+  end
+  vim.cmd('edit! ' .. vim.fn.fnameescape(inline_scroll))
+  md.attach(vim.api.nvim_get_current_buf(), vim.api.nvim_get_current_win())
+  vim.wait(8000, function()
+    local s = st()
+    return s ~= nil and s.mode == 'R' and s.doc ~= nil
+  end)
+  -- Showing a document schedules the first paint, and the settle is a timer:
+  -- without waiting past the debounce the entry placement would land after the
+  -- first report and be counted against the scroll that follows.
+  vim.wait(config.options.resize_debounce + 300)
+  quiescent()
+end
+
+--- Where the image block is, and what the settle has asked for since
+--- `inline_reset`.
+---
+--- The wait is part of the report rather than a step before it: the settle is a
+--- debounce, so a report taken in the same breath as the scroll would be about
+--- a viewport that had not settled and a paint that had not run.
+function M.inline_report(tag)
+  vim.wait(config.options.resize_debounce + 300)
+  quiescent()
+
+  local s = st()
+  local lines = vim.api.nvim_buf_get_lines(s.source, 0, -1, false)
+  local source
+  for i = 1, #lines do
+    if #linkmod.images(lines, i - 1) > 0 then
+      source = i - 1
+      break
+    end
+  end
+  local rect = source and graphics.rect(s.doc, source)
+  local slice = rect and graphics.slice(s.win, rect)
+  vim.fn.writefile({
+    'paints=' .. inline.paints,
+    'placements=' .. inline.placements,
+    'deletes=' .. inline.deletes,
+    'rect_top=' .. tostring(rect and rect.top or ''),
+    'rect_height=' .. tostring(rect and rect.height or ''),
+    'rect_width=' .. tostring(rect and rect.width or ''),
+    -- The whole block, not merely a slice: this suite stands in for a
+    -- path-carrying terminal, which is handed a file it cannot crop and so
+    -- paints only what is wholly visible.
+    'visible=' .. tostring(slice ~= nil and slice.rows == rect.height),
+    'topline=' .. tostring(view_of(s.win).topline),
+    'cursor_line=' .. tostring(vim.api.nvim_win_get_cursor(s.win)[1]),
+  }, string.format('%s/%s.txt', out, tag))
+end
+
+--- Put the transport back, so nothing after this check is answered by fakes.
+function M.inline_restore()
+  if not real_graphics then
+    return
+  end
+  graphics.has_send = real_graphics.has_send
+  graphics.uis = real_graphics.uis
+  graphics.env = real_graphics.env
+  graphics.send = real_graphics.send
+  graphics.paint = real_graphics.paint
+end
+
 --- Close the preview, if one is open.
 function M.close_preview()
   preview.close()

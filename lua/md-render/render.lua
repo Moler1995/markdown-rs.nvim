@@ -4,8 +4,11 @@
 -- The engine's output is already the layout: a list of lines, each with its
 -- text and its styles, and each knowing the source line it came from. So
 -- "rendering" here is a `nvim_buf_set_lines` and one extmark per span. There
--- is no conceal, no virtual text and no line-height arithmetic, because R is a
--- real buffer rather than a decorated view of S.
+-- is no conceal and no line-height arithmetic, because R is a real buffer
+-- rather than a decorated view of S. The one piece of virtual text is the image
+-- hint, drawn over the row it annotates: it shifts nothing and is not part of
+-- the line's bytes, so the one-buffer-line-per-display-line correspondence the
+-- source mapping rests on is untouched.
 
 local config = require('md-render.config')
 local style = require('md-render.style')
@@ -28,7 +31,14 @@ end
 --- `styles` is the document's style table; each span's index is an index into
 --- it. Styles are interned here rather than up front, so a frame using a colour
 --- no earlier frame used costs one highlight group and nothing else.
-local function paint_line(buf, row, line, styles, hints)
+---
+--- `image` is the hint for a row that shows an image reference as something a
+--- key opens — a card's caption row, or the alt text the engine writes when it
+--- cannot draw the picture. Such a row looks like ordinary text or an inert
+--- surface, so the hint says in words which key opens the picture; the caller
+--- decides which row it goes on and at what column, since it is the one that
+--- knows the presentation.
+local function paint_line(buf, row, line, styles, hints, image)
   -- Extmark columns are byte offsets, so this walks bytes rather than
   -- columns. That is also why the engine's width guarantee matters here: a
   -- line that overflowed would soft-wrap and break the one-display-line-per-
@@ -69,6 +79,22 @@ local function paint_line(buf, row, line, styles, hints)
       end
     end
   end
+
+  -- The image hint is virtual text drawn over the row, not an underline: a
+  -- card's caption is centred in a box of surface cells and an alt text is a
+  -- line of prose, so neither has a byte range to mark the way an engine link
+  -- does, and a word at the row's end says which key to press. Overlay is the
+  -- position that shifts nothing: end-of-line virtual text on a card would
+  -- reach past the window's right edge, where a wrapped line would become two
+  -- screen rows and the source mapping would drift.
+  if image then
+    vim.api.nvim_buf_set_extmark(buf, M.ns, row, 0, {
+      virt_text = { { image.text, style.hint_group } },
+      virt_text_pos = 'overlay',
+      virt_text_win_col = image.col,
+      hl_mode = 'combine',
+    })
+  end
 end
 
 --- Replace `buf`'s contents with `doc` and style every span.
@@ -77,7 +103,12 @@ end
 --- underlined. The preview popup passes false: it shows the same lines but
 --- binds no follow key of its own, and a hint for a key that is not there
 --- would mislead.
-function M.apply(buf, doc, hints)
+---
+--- `image_hints` maps a 0-based display row to `{ text, col }`: the hint saying
+--- which key opens an image shown as a card or an alt text, and the window
+--- column it is drawn at. It is built by the caller that knows the
+--- presentation, the keys bound and the room on the row; the popup passes none.
+function M.apply(buf, doc, hints, image_hints)
   local lines = {}
   for i, line in ipairs(doc.lines) do
     lines[i] = line_text(line)
@@ -97,7 +128,8 @@ function M.apply(buf, doc, hints)
   vim.api.nvim_buf_clear_namespace(buf, M.ns, 0, -1)
 
   for i, line in ipairs(doc.lines) do
-    paint_line(buf, i - 1, line, doc.styles, hints ~= false)
+    paint_line(buf, i - 1, line, doc.styles, hints ~= false,
+      image_hints ~= nil and image_hints[i - 1] or nil)
   end
 
   vim.bo[buf].modifiable = false

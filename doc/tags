@@ -9,6 +9,7 @@ md-render-engine-resolution	md-render.txt	/*md-render-engine-resolution*
 md-render-graphics	md-render.txt	/*md-render-graphics*
 md-render-health	md-render.txt	/*md-render-health*
 md-render-images	md-render.txt	/*md-render-images*
+md-render-inline	md-render.txt	/*md-render-inline*
 md-render-installation	md-render.txt	/*md-render-installation*
 md-render-keymaps	md-render.txt	/*md-render-keymaps*
 md-render-links	md-render.txt	/*md-render-links*

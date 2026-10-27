@@ -72,6 +72,12 @@ local function image_base(source)
   return vim.fn.fnamemodify(name, ':p:h')
 end
 
+--- Ask for the inline pictures to be painted again, after a settle.
+---
+--- Declared here because showing a document is what asks for the first paint,
+--- and the definition needs helpers that come later in the file.
+local schedule_settle
+
 --- The name to give this window's rendered buffer.
 ---
 --- The buffer must be named: `:w` on an unnamed `acwrite` buffer fails with
@@ -150,6 +156,130 @@ local function still_ours(st)
   return shown == st.source or shown == st.rendered or shown == st.inherited
 end
 
+--- Stop managing `win`, taking any inline picture off it first.
+---
+--- The picture is not part of the state, so it would otherwise be left over
+--- whatever put the window to another use: a Kitty placement outlives the cells
+--- being rewritten, and those cells are about to be somebody else's.
+local function drop(win)
+  graphics.clear(win)
+  state.forget(win)
+end
+
+--- The hint that says an image is something a key opens, per display row.
+---
+--- Only the presentations that leave the reference looking like ordinary text
+--- qualify. A card is a box of surface cells with one caption row, and an alt
+--- text is what the engine writes when it cannot draw the picture — neither
+--- says that pressing a key does anything. A card's caption is the box's middle
+--- row, which is where `draw_card` puts it, so the hint goes on the row below
+--- it, inside the box; an alt text can wrap, so the hint goes after the last
+--- row of the run it came from. Artwork is deliberately
+--- left alone: it is a drawing, and an annotation over its glyphs would paint
+--- over it. Neither is a card that the terminal paints a picture over: the
+--- picture itself says the reference is an image, and text over it would be
+--- erased by the next placement.
+---
+--- The hint is a word rather than an underline. On a card the row is a band of
+--- surface cells with the caption centred in it and nothing at either end, so
+--- an underline marks cells that are not text at all; a hint that names the
+--- keys says the same thing and says which keys. Its text is built from the
+--- keys actually bound, and nothing is returned when neither is: a hint for a
+--- key that is not there would mislead, which is the rule the follow hint
+--- already follows.
+---
+--- The result maps a 0-based display row to `{ text, col }`, where `col` is the
+--- window column the hint is drawn at. The room is measured here rather than in
+--- `render`, because only this side knows the window: `render` receives a
+--- buffer and writes it, with no window it could ask about columns.
+local function image_hints(st, doc)
+  local hints = {}
+  local text = config.image_hint_text()
+  if not text then
+    return hints
+  end
+  local encoding = config.image_inline_encoding()
+  if encoding ~= 'card' and encoding ~= 'off' then
+    return hints
+  end
+  if encoding == 'card' and config.options.image_inline ~= 'card'
+    and graphics.available() then
+    return hints
+  end
+  if not st.source or not vim.api.nvim_buf_is_valid(st.source) then
+    return hints
+  end
+  if not vim.api.nvim_win_is_valid(st.win) then
+    return hints
+  end
+
+  local width_of_hint = vim.fn.strdisplaywidth(text)
+  local info = vim.fn.getwininfo(st.win)[1]
+  local room = vim.api.nvim_win_get_width(st.win) - (info and info.textoff or 0)
+  local lines = vim.api.nvim_buf_get_lines(st.source, 0, -1, false)
+
+  local at = 1
+  while at <= #doc.lines do
+    local source = doc.lines[at].source
+    if source == nil then
+      at = at + 1
+    else
+      local first = at
+      while at < #doc.lines and doc.lines[at + 1].source == source do
+        at = at + 1
+      end
+      -- The drawn rows only: a blank line attributed to the same source is not
+      -- part of the picture's box, and counting it would put the caption one
+      -- row low. This is the same run `graphics.rect` measures.
+      local drawn = {}
+      for row = first, at do
+        local text_of_row = {}
+        for _, span in ipairs(doc.lines[row].spans or {}) do
+          text_of_row[#text_of_row + 1] = span[2]
+        end
+        text_of_row = table.concat(text_of_row)
+        if text_of_row ~= '' then
+          drawn[#drawn + 1] = { row = row, text = text_of_row }
+        end
+      end
+      if #drawn > 0 and #link.images(lines, source) > 0 then
+        local target, col
+        if encoding == 'off' then
+          -- An alt text is prose: the hint goes after it, on its last row, and
+          -- is left out when the line already reaches the window's edge.
+          target = drawn[#drawn]
+          col = vim.fn.strdisplaywidth(target.text) + 1
+          if col + width_of_hint > room then
+            col = nil
+          end
+        else
+          -- The hint is written on the card rather than beside it: the card's
+          -- bottom row is surface below the caption, and a hint anchored there
+          -- reads as part of the card instead of as an annotation floating next
+          -- to it. It is right-aligned a column in from the box's edge, which
+          -- is where the card's own width leaves room for it: a compact card is
+          -- as wide as its hint needs. A card with a single drawn row has no
+          -- row below the caption, and a caption is not something to write
+          -- over, so such a card gets no hint.
+          if #drawn > 1 then
+            target = drawn[#drawn]
+            local box = vim.fn.strdisplaywidth(target.text)
+            col = math.min(box, room) - width_of_hint - 1
+            if col < 0 then
+              col = nil
+            end
+          end
+        end
+        if col and col >= 0 then
+          hints[target.row - 1] = { text = text, col = col }
+        end
+      end
+      at = at + 1
+    end
+  end
+  return hints
+end
+
 --- Show `doc` in R in `st`'s window.
 ---
 --- The cursor is placed by mapping the source position rather than by
@@ -159,7 +289,7 @@ end
 local function show_rendered(st, doc)
   local win = st.win
   if not still_ours(st) then
-    state.forget(win)
+    drop(win)
     return
   end
 
@@ -171,7 +301,7 @@ local function show_rendered(st, doc)
   end
 
   if st.doc ~= doc then
-    render.apply(buf, doc)
+    render.apply(buf, doc, true, image_hints(st, doc))
     st.doc = doc
     -- A new document is a new layout, and the frame that was showing belonged
     -- to the old one. Every render starts the image over on its first frame.
@@ -229,6 +359,11 @@ local function show_rendered(st, doc)
   end
 
   st.mode = 'R'
+
+  -- The buffer was just written, and a placement is a paint over cells that any
+  -- write erases. Asking for a settle here is what puts the pictures back after
+  -- a render, a toggle and a re-render alike; the debounce makes it one paint.
+  schedule_settle()
 end
 
 --- Show the source in `st`'s window, at the line R was showing.
@@ -246,13 +381,18 @@ end
 local function show_source(st)
   local win = st.win
   if not still_ours(st) then
-    state.forget(win)
+    drop(win)
     return
   end
   local source = st.source
   if not source or not vim.api.nvim_buf_is_valid(source) then
     return
   end
+
+  -- R is about to be replaced by S in this window. The picture sits over the
+  -- cells R had, and the Kitty transport keeps it there through the swap, so it
+  -- has to be taken off by name rather than left to the rewrite.
+  graphics.clear(win)
 
   local line
   if st.rendered and vim.api.nvim_buf_is_valid(st.rendered)
@@ -363,14 +503,19 @@ local function request(st, opts)
   if type(cap) == 'number' and cap > 0 then
     height = math.min(height, cap)
   end
-  local encoding = config.image_encoding()
+  -- What an inline image is: `image_inline` resolved against `image_mode`, so
+  -- it is the card whenever the reader asked for one. The popup asks for its
+  -- own view and is deliberately not routed through here.
+  local encoding = config.image_inline_encoding()
   local tick = vim.api.nvim_buf_get_changedtick(source)
   local theme = config.options.theme
   -- Frames are asked for only when a caller actually wants them — the step key
   -- on an image, or the popup opening one. With the option off they are never
   -- asked for, whatever the caller wants.
   local animation = (opts.animate and config.options.image_animation) and true or false
-  local image = config.image_options()
+  -- The terminal's answer, not the option's: a card is compact only where no
+  -- picture is ever painted over it, and whether one is comes from `graphics`.
+  local image = config.image_options(graphics.available())
 
   local cached = state.cached(source, tick, width, height, encoding, theme, animation, image)
   if cached then
@@ -528,7 +673,7 @@ function M.attach(buf, win)
   if st.source and st.source ~= buf then
     -- The window has moved to a different document; the old state is not
     -- reachable from here any more.
-    state.forget(win)
+    drop(win)
     st = state.get(win)
   end
   -- A window split off a window showing R starts out showing that window's
@@ -592,9 +737,9 @@ function M.attach_current_soon()
   end)
 end
 
---- Forget everything about `win`.
+--- Forget everything about `win`, and take its inline picture with it.
 function M.detach(win)
-  state.forget(win)
+  drop(win)
 end
 
 --- Swap between R and S in `win`.
@@ -654,6 +799,19 @@ function M.preview(win)
     return
   end
 
+  -- An image's popup is the picture itself, drawn by the terminal. Where the
+  -- terminal cannot draw one, the popup would be the artwork the document
+  -- already shows — so the key takes the open-image path instead and hands the
+  -- file to its own viewer. The predicate is the transport's rather than
+  -- `image_inline`'s: `art` on a terminal that cannot draw routes out too, and a
+  -- terminal that can draw keeps the popup whatever the document shows inline.
+  -- Diagrams and tables have no viewer to hand a file to and keep their popups
+  -- everywhere.
+  if block.kind == 'image' and not graphics.available() then
+    M.open_image(win)
+    return
+  end
+
   -- A preview is a second render of a block, and two can be in flight if the
   -- key is pressed twice before the first engine answers. The older answer is
   -- dropped rather than opened over the newer one.
@@ -689,6 +847,51 @@ local function source_lines(st)
     return nil
   end
   return vim.api.nvim_buf_get_lines(st.source, 0, -1, false)
+end
+
+--- Paint the wholly visible inline pictures in every window showing R.
+---
+--- Called only from the debounce below. The work is decided from what the
+--- window is showing now, not from what a previous settle painted, so a scroll
+--- that left a block behind needs no bookkeeping: that block has no rectangle
+--- on screen any more and is simply not in this pass.
+local function settle()
+  if config.image_inline_encoding() ~= 'card' then
+    return
+  end
+  for _, st in pairs(state.windows) do
+    if st.want == 'R' and st.doc and st.rendered
+      and vim.api.nvim_win_is_valid(st.win)
+      and vim.api.nvim_win_get_buf(st.win) == st.rendered then
+      local lines = source_lines(st)
+      if lines then
+        graphics.paint(st.win, st.doc, lines, image_base(st.source))
+      end
+    end
+  end
+end
+
+--- The coalescing timer for `settle`.
+local settle_timer = vim.uv.new_timer()
+
+--- Ask for a paint, coalescing a burst of scrolls, moves and repaints.
+---
+--- Scrolls, resizes, cursor motions and repaints all arrive in bursts — a
+--- wheel or a held key fires one event per row — and each of them wipes the
+--- paints already on screen. Neither the first nor the last event of the burst
+--- is the one to paint at: the viewport has to be still for the rectangle to be
+--- where the next paint will put it. A picture over a card loses nothing by
+--- waiting one debounce: the card is what is showing meanwhile.
+---
+--- Nothing is asked when the inline image is not a card or the terminal cannot
+--- draw: both answers are read here so the timer is not started for a paint
+--- that would do nothing.
+function schedule_settle()
+  if config.image_inline_encoding() ~= 'card' or not graphics.available() then
+    return
+  end
+  settle_timer:stop()
+  settle_timer:start(config.options.resize_debounce, 0, vim.schedule_wrap(settle))
 end
 
 --- The animation `doc` carries for the reference on source line `lnum`, if any.
@@ -1329,6 +1532,10 @@ function M.setup_autocmds()
     group = group,
     callback = function(args)
       M.detach(tonumber(args.match))
+      -- Closing the preview float repaints what was underneath it, which is the
+      -- inline picture if there was one there. Every other kind of close is a
+      -- lost paint too, and one settle covers both.
+      schedule_settle()
     end,
   })
 
@@ -1399,6 +1606,18 @@ function M.setup_autocmds()
     group = group,
     callback = schedule_refresh,
   })
+
+  -- Every move of the viewport or the cursor is a repaint of cells a picture
+  -- was painted over — and with `cursorline` set, a cursor motion alone is
+  -- enough. One debounce for all of them, and for the resize that already
+  -- re-renders: the render's own completion asks again through `show_rendered`,
+  -- so the expensive path is not repeated here.
+  vim.api.nvim_create_autocmd(
+    { 'WinScrolled', 'WinResized', 'VimResized', 'CursorMoved', 'CursorMovedI' },
+    {
+      group = group,
+      callback = schedule_settle,
+    })
 
   -- The source changed: R is stale until it is rendered again, but only where R
   -- is actually on screen — a re-render for a window showing S would be a

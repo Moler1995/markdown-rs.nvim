@@ -43,10 +43,13 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use image::imageops::{self, FilterType};
 use image::{AnimationDecoder, DynamicImage, Frame, ImageFormat, RgbImage, RgbaImage};
 use serde::Serialize;
+use unicode_width::UnicodeWidthChar;
 
 use crate::style::{Color, Line, Span, Style};
+use crate::text_layout::measure;
 
 /// The largest image file, in bytes, that will be read.
 ///
@@ -201,8 +204,42 @@ pub enum ImageEncoding {
     Quads,
     /// ASCII glyphs from the luminance ramp, one colour per cell.
     Ascii,
+    /// No pixels: a quiet card of the artwork's own box, carrying one caption.
+    ///
+    /// The card occupies exactly the cells the pixel encodings would, so a
+    /// document's flow and source mapping do not depend on which encoding
+    /// drew it. It is a placeholder for a picture shown some other way — by
+    /// the terminal's graphics protocol, in a preview — and the floor a failed
+    /// placement falls back to, not a way to see the picture.
+    Card,
     /// No artwork; the reference reads as its alt text.
     Off,
+}
+
+/// The two colours a [`ImageEncoding::Card`] is drawn with.
+///
+/// [`Color::Reset`] — the default — leaves the cell's own colour in place,
+/// which is what a caller that never asks for a card wants.
+/// [`crate::document`] fills both from the selected theme, because the caller
+/// names a theme rather than its tokens.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CardColours {
+    /// The surface filling the box.
+    pub background: Color,
+    /// The caption's foreground.
+    pub caption: Color,
+}
+
+impl CardColours {
+    /// The colours a card takes from a theme: the raised surface behind the
+    /// box, and the muted text colour for its caption.
+    #[must_use]
+    pub fn from_palette(palette: &crate::theme::Palette) -> CardColours {
+        CardColours {
+            background: palette.code_bg,
+            caption: palette.dim,
+        }
+    }
 }
 
 /// Where a cell's colours come from.
@@ -294,6 +331,28 @@ pub struct ImageOptions<'a> {
     /// as gaps — and on a light page it is the dark side. `None` means the
     /// caller did not say; the layout then uses the theme's background.
     pub paper: Option<[u8; 3]>,
+    /// The rows a card is drawn with, or zero for the artwork's own box.
+    ///
+    /// A caller that paints the picture over the card needs the box the
+    /// artwork was measured for, so it leaves this zero. A caller that shows
+    /// no picture anywhere gives a small fixed height instead: the card stays
+    /// the width of the artwork's box — the picture's own shape — but a page
+    /// of images then reads as a page of cards rather than as a column of
+    /// towers. The page's own row bound stays hard, so a short window makes a
+    /// shorter card rather than one that spills.
+    pub card_rows: u16,
+    /// The narrowest a card may be, in display columns, or zero for the
+    /// artwork's box.
+    ///
+    /// A card is written on: its caption, and whatever the caller draws over
+    /// it. A floor here lets a short card stay as wide as what it has to hold,
+    /// which is what keeps a caller's own annotation inside the box. The
+    /// page's width stays the hard bound, so the floor can never widen a
+    /// document.
+    pub card_min_width: u16,
+    /// The colours a card is drawn with, or the default that asks the layout
+    /// for the theme's.
+    pub card: CardColours,
 }
 
 /// A style reduced to the two colours that distinguish it, as 8-bit channels.
@@ -440,6 +499,15 @@ pub fn artwork(
         return None;
     }
     let path = resolve(dest, options.base)?;
+    if options.encoding == ImageEncoding::Card {
+        // The card needs the picture's shape, not its pixels: the header is
+        // enough, so a file over the decode limits still becomes a card.
+        let (width, height) = header_dimensions(&path)?;
+        let (cols, rows, _) = cell_grid(width, height, bounds, options.min_rows)?;
+        let cols = card_width(cols, bounds, options.card_min_width);
+        let rows = card_height(rows, bounds, options.card_rows);
+        return Some(draw_card(&path, width, height, cols, rows, options));
+    }
     let image = load(&path)?;
     let (cols, rows, enlarge) = cell_grid(image.width(), image.height(), bounds, options.min_rows)?;
     let reduced = enlarge == 1 && was_reduced(image.width(), image.height(), cols, rows);
@@ -465,6 +533,15 @@ pub fn animated_artwork(
         return None;
     }
     let path = resolve(dest, options.base)?;
+    if options.encoding == ImageEncoding::Card {
+        // There is no picture on a card, so there is nothing to animate: the
+        // result is a still first frame and no frames at all.
+        return artwork(dest, bounds, options, budget).map(|lines| Artwork {
+            lines,
+            frames: Vec::new(),
+            animation_limited: false,
+        });
+    }
     let image = load(&path)?;
     let (cols, rows, enlarge) = cell_grid(image.width(), image.height(), bounds, options.min_rows)?;
     let reduced = enlarge == 1 && was_reduced(image.width(), image.height(), cols, rows);
@@ -497,6 +574,174 @@ pub fn animated_artwork(
     })
 }
 
+/// The largest pixel count a thumbnail is encoded at.
+///
+/// A bound on encode time and on the payload the plugin re-sends whenever the
+/// viewport settles, not a quality setting: two megapixels is a few hundred
+/// kilobytes however it is encoded, and far more detail than a cell box on a
+/// terminal can show.
+pub const MAX_THUMBNAIL_PIXELS: u64 = 2_000_000;
+
+/// The pixel width a thumbnail's box aims for, whatever the cell box is.
+///
+/// Wide enough that a terminal stretching it into cells loses nothing a reader
+/// would notice, small enough that the payload stays cheap.
+const THUMBNAIL_TARGET_WIDTH: u32 = 640;
+
+/// Encode `source` as a thumbnail for a `cols` × `rows` cell box at `out`.
+///
+/// The box is `cols × k` by `rows × 2k`: the artwork's own 2:1 cell
+/// assumption, so the terminal places the picture where the card was. The
+/// picture is scaled to fit inside the box without distortion and centred,
+/// with the remainder filled with `background`, so the placement is a clean
+/// rectangle and nothing of the card shows at an edge.
+///
+/// `crop` asks for part of that box instead of all of it, as `(top, rows)` in
+/// cells: the box is drawn in full and then cut, so the rows carry exactly the
+/// cells they will be placed on. That is what lets a block half-scrolled out of
+/// the window send the rows still on screen — the picture is cut at the window's
+/// edge, as it would be if the terminal could clip a placement. The resolution
+/// per cell is the whole box's, so a crop and the full picture are the same
+/// picture at the same scale, and `None` is the whole box.
+///
+/// PNG is written when the picture has transparent pixels and JPEG otherwise,
+/// both with the encoders the engine already links. The same request twice
+/// produces the same bytes.
+///
+/// # Errors
+///
+/// Every refusal names what it refused: a missing or unreadable file, one
+/// over the decoding limits, an unsupported format, a cell box that leaves no
+/// room or whose pixel box is over [`MAX_THUMBNAIL_PIXELS`], a crop that is not
+/// inside the box, or an output path that cannot be written.
+pub fn thumbnail(
+    source: &Path,
+    cols: u16,
+    rows: u16,
+    crop: Option<(u16, u16)>,
+    background: [u8; 3],
+    out: &Path,
+) -> Result<(), String> {
+    let (box_width, box_height) = thumbnail_box(cols, rows)?;
+    let (crop_top, crop_rows) = crop.unwrap_or((0, rows));
+    if crop_rows == 0 || u32::from(crop_top) + u32::from(crop_rows) > u32::from(rows) {
+        return Err(format!(
+            "--crop {crop_top}x{crop_rows} is not inside the {cols}x{rows} box"
+        ));
+    }
+    let pixels = decode_thumbnail_source(source)?;
+    let transparent = pixels.pixels().any(|pixel| pixel[3] < u8::MAX);
+
+    let (src_width, src_height) = pixels.dimensions();
+    let scale = (f64::from(box_width) / f64::from(src_width))
+        .min(f64::from(box_height) / f64::from(src_height));
+    // Rounding may exceed the box by a pixel; the box is the bound.
+    let fit_width = ((f64::from(src_width) * scale).round() as u32).clamp(1, box_width);
+    let fit_height = ((f64::from(src_height) * scale).round() as u32).clamp(1, box_height);
+    let fitted = imageops::resize(&pixels, fit_width, fit_height, FilterType::Triangle);
+
+    let mut canvas = RgbaImage::from_pixel(
+        box_width,
+        box_height,
+        image::Rgba([background[0], background[1], background[2], u8::MAX]),
+    );
+    imageops::replace(
+        &mut canvas,
+        &fitted,
+        i64::from((box_width - fit_width) / 2),
+        i64::from((box_height - fit_height) / 2),
+    );
+
+    // The box is `rows × 2k` pixels tall, so a cell is `2k` of them and a
+    // row-aligned crop lands on a pixel row exactly. Cutting the drawn box
+    // rather than the source keeps the letterboxing and the centring of the
+    // whole picture, which is what makes the crop the same picture at the same
+    // place.
+    let picture = if crop.is_some() {
+        let cell_height = box_height / u32::from(rows);
+        imageops::crop_imm(
+            &canvas,
+            0,
+            u32::from(crop_top) * cell_height,
+            box_width,
+            u32::from(crop_rows) * cell_height,
+        )
+        .to_image()
+    } else {
+        canvas
+    };
+
+    let saved = if transparent {
+        DynamicImage::ImageRgba8(picture).save_with_format(out, ImageFormat::Png)
+    } else {
+        DynamicImage::ImageRgba8(picture)
+            .to_rgb8()
+            .save_with_format(out, ImageFormat::Jpeg)
+    };
+    saved.map_err(|err| format!("could not write {}: {err}", out.display()))
+}
+
+/// The pixel box a `cols` × `rows` cell box is encoded at.
+fn thumbnail_box(cols: u16, rows: u16) -> Result<(u32, u32), String> {
+    if cols == 0 || rows == 0 {
+        return Err(format!("--box {cols}x{rows} leaves no room for a cell"));
+    }
+    let (cols, rows) = (u32::from(cols), u32::from(rows));
+    let mut scale = (THUMBNAIL_TARGET_WIDTH / cols).max(1);
+    while scale > 1 && u64::from(cols * scale) * u64::from(rows * 2 * scale) > MAX_THUMBNAIL_PIXELS
+    {
+        scale -= 1;
+    }
+    let (width, height) = (cols * scale, rows * 2 * scale);
+    if u64::from(width) * u64::from(height) > MAX_THUMBNAIL_PIXELS {
+        return Err(format!(
+            "--box {cols}x{rows} is over {MAX_THUMBNAIL_PIXELS} pixels even at one pixel per cell"
+        ));
+    }
+    Ok((width, height))
+}
+
+/// Decode a thumbnail's source under the same byte and pixel limits a render
+/// uses, naming the file in every refusal.
+fn decode_thumbnail_source(path: &Path) -> Result<RgbaImage, String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|err| format!("could not read {}: {err}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a file", path.display()));
+    }
+    if metadata.len() > MAX_FILE_BYTES {
+        return Err(format!(
+            "{} is over the {MAX_FILE_BYTES} byte decoding limit",
+            path.display()
+        ));
+    }
+
+    let reader = image::ImageReader::open(path)
+        .map_err(|err| format!("could not read {}: {err}", path.display()))?
+        .with_guessed_format()
+        .map_err(|err| format!("{} is not a supported image: {err}", path.display()))?;
+    let (width, height) = reader
+        .into_dimensions()
+        .map_err(|err| format!("{} is not a supported image: {err}", path.display()))?;
+    if u64::from(width) * u64::from(height) > MAX_PIXELS {
+        return Err(format!(
+            "{} is over the {MAX_PIXELS} pixel decoding limit",
+            path.display()
+        ));
+    }
+
+    // `load` has already checked the limits; decoding again here is what lets
+    // every refusal name its file instead of collapsing to `None`.
+    let reader = image::ImageReader::open(path)
+        .map_err(|err| format!("could not read {}: {err}", path.display()))?
+        .with_guessed_format()
+        .map_err(|err| format!("{} is not a supported image: {err}", path.display()))?;
+    reader
+        .decode()
+        .map(|image| image.into_rgba8())
+        .map_err(|err| format!("could not decode {}: {err}", path.display()))
+}
+
 /// True when drawing a `src_w` × `src_h` image at `cols` × `rows` loses detail.
 fn was_reduced(src_w: u32, src_h: u32, cols: u32, rows: u32) -> bool {
     cols < src_w || rows < src_h.div_ceil(2)
@@ -523,9 +768,9 @@ fn draw(
         ImageEncoding::Braille => (cols * 2, rows * 4),
         ImageEncoding::Quads => (cols * 2, rows * 2),
         ImageEncoding::Blocks | ImageEncoding::Ascii => (cols, rows * 2),
-        // The caller refuses `Off` before reaching here; kept so the match is
-        // total.
-        ImageEncoding::Off => return Vec::new(),
+        // A card and no artwork are drawn without sampling; the caller
+        // returns before reaching here. Kept so the match is total.
+        ImageEncoding::Card | ImageEncoding::Off => return Vec::new(),
     };
 
     let mut samples = sample(image, grid_cols, grid_rows, enlarge, options.background);
@@ -560,8 +805,112 @@ fn draw(
         ImageEncoding::Blocks => encode_blocks(&samples, cols, rows, &mut quantizer),
         ImageEncoding::Quads => encode_quads(&samples, cols, rows, &mut quantizer),
         ImageEncoding::Ascii => encode_ascii(&samples, cols, rows, &mut quantizer),
-        ImageEncoding::Off => Vec::new(),
+        ImageEncoding::Card | ImageEncoding::Off => Vec::new(),
     }
+}
+
+/// The rows a card is drawn with: the artwork's box, or the caller's fixed
+/// height when it asked for one.
+///
+/// A fixed height is clamped to the page's own row bound — never past it, so a
+/// card cannot push a document's lines below the page — and to at least one
+/// row, which is what the caller's zero column of room already ruled out.
+fn card_height(artwork_rows: u32, bounds: Bounds, requested: u16) -> u32 {
+    if requested == 0 {
+        return artwork_rows;
+    }
+    let requested = u32::from(requested);
+    match bounds.height {
+        Some(height) => requested.min(u32::from(height)).max(1),
+        None => requested,
+    }
+}
+
+/// The columns a card is drawn with: the artwork box's own width, raised to
+/// the caller's floor so the card has room for what is written on it.
+///
+/// The page's width is the hard bound, so a floor wider than the page leaves
+/// the card at the page's width rather than widening the document.
+fn card_width(artwork_cols: u32, bounds: Bounds, minimum: u16) -> u32 {
+    artwork_cols
+        .max(u32::from(minimum))
+        .min(u32::from(bounds.width))
+}
+
+/// Draw a card: the artwork's whole box in the raised surface, with one
+/// centred caption on its middle row.
+///
+/// The box is `cols` × `rows`. Left to the artwork's own grid — which is what
+/// a caller that paints the picture over the card asks for — the reference
+/// keeps the flow and the source attribution the pixel encodings give it.
+/// [`ImageOptions::card_rows`] and [`ImageOptions::card_min_width`] let a
+/// caller give the card a shape of its own instead. The caption is truncated
+/// to the box rather than allowed to overflow it; `cols` and `rows` are at
+/// least one, which is what [`cell_grid`] and the two sizing helpers
+/// guarantee.
+fn draw_card(
+    path: &Path,
+    width: u32,
+    height: u32,
+    cols: u32,
+    rows: u32,
+    options: &ImageOptions,
+) -> Vec<Line> {
+    let surface = Style::new().bg(options.card.background);
+    let caption_style = surface.fg(options.card.caption);
+
+    let caption = truncate_to_width(&card_caption(path, width, height), cols);
+    let caption_width = u32::from(measure(&[Span::raw(caption.as_str())]));
+    // A caption that does not fit was already cut to the box, so the left pad
+    // cannot exceed it; the spare column of an odd gap goes to the right.
+    let left = (cols - caption_width) / 2;
+    let right = cols - caption_width - left;
+    let middle = (rows - 1) / 2;
+
+    (0..rows)
+        .map(|row| {
+            let spans = if row == middle {
+                vec![
+                    Span::styled(" ".repeat(left as usize), surface),
+                    Span::styled(caption.clone(), caption_style),
+                    Span::styled(" ".repeat(right as usize), surface),
+                ]
+            } else {
+                vec![Span::styled(" ".repeat(cols as usize), surface)]
+            };
+            Line { spans }
+        })
+        .collect()
+}
+
+/// The one line of text a card carries: the file's name, and the size its
+/// header declares.
+fn card_caption(path: &Path, width: u32, height: u32) -> String {
+    let name = path
+        .file_name()
+        .map_or_else(|| path.as_os_str(), |name| name)
+        .to_string_lossy();
+    format!("{name} · {width}×{height}")
+}
+
+/// `caption` cut to at most `cols` display columns.
+///
+/// Cut at a character boundary with no ellipsis: a card is a placeholder, and
+/// a wide character that does not fit is dropped whole rather than left half
+/// on the box.
+fn truncate_to_width(caption: &str, cols: u32) -> String {
+    let mut width = 0u32;
+    caption
+        .chars()
+        .take_while(|ch| {
+            let char_width = UnicodeWidthChar::width(*ch).unwrap_or(0) as u32;
+            if width + char_width > cols {
+                return false;
+            }
+            width += char_width;
+            true
+        })
+        .collect()
 }
 
 /// Whether quantisation is dithered for this encoding and palette.
@@ -572,7 +921,10 @@ fn resolves_dither(mode: DitherMode, encoding: ImageEncoding, palette: ImagePale
         DitherMode::Auto => match encoding {
             ImageEncoding::Braille => true,
             ImageEncoding::Ascii => palette != ImagePalette::Full,
-            ImageEncoding::Blocks | ImageEncoding::Quads | ImageEncoding::Off => false,
+            ImageEncoding::Blocks
+            | ImageEncoding::Quads
+            | ImageEncoding::Card
+            | ImageEncoding::Off => false,
         },
     }
 }
@@ -824,11 +1176,7 @@ fn load(path: &Path) -> Option<Pixels> {
         return None;
     }
 
-    let reader = image::ImageReader::open(path)
-        .ok()?
-        .with_guessed_format()
-        .ok()?;
-    let (width, height) = reader.into_dimensions().ok()?;
+    let (width, height) = header_dimensions(path)?;
     if u64::from(width) * u64::from(height) > MAX_PIXELS {
         return None;
     }
@@ -840,6 +1188,28 @@ fn load(path: &Path) -> Option<Pixels> {
     // A GIF decodes to its first frame, which is exactly what a still reading
     // view wants.
     Some(Pixels::new(reader.decode().ok()?))
+}
+
+/// The pixel width and height an image declares in its header.
+///
+/// Bounded by nothing: a caller that only needs the shape — the card — must
+/// learn it from a file the pixel limits would refuse, and reading a header
+/// costs a few kilobytes whatever the file's size. `None` means the path is
+/// not a readable file of a supported format, which is the alt-text case.
+fn header_dimensions(path: &Path) -> Option<(u32, u32)> {
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let (width, height) = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some((width, height))
 }
 
 /// The cell grid an image of `src_w` × `src_h` occupies within `bounds`.
@@ -3067,6 +3437,581 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    // ── Card ───────────────────────────────────────────────────────────────
+
+    /// The card a fixture renders to at `bounds`, with explicit colours.
+    fn card(name: &str, bounds: Bounds) -> Vec<Line> {
+        let path = fixture(name);
+        let options = ImageOptions {
+            card: CardColours {
+                background: Color::Rgb(0x28, 0x28, 0x28),
+                caption: Color::Rgb(0xa8, 0x99, 0x84),
+            },
+            ..options(ImageEncoding::Card)
+        };
+        let mut budget = StyleBudget::default();
+        artwork(path.to_str().unwrap(), bounds, &options, &mut budget).expect("the fixture renders")
+    }
+
+    /// A card as text, one row per line, so a snapshot pins its shape and
+    /// caption without a debug dump's escapes.
+    fn card_text(lines: &[Line]) -> String {
+        lines
+            .iter()
+            .map(|line| format!("|{}|", line.text()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_card_holds_the_same_box_as_braille() {
+        let path = fixture("image_sample.png");
+        let bounds = Bounds {
+            width: 80,
+            height: Some(20),
+        };
+        let mut card_budget = StyleBudget::default();
+        let card = artwork(
+            path.to_str().unwrap(),
+            bounds,
+            &options(ImageEncoding::Card),
+            &mut card_budget,
+        )
+        .expect("the fixture renders as a card");
+        let mut braille_budget = StyleBudget::default();
+        let braille = artwork(
+            path.to_str().unwrap(),
+            bounds,
+            &options(ImageEncoding::Braille),
+            &mut braille_budget,
+        )
+        .expect("the fixture renders as braille");
+
+        assert_eq!(
+            card.len(),
+            braille.len(),
+            "the two boxes hold different rows"
+        );
+        assert_eq!(
+            card.iter().map(Line::width).max(),
+            braille.iter().map(Line::width).max(),
+            "the two boxes hold different widths"
+        );
+    }
+
+    #[test]
+    fn a_card_is_its_surface_with_one_caption() {
+        let lines = card(
+            "image_sample.png",
+            Bounds {
+                width: 40,
+                height: None,
+            },
+        );
+        // 16x16 is a 16 x 8 cell box.
+        assert_eq!(lines.len(), 8);
+        let middle = (lines.len() - 1) / 2;
+        for (row, line) in lines.iter().enumerate() {
+            assert_eq!(line.width(), 16);
+            for span in &line.spans {
+                assert_eq!(span.style.bg, Some(Color::Rgb(0x28, 0x28, 0x28)));
+            }
+            if row == middle {
+                let caption = line
+                    .spans
+                    .iter()
+                    .find(|span| !span.content.trim().is_empty())
+                    .expect("the middle row carries a caption");
+                assert_eq!(caption.style.fg, Some(Color::Rgb(0xa8, 0x99, 0x84)));
+                assert_eq!(caption.content, "image_sample.png");
+            } else {
+                assert!(
+                    line.text().trim().is_empty(),
+                    "row {row} carries text: {:?}",
+                    line.text()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_card_caption_is_the_file_name_and_its_header_size() {
+        assert_eq!(
+            card_caption(Path::new("/docs/images/pic.png"), 24, 16),
+            "pic.png · 24×16"
+        );
+    }
+
+    #[test]
+    fn a_card_caption_is_centred() {
+        // The caption is 12 columns: "ab.png · 2×2".
+        let layout = |cols| {
+            draw_card(
+                Path::new("ab.png"),
+                2,
+                2,
+                cols,
+                3,
+                &options(ImageEncoding::Card),
+            )
+        };
+
+        let even = layout(20);
+        assert_eq!(even.len(), 3);
+        assert_eq!(even[1].spans[0].content, "    ");
+        assert_eq!(even[1].spans[1].content, "ab.png · 2×2");
+        assert_eq!(even[1].spans[2].content, "    ");
+
+        // An odd spare column goes to the right, so the caption never moves.
+        let odd = layout(21);
+        assert_eq!(odd[1].spans[0].content, "    ");
+        assert_eq!(odd[1].spans[2].content, "     ");
+    }
+
+    #[test]
+    fn a_card_caption_is_truncated_to_its_box() {
+        let line = &draw_card(
+            Path::new("ab.png"),
+            2,
+            2,
+            8,
+            1,
+            &options(ImageEncoding::Card),
+        )[0];
+        assert_eq!(line.text(), "ab.png ·");
+        assert_eq!(line.width(), 8);
+        let caption = &line.spans[0];
+        assert_eq!(caption.style, Style::new().bg(Color::Reset));
+    }
+
+    #[test]
+    fn a_card_with_no_room_falls_back() {
+        let path = fixture("image_sample.png");
+        for bounds in [
+            Bounds {
+                width: 0,
+                height: None,
+            },
+            Bounds {
+                width: 40,
+                height: Some(0),
+            },
+        ] {
+            let mut budget = StyleBudget::default();
+            assert!(
+                artwork(
+                    path.to_str().unwrap(),
+                    bounds,
+                    &options(ImageEncoding::Card),
+                    &mut budget,
+                )
+                .is_none(),
+                "a {bounds:?} box must fall back"
+            );
+        }
+    }
+
+    #[test]
+    fn a_card_is_sized_from_a_file_over_the_byte_limit() {
+        // A file over the byte limit whose contents are a valid 4x2 PNG. The
+        // pixel encodings refuse it before the header; a card only needs the
+        // header, so it becomes the header's box.
+        let dir = std::env::temp_dir().join("md-render-card-byte-limit-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("oversized.png");
+        let mut bytes = std::fs::read(fixture("image_cells.png")).expect("fixture");
+        bytes.resize(usize::try_from(MAX_FILE_BYTES).expect("fits") + 1, 0);
+        std::fs::write(&path, &bytes).expect("write");
+
+        let bounds = Bounds {
+            width: 80,
+            height: None,
+        };
+        let mut budget = StyleBudget::default();
+        let lines = artwork(
+            path.to_str().unwrap(),
+            bounds,
+            &options(ImageEncoding::Card),
+            &mut budget,
+        )
+        .expect("the header still sizes a card");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].width(), 4);
+        assert_eq!(lines[0].text(), "over");
+
+        let mut budget = StyleBudget::default();
+        assert!(
+            artwork(
+                path.to_str().unwrap(),
+                bounds,
+                &options(ImageEncoding::Braille),
+                &mut budget
+            )
+            .is_none(),
+            "braille must still refuse the file"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_card_is_sized_from_a_header_over_the_pixel_limit() {
+        // 5000x4000 is 20 megapixels: the pixels are never decoded, under
+        // either encoding, but only the card can still say how big it is.
+        let dir = std::env::temp_dir().join("md-render-card-pixel-limit-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("huge.png");
+        let img = RgbaImage::from_pixel(5000, 4000, image::Rgba([1, 2, 3, 255]));
+        img.save(&path).expect("write a large PNG");
+
+        let bounds = Bounds {
+            width: 80,
+            height: None,
+        };
+        let mut budget = StyleBudget::default();
+        let lines = artwork(
+            path.to_str().unwrap(),
+            bounds,
+            &options(ImageEncoding::Card),
+            &mut budget,
+        )
+        .expect("the header still sizes a card");
+        // 5000 x 2000 cells scaled to the 80-column bound.
+        assert_eq!(lines.len(), 32);
+        assert!(lines.iter().all(|line| line.width() == 80));
+
+        let mut budget = StyleBudget::default();
+        assert!(
+            artwork(
+                path.to_str().unwrap(),
+                bounds,
+                &options(ImageEncoding::Braille),
+                &mut budget
+            )
+            .is_none(),
+            "braille must still refuse the pixel count"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_card_keeps_the_alt_text_for_references_it_cannot_size() {
+        let dir = std::env::temp_dir().join("md-render-card-unreadable-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let empty = dir.join("empty.png");
+        std::fs::write(&empty, b"").expect("write");
+        let svg = dir.join("drawing.svg");
+        std::fs::write(
+            &svg,
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>"#,
+        )
+        .expect("write");
+
+        let bounds = Bounds {
+            width: 80,
+            height: None,
+        };
+        for path in [&empty, &svg] {
+            let mut budget = StyleBudget::default();
+            assert!(
+                artwork(
+                    path.to_str().unwrap(),
+                    bounds,
+                    &options(ImageEncoding::Card),
+                    &mut budget
+                )
+                .is_none(),
+                "{} must fall back to alt text",
+                path.display()
+            );
+        }
+        let mut budget = StyleBudget::default();
+        assert!(
+            artwork(
+                "https://example.com/a.png",
+                bounds,
+                &options(ImageEncoding::Card),
+                &mut budget,
+            )
+            .is_none(),
+            "a remote reference must fall back to alt text"
+        );
+        let _ = std::fs::remove_file(&empty);
+        let _ = std::fs::remove_file(&svg);
+    }
+
+    #[test]
+    fn a_compact_card_takes_the_fixed_height_and_keeps_the_box_width() {
+        let path = fixture("image_sample.png");
+        let bounds = Bounds {
+            width: 80,
+            height: None,
+        };
+        let mut budget = StyleBudget::default();
+        let lines = artwork(
+            path.to_str().unwrap(),
+            bounds,
+            &ImageOptions {
+                card_rows: 3,
+                ..options(ImageEncoding::Card)
+            },
+            &mut budget,
+        )
+        .expect("the fixture renders as a card");
+
+        // 16x16 is a 16 x 8 cell box; the fixed height moves the rows only.
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|line| line.width() == 16));
+        assert!(
+            lines[1].text().contains("image_sample.png"),
+            "the caption stays on the middle of what is drawn: {:?}",
+            lines[1].text()
+        );
+    }
+
+    #[test]
+    fn a_compact_card_is_never_taller_than_the_page() {
+        let path = fixture("image_sample.png");
+        let bounds = Bounds {
+            width: 80,
+            height: Some(2),
+        };
+        let mut budget = StyleBudget::default();
+        let lines = artwork(
+            path.to_str().unwrap(),
+            bounds,
+            &ImageOptions {
+                card_rows: 3,
+                ..options(ImageEncoding::Card)
+            },
+            &mut budget,
+        )
+        .expect("the fixture renders as a card");
+        assert_eq!(lines.len(), 2, "the page's rows are the hard bound");
+    }
+
+    #[test]
+    fn a_card_is_raised_to_its_minimum_width() {
+        let path = fixture("image_sample.png");
+        let bounds = Bounds {
+            width: 80,
+            height: None,
+        };
+        let mut budget = StyleBudget::default();
+        let lines = artwork(
+            path.to_str().unwrap(),
+            bounds,
+            &ImageOptions {
+                card_rows: 3,
+                card_min_width: 21,
+                ..options(ImageEncoding::Card)
+            },
+            &mut budget,
+        )
+        .expect("the fixture renders as a card");
+        assert!(lines.iter().all(|line| line.width() == 21));
+
+        // The page's width is the hard bound, floor or no floor.
+        let mut budget = StyleBudget::default();
+        let narrow = artwork(
+            path.to_str().unwrap(),
+            Bounds {
+                width: 12,
+                height: None,
+            },
+            &ImageOptions {
+                card_rows: 3,
+                card_min_width: 21,
+                ..options(ImageEncoding::Card)
+            },
+            &mut budget,
+        )
+        .expect("the fixture renders as a card");
+        assert!(narrow.iter().all(|line| line.width() <= 12));
+    }
+
+    #[test]
+    fn a_card_for_a_fixture() {
+        let lines = card(
+            "image_sample.png",
+            Bounds {
+                width: 40,
+                height: None,
+            },
+        );
+        insta::assert_snapshot!(card_text(&lines));
+    }
+
+    // ── Thumbnail ──────────────────────────────────────────────────────────
+
+    /// A fresh directory for one thumbnail test, so parallel tests cannot
+    /// share a file name.
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(name);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// A solid picture written to `path`, with an alpha channel when
+    /// `transparent` is set.
+    fn solid(path: &Path, width: u32, height: u32, transparent: bool) {
+        let alpha = if transparent { 200 } else { 255 };
+        RgbaImage::from_pixel(width, height, image::Rgba([200, 10, 10, alpha]))
+            .save(path)
+            .expect("write the source picture");
+    }
+
+    #[test]
+    fn a_thumbnail_fills_its_box_with_the_picture_and_the_background() {
+        let dir = temp_dir("md-render-thumbnail-shape-test");
+        let source = dir.join("wide.png");
+        solid(&source, 2000, 500, true);
+        let out = dir.join("wide-thumb.png");
+        let background = [0x28, 0x28, 0x28];
+
+        thumbnail(&source, 10, 10, None, background, &out).expect("the thumbnail is written");
+
+        // Ten columns at k = 64 is 640 x 1280, the box's 10 : 20 cell shape.
+        let decoded = image::open(&out).expect("decode").to_rgba8();
+        assert_eq!(decoded.dimensions(), (640, 1280));
+
+        // 2000 x 500 scaled by 0.32 is 640 x 160, centred at y = 560.
+        assert_eq!(decoded.get_pixel(320, 559).0, [0x28, 0x28, 0x28, 255]);
+        assert_eq!(decoded.get_pixel(320, 560).0, [200, 10, 10, 200]);
+        assert_eq!(decoded.get_pixel(0, 0).0, [0x28, 0x28, 0x28, 255]);
+        assert_eq!(decoded.get_pixel(639, 1279).0, [0x28, 0x28, 0x28, 255]);
+
+        let pixels = u64::from(decoded.width()) * u64::from(decoded.height());
+        assert!(pixels < 2000 * 500, "the thumbnail is not smaller");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A picture whose rows differ from each other, so a crop can be checked
+    /// against the rows it claims to carry.
+    fn stripes(path: &Path, width: u32, height: u32) {
+        let mut image = RgbaImage::new(width, height);
+        for y in 0..height {
+            let colour = image::Rgba([(y % 250) as u8, 10, 10, 200]);
+            for x in 0..width {
+                image.put_pixel(x, y, colour);
+            }
+        }
+        image.save(path).expect("write the source picture");
+    }
+
+    #[test]
+    fn a_crop_carries_the_rows_of_the_whole_box() {
+        let dir = temp_dir("md-render-thumbnail-crop-test");
+        let source = dir.join("stripes.png");
+        // 640 x 160 at k = 64 fits the 640 x 1280 box without scaling, so a
+        // crop's rows are the box's rows and not a resampling of them.
+        stripes(&source, 640, 160);
+        let full = dir.join("full.png");
+        let part = dir.join("part.png");
+
+        thumbnail(&source, 10, 10, None, [0; 3], &full).expect("full");
+        thumbnail(&source, 10, 10, Some((3, 3)), [0; 3], &part).expect("part");
+
+        let whole = image::open(&full).expect("decode").to_rgba8();
+        let cropped = image::open(&part).expect("decode").to_rgba8();
+        // One cell is 2 x 64 pixels tall, so rows 3..6 are 384..768.
+        assert_eq!(cropped.dimensions(), (640, 384));
+        for y in 0..384 {
+            for x in [0u32, 320, 639] {
+                assert_eq!(cropped.get_pixel(x, y), whole.get_pixel(x, y + 384));
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_same_thumbnail_request_is_byte_identical() {
+        let dir = temp_dir("md-render-thumbnail-determinism-test");
+        let source = dir.join("photo.png");
+        solid(&source, 1200, 800, false);
+        let first = dir.join("first.jpg");
+        let second = dir.join("second.jpg");
+
+        thumbnail(&source, 40, 12, None, [0, 0, 0], &first).expect("first");
+        thumbnail(&source, 40, 12, None, [0, 0, 0], &second).expect("second");
+
+        assert_eq!(
+            std::fs::read(&first).expect("first bytes"),
+            std::fs::read(&second).expect("second bytes")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_transparent_picture_is_png_and_an_opaque_one_is_jpeg() {
+        let dir = temp_dir("md-render-thumbnail-format-test");
+        let transparent = dir.join("transparent.png");
+        let opaque = dir.join("opaque.png");
+        solid(&transparent, 64, 64, true);
+        solid(&opaque, 64, 64, false);
+
+        let png = dir.join("out-png");
+        thumbnail(&transparent, 8, 4, None, [0, 0, 0], &png).expect("png");
+        let png_bytes = std::fs::read(&png).expect("png bytes");
+        assert_eq!(&png_bytes[..8], b"\x89PNG\r\n\x1a\n");
+
+        let jpeg = dir.join("out-jpeg");
+        thumbnail(&opaque, 8, 4, None, [0, 0, 0], &jpeg).expect("jpeg");
+        let jpeg_bytes = std::fs::read(&jpeg).expect("jpeg bytes");
+        assert_eq!(&jpeg_bytes[..3], b"\xff\xd8\xff");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_thumbnail_refuses_what_it_cannot_serve() {
+        let dir = temp_dir("md-render-thumbnail-refusal-test");
+        let out = dir.join("out.png");
+        let source = dir.join("source.png");
+        solid(&source, 16, 16, false);
+
+        // A missing file.
+        let missing = dir.join("missing.png");
+        assert!(thumbnail(&missing, 8, 4, None, [0; 3], &out).is_err());
+
+        // A path that is a directory.
+        assert!(thumbnail(&dir, 8, 4, None, [0; 3], &out).is_err());
+
+        // A file the decoder cannot identify.
+        let text = dir.join("notes.txt");
+        std::fs::write(&text, b"not a picture").expect("write");
+        assert!(thumbnail(&text, 8, 4, None, [0; 3], &out).is_err());
+
+        // A box with no room for a cell.
+        assert!(thumbnail(&source, 0, 4, None, [0; 3], &out).is_err());
+        assert!(thumbnail(&source, 8, 0, None, [0; 3], &out).is_err());
+
+        // A box whose pixel count is over the bound even at one pixel a cell.
+        assert!(thumbnail(&source, 4000, 2000, None, [0; 3], &out).is_err());
+
+        // A crop that is empty, or that reaches past the box.
+        assert!(thumbnail(&source, 8, 4, Some((0, 0)), [0; 3], &out).is_err());
+        assert!(thumbnail(&source, 8, 4, Some((3, 2)), [0; 3], &out).is_err());
+
+        // An output path in a directory that does not exist.
+        let unwritable = dir.join("no-such-directory").join("out.png");
+        assert!(thumbnail(&source, 8, 4, None, [0; 3], &unwritable).is_err());
+
+        // A file over the byte decoding limit, whose header is still valid.
+        let oversized = dir.join("oversized.png");
+        let mut bytes = std::fs::read(&source).expect("source bytes");
+        bytes.resize(usize::try_from(MAX_FILE_BYTES).expect("fits") + 1, 0);
+        std::fs::write(&oversized, &bytes).expect("write");
+        let err = thumbnail(&oversized, 8, 4, None, [0; 3], &out).expect_err("refused");
+        assert!(
+            err.contains(&oversized.display().to_string()),
+            "{err} must name the file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── Animation ──────────────────────────────────────────────────────────

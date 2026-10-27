@@ -3,22 +3,27 @@
 //! ```text
 //! md-render --width 120 --theme nord path/to/file.md
 //! cat file.md | md-render --width 120
+//! md-render thumbnail art.png --box 80x24 --out thumb --background '#1e1e1e'
+//! md-render thumbnail art.png --box 80x24 --crop 4x12 --out part --background '#1e1e1e'
 //! ```
 //!
 //! The width is required. There is no sensible default: the engine lays out
 //! tables and diagrams against a column budget, and a guess would produce
 //! output the caller then has to discard. Making it mandatory means a caller
 //! that forgets it gets an error rather than a subtly wrong render.
+//!
+//! The one auxiliary mode is `thumbnail`: it writes a picture for the plugin
+//! to paint inline instead of a document, and takes no width.
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 
 use md_render::document::{layout_document, source_line_count};
 use md_render::image_art::{
-    DitherMode, ImageBackground, ImageEncoding, ImageOptions, ImagePalette,
+    CardColours, DitherMode, ImageBackground, ImageEncoding, ImageOptions, ImagePalette,
 };
 use md_render::renderer::render_markdown;
 use md_render::style::Color;
@@ -26,8 +31,64 @@ use md_render::theme::{Palette, Theme};
 
 /// Render markdown to styled display lines.
 #[derive(Debug, Parser)]
-#[command(name = "md-render", version, about, long_about = None)]
+#[command(
+    name = "md-render",
+    version,
+    about,
+    long_about = None,
+    // `thumbnail` must win over the render path positional of the same name,
+    // and a subcommand carries its own required set.
+    subcommand_precedence_over_arg = true,
+    subcommand_negates_reqs = true,
+    args_conflicts_with_subcommands = true
+)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[command(flatten)]
+    render: RenderArgs,
+}
+
+/// The auxiliary modes, each of which exits without writing a document.
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Encode a picture for a cell box, for the plugin to paint inline.
+    Thumbnail(ThumbnailArgs),
+}
+
+/// Encode a picture at the shape a terminal cell box has.
+#[derive(Debug, Args)]
+struct ThumbnailArgs {
+    /// Image file to encode.
+    source: PathBuf,
+
+    /// Cell box the picture is painted into, as `COLSxROWS`.
+    ///
+    /// The output's proportions are the artwork's own: `cols` to twice `rows`.
+    #[arg(long = "box", value_name = "COLSxROWS", value_parser = parse_box)]
+    cells: (u16, u16),
+
+    /// File to write the encoded picture to.
+    #[arg(long, value_name = "PATH")]
+    out: PathBuf,
+
+    /// Part of the box to encode, as `TOPxROWS`.
+    ///
+    /// The picture is fitted and centred in the whole box first, and the rows
+    /// are cut from that drawing, so the output is the same picture at the
+    /// same scale as the whole box. A block half-scrolled out of the window
+    /// asks for the rows still on screen.
+    #[arg(long, value_name = "TOPxROWS", value_parser = parse_crop)]
+    crop: Option<(u16, u16)>,
+
+    /// Colour filling the band the picture does not cover, as `#rrggbb`.
+    #[arg(long, value_name = "#rrggbb", value_parser = parse_background_hex)]
+    background: [u8; 3],
+}
+
+#[derive(Debug, Args)]
+struct RenderArgs {
     /// Display width in columns.
     ///
     /// Every emitted line fits within this many columns.
@@ -62,8 +123,11 @@ struct Cli {
     /// `braille` uses eight dots in a 2 × 4 grid and one colour per cell;
     /// `quads` uses quadrant glyphs, four sub-cells in two colours; `blocks`
     /// uses half-block glyphs and two colours per cell; `ascii` uses one
-    /// characteristic glyph and one colour; and `off` renders references as
-    /// their alt text.
+    /// characteristic glyph and one colour; `card` draws no pixels at all — a
+    /// quiet box carrying the file's name and size, for a reader whose terminal
+    /// shows the picture another way; and `off` renders references as their alt
+    /// text. A card is as wide as the artwork's box and as tall as it, unless
+    /// `--image-card-rows` gives it a height of its own.
     #[arg(long, value_enum, default_value = "braille")]
     image_encoding: ImageEncoding,
 
@@ -112,6 +176,23 @@ struct Cli {
     #[arg(long, default_value_t = 0, value_name = "ROWS")]
     image_min_rows: u16,
 
+    /// The display rows a card occupies.
+    ///
+    /// Zero (the default) gives a card the artwork's own box, which is what a
+    /// caller that paints the picture over the card needs. A positive value
+    /// gives every card that height instead: it stays as wide as the artwork's
+    /// box, and no taller than the page allows.
+    #[arg(long, default_value_t = 0, value_name = "ROWS")]
+    image_card_rows: u16,
+
+    /// The narrowest a card may be, in display columns.
+    ///
+    /// Zero (the default) leaves the card the width of the artwork's box. A
+    /// caller with text to write on the card raises it so the card can hold
+    /// that text; the requested render width stays the hard bound.
+    #[arg(long, default_value_t = 0, value_name = "COLS")]
+    image_card_min_width: u16,
+
     /// Sharpen an image that was reduced to fit the page.
     #[arg(long)]
     image_sharpen: bool,
@@ -135,14 +216,29 @@ struct Cli {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    if cli.themes {
+    if let Some(Command::Thumbnail(args)) = &cli.command {
+        return match md_render::image_art::thumbnail(
+            &args.source,
+            args.cells.0,
+            args.cells.1,
+            args.crop,
+            args.background,
+            &args.out,
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => fail(&err),
+        };
+    }
+
+    let render = &cli.render;
+    if render.themes {
         for theme in Theme::ALL {
             println!("{}", theme_name(*theme));
         }
         return ExitCode::SUCCESS;
     }
 
-    match run(&cli) {
+    match run(render) {
         Ok(json) => match write_stdout(&json) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => fail(&format!("could not write output: {err}")),
@@ -157,7 +253,7 @@ fn fail(message: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
-fn run(cli: &Cli) -> Result<String, String> {
+fn run(cli: &RenderArgs) -> Result<String, String> {
     // clap guarantees a width here: it is required unless `--themes` is set,
     // and that path returns before reaching `run`.
     let width = cli.width.unwrap_or(0);
@@ -187,8 +283,13 @@ fn run(cli: &Cli) -> Result<String, String> {
         background,
         dither: cli.image_dither,
         min_rows: cli.image_min_rows,
+        card_rows: cli.image_card_rows,
+        card_min_width: cli.image_card_min_width,
         sharpen: cli.image_sharpen,
         paper,
+        // Left at its default: the layout fills a card's colours from the
+        // selected theme, which it has resolved and this flag set has not.
+        card: CardColours::default(),
     };
     let doc = layout_document(
         &blocks,
@@ -214,6 +315,35 @@ fn parse_background(value: &str, palette: &Palette) -> Result<ImageBackground, S
         }
         hex => Ok(ImageBackground::Rgb(parse_hex(hex, "--image-background")?)),
     }
+}
+
+/// Parse `--box COLSxROWS`.
+fn parse_box(value: &str) -> Result<(u16, u16), String> {
+    parse_cells(value, "--box")
+}
+
+/// Parse the thumbnail's `--crop TOPxROWS`.
+fn parse_crop(value: &str) -> Result<(u16, u16), String> {
+    parse_cells(value, "--crop")
+}
+
+/// Parse two counts separated by `x`, naming `option` in any error.
+fn parse_cells(value: &str, option: &str) -> Result<(u16, u16), String> {
+    let (first, second) = value
+        .split_once(['x', 'X'])
+        .ok_or_else(|| format!("{option}: expected COUNTSxCOUNTS, got {value}"))?;
+    let first = first
+        .parse::<u16>()
+        .map_err(|_| format!("{option}: {first} is not a count"))?;
+    let second = second
+        .parse::<u16>()
+        .map_err(|_| format!("{option}: {second} is not a count"))?;
+    Ok((first, second))
+}
+
+/// Parse the thumbnail's `--background #rrggbb`.
+fn parse_background_hex(value: &str) -> Result<[u8; 3], String> {
+    parse_hex(value, "--background")
 }
 
 /// Parse `#rrggbb`, naming the option in any error.

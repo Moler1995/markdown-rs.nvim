@@ -65,6 +65,54 @@ M.defaults = {
   -- is set to, so no document can fail to render because of a picture.
   image_mode = 'auto',
 
+  -- What R shows for an inline image.
+  --
+  --   'auto'  A card — the picture's own box, with its name and size — on every
+  --           terminal, and the picture itself painted over the card where the
+  --           terminal can draw one. The card is what the cursor, the search and
+  --           the yank see; the paint is over the card's cells and is redone
+  --           after a scroll, so a reader who scrolls away and back gets the
+  --           picture again rather than a hole.
+  --   'card'  The card alone, never painted over. For a terminal that can draw
+  --           but a reader who would rather see where the picture sits than the
+  --           picture itself.
+  --   'art'   The artwork `image_mode` selects, exactly as before this option
+  --           existed, and nothing painted over it.
+  --
+  -- Where no picture is painted over the card — every terminal that cannot
+  -- draw, and `card` on one that can — the card is three rows tall. Its width
+  -- is still the picture's own, so the same picture keeps its footprint, and a
+  -- flat height keeps a page of images from towering over the prose. Where a
+  -- picture is painted over it the card keeps the artwork's whole box, because
+  -- the picture is measured for exactly those cells.
+  --
+  -- `image_mode = 'off'` outranks `auto` and `card`: a reader who asked for no
+  -- picture inline gets no card either, and the reference stays its alt text.
+  --
+  -- This changes R only. The preview popup shows the image itself at
+  -- `image_mode`'s encoding whatever this is set to, and whether the terminal
+  -- can draw is not consulted here at all — a card is a card on every terminal,
+  -- and only the painting over it asks. An unknown value is handed to the
+  -- engine as the encoding and refused there, the same way an unknown
+  -- `image_mode` is.
+  image_inline = 'auto',
+
+  -- The largest file painted inline as it is, instead of downscaled first.
+  --
+  -- An inline picture is normally the engine's thumbnail: the picture's own
+  -- cells, scaled to about 640 pixels across, re-encoded, and cached. That
+  -- bounds what every settle sends back to the terminal, at the cost of
+  -- sharpness on a large window. A file no larger than this is sent as it is —
+  -- its own bytes, at its own resolution — because a file this small costs less
+  -- to send than the encode it would replace. Only a still PNG or JPEG is sent
+  -- this way: a GIF, a WebP or an APNG would play itself inline, and a format
+  -- the terminal cannot decode would draw nothing.
+  --
+  -- Zero always asks for the thumbnail. The value is also capped by the 8 MiB
+  -- the OSC 1337 transport can carry; the Kitty transport sends a path and is
+  -- not affected either way.
+  image_inline_original_bytes = 2097152,
+
   -- Where an image's cell colours come from.
   --
   --   'auto'      `full` for `braille` and `ascii`, where a cell carries one
@@ -208,6 +256,14 @@ M.defaults = {
   -- underline goes away with them, since there would be nothing left to
   -- follow.
   --
+  -- An image shown as a card or as its alt text names the keys instead: the
+  -- row ends with `<CR>/gx open image`, built from whichever of `preview` and
+  -- `open_image` are bound, so the reference reads as something a key opens.
+  -- With both set to `false` there is no hint, the character artwork is never
+  -- hinted, and neither is a card the terminal paints a picture over. The hint
+  -- is virtual text drawn over the row, not an underline: what it marks can be
+  -- a band of surface cells with no text in it at all.
+  --
   -- `zoom_in` and `zoom_out` are set in the preview popup's buffer rather than
   -- in R or S, because they act on the block the popup is showing. In a table's
   -- popup they are bound and do nothing: the engine wraps a table's cells rather
@@ -292,6 +348,32 @@ function M.image_encoding()
   return mode
 end
 
+--- The image encoding an inline render asks the engine for.
+---
+--- `image_inline` chooses between a card and the artwork; `image_mode` chooses
+--- what the artwork is, so `art` is the only value that consults it, and `off`
+--- is the one value that outranks the card. Both answers are values of the
+--- engine's `--image-encoding`.
+---
+--- No branch here falls back, which is deliberate: an unknown `image_inline` is
+--- returned as it stands, sent to the engine as the encoding, and refused there
+--- by name — the same route an unknown `image_mode` takes today.
+---
+--- Whether the terminal can draw belongs to the graphics module, asked when a
+--- placement is made. Nothing in this resolution needs it: a card is what every
+--- terminal gets, and `graphics = 'off'` changes only whether it is painted
+--- over.
+function M.image_inline_encoding()
+  local inline = M.options.image_inline
+  if inline == 'art' then
+    return M.image_encoding()
+  end
+  if inline == 'auto' or inline == 'card' then
+    return M.options.image_mode == 'off' and 'off' or 'card'
+  end
+  return inline
+end
+
 --- The palette to ask the engine for, with `auto` resolved against the
 --- encoding this render will use.
 ---
@@ -328,6 +410,48 @@ local function page_background()
   return string.format('#%06x', hl.bg)
 end
 
+--- The text that says which keys open an image, or nil when neither is bound.
+---
+--- Built from the keys actually bound, in the order an image reference names
+--- them: the preview key first, then the open-image key. A hint for a key that
+--- is not there would mislead, which is the rule the link hint already follows.
+function M.image_hint_text()
+  local keys = {}
+  for _, key in ipairs({ M.options.keymaps.preview, M.options.keymaps.open_image }) do
+    if type(key) == 'string' and key ~= '' then
+      keys[#keys + 1] = key
+    end
+  end
+  if #keys == 0 then
+    return nil
+  end
+  return ' ' .. table.concat(keys, '/') .. ' open image'
+end
+
+--- The rows and the narrowest width a card is drawn with.
+---
+--- A card the terminal paints over is the artwork's box, in both dimensions:
+--- the picture is measured for those cells and is placed back on them, so the
+--- card has to be exactly what the picture was cut for. A card that is the
+--- whole of the image is a placeholder instead, and three rows is enough to
+--- carry a caption and the hint — a page of images then reads as a page of
+--- cards rather than as a column of towers. Its width stays the picture's;
+--- the floor is only what the hint needs to fit inside the box.
+---
+--- `painting` is the graphics module's answer, passed in rather than asked
+--- for: this module knows nothing about terminals, and the caller that places
+--- pictures is the one that can see one.
+local function card_shape(painting)
+  if M.image_inline_encoding() ~= 'card' then
+    return 0, 0
+  end
+  if M.options.image_inline == 'auto' and painting then
+    return 0, 0
+  end
+  local text = M.image_hint_text()
+  return 3, text and vim.fn.strdisplaywidth(text) + 2 or 0
+end
+
 --- The image options in the shape the render views carry.
 ---
 --- One place resolves `auto`, so the inline render and the preview popup cannot
@@ -338,8 +462,13 @@ end
 --- page an image is drawn on is the editor's own background, and braille needs
 --- it to know which side of a cell is ink. A named background already says
 --- what the page is, so the engine uses that instead.
-function M.image_options()
+---
+--- `painting` is whether the terminal can draw a picture over a card; it
+--- decides only the card's shape, and a caller with no card to shape — the
+--- preview popup — passes nothing and gets the artwork's own box.
+function M.image_options(painting)
   local background = M.options.image_background
+  local card_rows, card_min_width = card_shape(painting)
   return {
     palette = M.image_palette(),
     background = background,
@@ -347,6 +476,8 @@ function M.image_options()
     min_rows = M.options.image_min_rows,
     sharpen = M.options.image_sharpen,
     paper = background == 'terminal' and page_background() or nil,
+    card_rows = card_rows,
+    card_min_width = card_min_width,
   }
 end
 

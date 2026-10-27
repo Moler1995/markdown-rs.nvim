@@ -64,7 +64,11 @@ is one more answer: a box the size of the artwork's, filled with a surface and o
 
 The box is computed by the same `cell_grid` call that braille uses, with the same bounds, so a
 document rendered with `card` and one rendered with `braille` hold the same number of rows for the
-same image, and the same source attribution.
+same image, and the same source attribution. Two engine options, `--image-card-rows` and
+`--image-card-min-width`, let the caller give the card a shape of its own instead: three rows on a
+terminal that will never paint the picture, and a width at least as wide as the hint the card
+carries. The artwork's box remains the default because that is what a card a picture is painted
+over must keep.
 
 *Alternatives:* the plugin replacing the block's lines after the render — it would have to move
 every following line, rewrite the source mapping and re-implement the width guarantee, and it
@@ -90,9 +94,16 @@ width; the alt text everywhere — leaves exactly the case the reader complained
 ### D3 — The thumbnail is produced on demand, outside the wire
 
 A `thumbnail` subcommand takes a path, a cell box, an output path and a background colour, and
-writes one encoded picture. The plugin calls it only for blocks that are wholly visible, keeps the
-bytes in memory keyed by (absolute path, length, mtime, columns, rows), and deletes the temporary
-file it asked for.
+writes one encoded picture. The plugin calls it only for blocks that are wholly visible and only
+for a file it cannot send as it is, keeps the bytes in memory keyed by (absolute path, length,
+mtime, columns, rows), and deletes the temporary file it asked for.
+
+A small file is not worth that: `image_inline_original_bytes` (2 MiB by default) is the largest
+file sent to the terminal unchanged, so a logo or a screenshot keeps its own resolution instead of
+being re-encoded to 640 pixels, and the payload is no bigger than the encode it replaces. The
+bytes are cached the same way. Only a still PNG or JPEG qualifies — a GIF, a WebP or an APNG would
+play itself inline, which the inline view is not, and every other format is left to the engine,
+which decodes more than the terminal does.
 
 The wire is deliberately untouched: a base64 field would be re-produced on every render — every
 keystroke in insert mode — and a path field would be environment-dependent, which the wire's
@@ -133,21 +144,38 @@ for the reason the popup's border taught.
 the wire already carries, and a new field would be a format change for something the plugin can
 already compute.
 
-### D6 — Place on settle, only when the whole block is visible
+### D6 — Place on settle, over the rows the window shows
 
 A placement is a paint over cells, so it has to be made after the window has painted, and it is
 lost to every repaint after it. The popup solved this by not moving; R cannot. The rule is
-therefore: place when the block is wholly inside the window's visible rows, and after the
+therefore: place over the block's rows that are inside the window's visible rows, and after the
 viewport has stopped moving — one debounce, reused from the resize path, for scrolls, resizes,
 re-renders and cursor motions.
 
-The block must be wholly visible because the protocol scales a picture into the box it is given
-and cannot crop it: half a block would show the whole picture squeezed into the visible half.
+Those rows are the window's own answer — `w0` and `w$`, not arithmetic on `topline` — because
+`scrolloff` and a partly drawn last line are easy to get wrong. A block the window cuts was
+originally left as its card, on the grounds that the protocol scales a picture into the box it is
+given and cannot crop it: half a block would show the whole picture squeezed into the visible
+half. The fix belongs in the engine, which is the only stage that decodes pixels: the thumbnail
+mode takes the visible slice of the box, fits the picture into the whole box first and then cuts
+those rows out, so the placement carries the same picture at the same scale, continuing above and
+below the window. A file sent unchanged cannot be cut, so a cut block always goes through the
+engine; the Kitty transport is handed a path and cannot crop at all, so there a partly visible
+block keeps its card.
 
 Cursor motion is in the list of triggers rather than only scrolls: with `cursorline` set, moving
 the cursor repaints its row, which erases the placement at that row, and a debounced re-place
 after the motion is what puts it back. The cost is one payload per pause, which D4's sizing keeps
 small.
+
+"Visible" also means "not covered". A floating window owns the cells under it, and the list of
+triggers is not filtered by window — a cursor move inside the preview popup schedules the same
+settle — so without this rule opening the popup on an image re-placed every inline picture on top
+of it one debounce later: the terminal draws whatever it was told last, and on the OSC transport
+there is one image layer for the whole tabpage. Measured by hand in WezTerm. The rule is the same
+rectangle comparison `screenpos` already gives, against every float in the tabpage, borders
+included; a covered block is treated exactly like a scrolled-out one, which also deletes its Kitty
+placement.
 
 *Alternatives:* re-place synchronously on every event — a payload per scroll row and per keystroke;
 freeze the viewport as the popup does — R is the reading surface and must scroll; keep the artwork
@@ -155,9 +183,11 @@ underneath and let the terminal keep its paint — the same thing, with the wipe
 
 ### D7 — The card is what a failed or absent placement costs
 
-Nothing in this design hides a failure: a file that disappears, a block that is partly visible, a
-terminal that cannot draw, a `graphics = 'off'` — all of them leave the card in place, which is the
-document's own content and needs no paint. That is why the card comes first in the task order:
+Nothing in this design hides a failure: a file that disappears, a block the path-carrying
+transport cannot crop, a file that transport cannot decode — it names PNG as the picture's format
+in its sequence, so every other format is refused and keeps its card — a terminal that cannot draw,
+a `graphics = 'off'` — all of them leave the
+card in place, which is the document's own content and needs no paint. That is why the card comes first in the task order:
 it is the floor the rest of the change stands on.
 
 ### D8 — An explicit `image_mode = 'off'` keeps its alt text
@@ -202,12 +232,16 @@ popup full of dots on the terminal this change exists to stop drawing them on.
 
 ## Risks / Trade-offs
 
-- **A visible wipe on every scroll** → the card underneath is the artwork's box, so what shows
-  during the wipe is a quiet surface with the file's name, not a dot matrix; the placement returns
-  one debounce after the scroll stops.
+- **A visible wipe on every scroll** → wherever a picture is painted the card underneath is the
+  artwork's box, so what shows during the wipe is a quiet surface with the file's name, not a dot
+  matrix; the placement returns one debounce after the scroll stops.
 - **A document with many images costs a spawn each** → thumbnails are requested lazily, only for
-  blocks that become wholly visible, and cached per file and box, so a session costs one request
-  per distinct visible picture; the cache is bounded and evicts least-recently-used entries.
+  blocks that become wholly visible and only for files over the threshold, and cached per file and
+  box, so a session costs one request per distinct visible picture; the cache is bounded and
+  evicts least-recently-used entries.
+- **A file under the threshold is re-sent on every settle** → the threshold is a byte count, so
+  the payload is bounded by it and the bytes are cached; a reader who would rather have the
+  smallest payload sets it to `0` and takes the thumbnail everywhere.
 - **A terminal whose cells are far from 2:1** → the picture is stretched by the same error the
   artwork carries, since both are laid out under the same assumption; a cell-metric source, if
   Neovim ever exposes one, changes D4 and nothing else.
@@ -221,6 +255,9 @@ popup full of dots on the terminal this change exists to stop drawing them on.
   could only show the dots this change removes; the file opens in the system viewer instead, which
   is the behaviour the reader asked for, and the open-image key already did it. A reader who wants
   the dots back sets `image_inline = 'art'` and keeps them inline.
+- **A float over a block costs it its picture** → the block keeps its card while the float is
+  there, which is what the float's own content needs in order to be readable; the settle after
+  the float closes paints it again, and the thumbnail came from the cache.
 - **Two windows on one document** → each window places its own; a placement is screen-global, so a
   block visible in neither window keeps nothing, and a block visible in both is painted twice at
   different positions, which the protocol allows.

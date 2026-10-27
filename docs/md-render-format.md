@@ -1,11 +1,33 @@
 # The `md-render` wire format
 
-`md-render` writes one JSON object to stdout and nothing else. Diagnostics go to
-stderr, so a caller can read stdout as data unconditionally.
+`md-render` renders a document as one JSON object on stdout and nothing else.
+Diagnostics go to stderr, so a caller can read stdout as data unconditionally.
 
 ```text
 md-render --width 120 --theme nord path/to/file.md
 ```
+
+## Auxiliary modes
+
+```text
+md-render thumbnail <source> --box <cols>x<rows> --out <path> --background <#rrggbb>
+md-render thumbnail <source> --box <cols>x<rows> --crop <top>x<rows> --out <path> --background <#rrggbb>
+```
+
+`thumbnail` encodes a picture at the shape a terminal cell box has — `cols` to
+twice `rows`, the artwork's own proportions — and writes it to `--out`. It
+writes nothing to stdout and takes no `--width`.
+
+`--crop TOPxROWS` writes only those rows of the box. The picture is fitted and
+centred in the whole box first and the rows are cut from that drawing, so the
+output is the same picture at the same scale as the whole box: a block half
+scrolled out of the window asks for the rows still on screen and the reader
+sees the part of the picture that is there, not a squeezed whole. A crop that
+is not inside the box is refused, naming `--crop`.
+
+It is the only stage that decodes pixels on the plugin's behalf: the plugin
+paints the result inline where the terminal draws images, and the document's
+card is what shows when it does not. Nothing about a render depends on it.
 
 The object describes a document already laid out for a specific column width.
 It is not a parse tree and not an intermediate representation: the engine has

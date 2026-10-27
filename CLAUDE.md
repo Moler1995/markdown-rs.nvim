@@ -134,7 +134,7 @@ Rendering is deterministic: same source, width and theme produce byte-identical 
 
 - `engine/src/theme/` defines semantic `Tokens`, derives a flat `Palette` from them, and keeps one constructor per theme in `themes.rs`. Add a theme there, not in the token types.
 - `engine/src/mermaid.rs` wraps the vendored `mermaid-text`. `MermaidTextBackend::Auto` is a narrow lexical heuristic: it picks the Native backend only for a `subgraph` containing its own `direction` line, where Sugiyama is documented to be less compact; everything else uses Sugiyama.
-- The dependency set is deliberately small and is asserted by `engine/tests/dependencies.rs`: no terminal-drawing crate, no async runtime. The one decoder is `image`, added knowingly for image artwork: markdown images are decoded and drawn as character cells by `engine/src/image_art.rs`, the only stage that knows both the width and the page height. Adding any other crate means adding it to that test's allowlist, with the job it does.
+- The dependency set is deliberately small and is asserted by `engine/tests/dependencies.rs`: no terminal-drawing crate, no async runtime. The one decoder is `image`, added knowingly for image artwork: markdown images are decoded and drawn as character cells by `engine/src/image_art.rs`, the only stage that knows both the width and the page height. The same module draws the card — the theme's raised surface in the shape the caller asks for: three rows where no terminal paints the picture, the picture's box where one does (`--image-card-rows`, `--image-card-min-width`) — and encodes the thumbnail the plugin paints over it, through the `md-render thumbnail` subcommand. Adding any other crate means adding it to that test's allowlist, with the job it does.
 
 ### The plugin
 
@@ -144,14 +144,14 @@ Module responsibilities:
 
 | Module | Owns |
 | --- | --- |
-| `init.lua` | autocmds, keymaps, commands, the R↔S transitions and insert-entry keys |
+| `init.lua` | autocmds, keymaps, commands, the R↔S transitions, insert-entry keys, and the settle that repaints inline pictures |
 | `state.lua` | which mode each window is in; the render cache keyed on buffer, `changedtick`, width and theme |
 | `engine.lua` | binary resolution, spawning, top-level JSON validation — nothing about markdown |
-| `render.lua` | writing lines into R and placing one extmark per span; display↔source mapping |
+| `render.lua` | writing lines into R and placing one extmark per span, plus the image hint's virtual text; display↔source mapping |
 | `style.lua` | interning wire styles into highlight groups named by a hash of the style, so re-renders reuse groups instead of redefining them |
 | `link.lua` | resolving the link under the cursor from the *source* text (the engine drops link targets) |
 | `preview.lua` | finding the block under the cursor, the float, its own render budget and the zoom ladder |
-| `graphics.lua` | terminal identification, the two graphics transports, the escape sequences, and the injectable raw-bytes sender |
+| `graphics.lua` | terminal identification, the two graphics transports, the escape sequences — every placement wrapped in a cursor save/restore, so the raw move it needs does not desync Neovim's own cursor tracking — the injectable raw-bytes sender, the thumbnail and original-file caches, the placement of pictures over their cards — cropped to the rows the window shows, where the transport carries bytes, and only a PNG where the transport carries a path — and the rule that a block a floating window covers is not painted |
 
 Refreshes are debounced by `resize_debounce` (100 ms) because resizes and typing arrive in bursts; toggles are applied immediately so a pending refresh cannot swallow the key after a resize.
 

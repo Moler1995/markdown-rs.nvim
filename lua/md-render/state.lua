@@ -81,7 +81,9 @@ end
 --- `changedtick` covers the document's *contents*: it changes on every edit and
 --- on nothing else. Everything else in the key is a reason the same contents
 --- could render differently — the width and height the page has, the encoding
---- images are drawn with, the theme, whether frames were asked for, and the
+--- images are drawn with (`image_inline` already resolved against `image_mode`,
+--- so switching either one, or switching between two values that resolve alike,
+--- is decided by this one field), the theme, whether frames were asked for, and the
 --- palette, background, dithering, minimum height and sharpening that decide
 --- how an image is drawn. A height-only resize, or flipping `image_mode`,
 --- changes what the engine would produce without touching the buffer, so those

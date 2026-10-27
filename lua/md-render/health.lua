@@ -72,6 +72,7 @@ function M.probe()
     checks = {},
     termguicolors = vim.o.termguicolors,
     image_encoding = config.image_encoding(),
+    image_inline = nil,
     filetypes = vim.deepcopy(config.options.filetypes),
     engine = nil,
     step = nil,
@@ -148,6 +149,36 @@ function M.probe()
   add(report, 'graphics', graphics_ok, graphics_detail,
     'Images still show as character cells. Use Neovim 0.12 or newer in WezTerm, '
       .. 'iTerm2, kitty or Ghostty, with `graphics` left at its default.',
+    'warn')
+
+  -- What an inline image becomes, and why. A `warn` for a card nobody paints
+  -- over, never an error: the card is a whole answer about the file, the
+  -- document reads the same either way, and `image_inline` may name exactly
+  -- that on purpose.
+  local inline = config.image_inline_encoding()
+  report.image_inline = inline
+  local inline_detail, inline_ok
+  if config.options.image_mode == 'off' then
+    inline_detail = "alt text (`off`): image_mode = 'off'"
+    inline_ok = true
+  elseif config.options.image_inline == 'art' then
+    inline_detail = 'the ' .. inline .. " artwork: image_inline = 'art'"
+    inline_ok = true
+  elseif config.options.image_inline == 'card' then
+    inline_detail = "a card on its own: image_inline = 'card'"
+    inline_ok = true
+  elseif report.graphics then
+    inline_detail = "a card with the picture painted over it: image_inline = 'auto'"
+    inline_ok = true
+  else
+    local _, why = graphics.tier()
+    inline_detail = 'a card on its own: ' .. (why or 'the terminal cannot draw')
+    inline_ok = false
+  end
+  add(report, 'image_inline', inline_ok, inline_detail,
+    'An inline picture is painted only where graphics works; the card is what '
+      .. 'the document shows otherwise. Set `image_inline = \'art\'` to get the '
+      .. 'character artwork instead.',
     'warn')
 
   local filetypes = #report.filetypes > 0 and table.concat(report.filetypes, ', ')

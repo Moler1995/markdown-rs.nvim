@@ -174,6 +174,7 @@ is deep:
 require('md-render').setup({
   theme = 'nord',
   image_mode = 'auto',
+  image_inline = 'auto',
   graphics = 'auto',
   keymaps = {
     toggle = '<leader>mr',
@@ -197,10 +198,11 @@ require('md-render').setup({
 })
 ```
 
-`theme` is passed to the engine. `image_mode` picks how artwork is drawn, and
-`graphics` whether the preview popup has the terminal draw the file itself.
-`filetypes` decides which buffers the plugin manages. Every keymap may be set
-to `false` to leave that key alone.
+`theme` is passed to the engine. `image_mode` picks how artwork is drawn,
+`image_inline` whether an inline image is a three-row card, a card with the
+picture painted over it, or that artwork, and `graphics` whether the terminal
+draws image files itself. `filetypes` decides which buffers the plugin manages.
+Every keymap may be set to `false` to leave that key alone.
 
 The full option reference — every key, its type, default and meaning — is
 `:help md-render-options`. The plugin ships its own help file, so the reference

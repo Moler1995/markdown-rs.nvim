@@ -30,14 +30,20 @@ the same width, and SHALL emit only characters from the block-element range U+25
 In the **ASCII** encoding each cell SHALL be a character from a fixed luminance ramp, and the
 encoding SHALL emit no character outside the ASCII range.
 
-In the **card** encoding no pixel of the picture SHALL be drawn as a glyph. The block SHALL occupy
-the same cell box the artwork would occupy at the same bounds and the same picture, so that a
-document laid out with the card and one laid out with braille hold the same rows and the same
-source lines. The box SHALL be filled with the theme's raised surface colour as the background,
-and one row of it — the middle one — SHALL carry a caption in a muted foreground: the resolved
-file's name, followed by ` · <width>×<height>` when the picture's header reports its size. The
-caption SHALL be centred in the box and truncated to the box's width. A box with no room for a
-cell SHALL fall back as an unrenderable image does.
+In the **card** encoding no pixel of the picture SHALL be drawn as a glyph. Unless the caller
+gives it a shape of its own, the block SHALL occupy the same cell box the artwork would occupy at
+the same bounds and the same picture, so that a document laid out with the card and one laid out
+with braille hold the same rows and the same source lines. The box SHALL be filled with the
+theme's raised surface colour as the background, and one row of it — the middle one — SHALL carry
+a caption in a muted foreground: the resolved file's name, followed by ` · <width>×<height>` when
+the picture's header reports its size. The caption SHALL be centred in the box and truncated to
+the box's width. A box with no room for a cell SHALL fall back as an unrenderable image does.
+
+A caller MAY give the card a shape of its own. A requested height SHALL fix the card's display
+rows, clamped to the page's height when one is given and never below one row. A requested minimum
+width SHALL raise the card's columns to at least that many, capped at the page width. The picture's
+own columns are kept unless a minimum width raises them, and the card's source attribution is
+unchanged either way.
 
 The engine SHALL use the braille encoding unless the caller asks for another encoding.
 
@@ -94,12 +100,21 @@ The engine SHALL use the braille encoding unless the caller asks for another enc
 
 #### Scenario: Card encoding
 
-- **WHEN** an image is rendered with the card encoding requested
+- **WHEN** an image is rendered with the card encoding requested and no shape of its own
 - **THEN** the block occupies the same number of display rows and columns as the braille encoding
   of the same image at the same width and page height
 - **AND** every one of its display lines is attributed to the reference's source line
 - **AND** the box carries the theme's raised surface as its background
 - **AND** no glyph of the box is a picture detail
+
+#### Scenario: A card with a shape of its own
+
+- **WHEN** an image is rendered with the card encoding, a height of three rows and a minimum width
+- **THEN** the block is three display rows tall
+- **AND** its columns are the picture's own, raised to the minimum width when that is wider
+- **AND** every one of those rows is attributed to the reference's source line
+- **AND** a page narrower than the minimum width, or shorter than the requested height, gives the
+  card the page's width or height instead, never fewer than one row
 
 #### Scenario: Card caption
 
@@ -186,6 +201,12 @@ requested cell box: a source path, a box of columns by rows, an output path, and
 colour. This is the file a terminal paints over an inline image, and the engine is the only stage
 with a decoder.
 
+A request MAY also name a crop: a top row and a count of rows inside the box. With one, the engine
+SHALL fit and centre the picture in the whole box first and cut those rows from that drawing, so
+the output is the same picture at the same scale as the whole box, describing the part of the
+block a window shows. A crop that is not inside the box — no rows at all, or rows past its last —
+SHALL be refused like any other bad request.
+
 The output SHALL be a single encoded picture whose pixel width to height ratio is the box's
 columns to twice its rows, so that a terminal filling the box with it reproduces the picture's
 proportions. The picture SHALL be scaled to fit inside that rectangle without distortion, centred,
@@ -204,6 +225,14 @@ picture's own size — subject to the same decoding limits as every other image.
 - **THEN** the file written has a width to height ratio of 40 to 24
 - **AND** it decodes to fewer pixels than the original
 - **AND** its size on disk is a small fraction of the original's
+
+#### Scenario: A crop of a box
+
+- **WHEN** a picture is asked for in a 40 × 12 box, and again in that box cropped to its rows 3
+  to 7
+- **THEN** the second output is five twelfths the height of the first
+- **AND** its pixels are the first output's rows 3 to 7, at the same scale
+- **AND** a crop past the box's last row is refused, naming the crop
 
 #### Scenario: Determinism
 

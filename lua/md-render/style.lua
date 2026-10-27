@@ -26,6 +26,17 @@ M.cache = {}
 M.link_group = 'MdRenderLink'
 vim.api.nvim_set_hl(0, M.link_group, { underline = true, default = true })
 
+--- The group of the image hint — the virtual text that says which key opens
+--- the picture.
+---
+--- It is drawn over the card's surface rather than over the document's own
+--- background, so it says nothing about either: with `hl_mode = 'combine'` only
+--- the group's foreground is taken, and the surface colour underneath stays.
+--- Linking to `Comment` keeps it a quiet annotation in whatever colourscheme is
+--- in use; `default` leaves the name to the user, as `MdRenderLink` does.
+M.hint_group = 'MdRenderHint'
+vim.api.nvim_set_hl(0, M.hint_group, { link = 'Comment', default = true })
+
 --- The sixteen system colours of the xterm 256-colour palette.
 ---
 --- These are the conventional values, not the terminal's actual ones. A style

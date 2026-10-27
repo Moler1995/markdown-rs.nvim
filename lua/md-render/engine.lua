@@ -110,7 +110,7 @@ end
 ---   width     columns the text may occupy (required)
 ---   height    display rows the page has, or nil to bound images by width alone
 ---   encoding  the engine's `--image-encoding`: 'braille', 'quads', 'blocks',
----             'ascii' or 'off'
+---             'ascii', 'card' or 'off'
 ---   base      directory relative image destinations resolve against, or nil to
 ---             leave them to the engine's working directory
 ---   animation true to ask for an animated image's frames as well as its first
@@ -120,6 +120,8 @@ end
 ---             or a '#rrggbb' colour
 ---   dither    'auto', true or false for `--image-dither`
 ---   min_rows  fewest display rows to enlarge an image to, or 0 for never
+---   card_rows the rows a card occupies, or 0 for the artwork's own box
+---   card_min_width the narrowest a card may be, or 0 for the artwork's box
 ---   sharpen   true to sharpen an image that was reduced
 ---   paper     the '#rrggbb' braille inks against, when the caller knows it;
 ---             nil lets the engine derive it from `background`
@@ -195,6 +197,16 @@ function M.render(opts, content, view, cb)
   if view.min_rows and view.min_rows > 0 then
     args[#args + 1] = '--image-min-rows'
     args[#args + 1] = tostring(view.min_rows)
+  end
+  -- A card's shape, when the caller asked for one of its own. Zero is left
+  -- unsent, so the engine's default — the artwork's box — is not restated.
+  if view.card_rows and view.card_rows > 0 then
+    args[#args + 1] = '--image-card-rows'
+    args[#args + 1] = tostring(view.card_rows)
+  end
+  if view.card_min_width and view.card_min_width > 0 then
+    args[#args + 1] = '--image-card-min-width'
+    args[#args + 1] = tostring(view.card_min_width)
   end
   if view.sharpen then
     args[#args + 1] = '--image-sharpen'

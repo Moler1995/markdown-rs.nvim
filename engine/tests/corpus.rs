@@ -10,9 +10,11 @@
 //! claims. Those are the things a change to the renderer is most likely to
 //! move, and the things a reader notices first.
 
+use std::path::{Path, PathBuf};
+
 use md_render::block::DocBlock;
 use md_render::document::{display_width, layout_document, source_line_count};
-use md_render::image_art::ImageOptions;
+use md_render::image_art::{ImageEncoding, ImageOptions};
 use md_render::renderer::render_markdown;
 use md_render::theme::{Palette, Theme};
 use md_render::wire::WireDoc;
@@ -53,16 +55,30 @@ fn fixtures() -> Vec<(String, String)> {
 }
 
 fn render(content: &str, width: u16) -> WireDoc {
+    render_with(content, width, ImageOptions::default())
+}
+
+fn render_with(content: &str, width: u16, images: ImageOptions<'_>) -> WireDoc {
     let palette = Palette::from_theme(Theme::default());
     let blocks = render_markdown(content, &palette, Theme::default());
-    layout_document(
-        &blocks,
-        width,
-        &palette,
-        source_line_count(content),
-        ImageOptions::default(),
-    )
+    layout_document(&blocks, width, &palette, source_line_count(content), images)
 }
+
+/// The directory the corpus's image references resolve against.
+fn image_base() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/images")
+}
+
+/// A document whose image reference resolves, with prose either side of it.
+const IMAGE_DOCUMENT: &str = "\
+# Pictures
+
+Before the picture.
+
+![sample](image_sample.png)
+
+After the picture.
+";
 
 /// A stable, readable view of a rendered document: one row per display line,
 /// with its index and the source line it anchors to.
@@ -290,4 +306,130 @@ fn a_parent_list_item_is_anchored_to_its_own_line() {
         ],
         "the parent bullet must not inherit its child's source line"
     );
+}
+
+/// A card occupies the artwork's place and nothing else: the same rows, the
+/// same widths and the same source anchors a pixel encoding produces.
+///
+/// This is what lets the plugin treat a card as the image: `source_line_for`,
+/// the preview's block lookup and every motion over the picture see one
+/// document either way.
+#[test]
+fn a_card_stands_in_for_the_artwork_it_replaces() {
+    let base = image_base();
+    let card = render_with(
+        IMAGE_DOCUMENT,
+        SNAPSHOT_WIDTH,
+        ImageOptions {
+            base: Some(&base),
+            encoding: ImageEncoding::Card,
+            ..ImageOptions::default()
+        },
+    );
+    let braille = render_with(
+        IMAGE_DOCUMENT,
+        SNAPSHOT_WIDTH,
+        ImageOptions {
+            base: Some(&base),
+            encoding: ImageEncoding::Braille,
+            ..ImageOptions::default()
+        },
+    );
+
+    assert_eq!(
+        card.lines.len(),
+        braille.lines.len(),
+        "a card and braille must occupy the same number of rows"
+    );
+    for (i, (card_line, braille_line)) in card.lines.iter().zip(&braille.lines).enumerate() {
+        assert_eq!(
+            card_line.source, braille_line.source,
+            "line {i} must anchor to the same source line"
+        );
+        assert_eq!(
+            display_width(card_line),
+            display_width(braille_line),
+            "line {i} must occupy the same width"
+        );
+    }
+    assert_eq!(card.layout_width, braille.layout_width);
+}
+
+/// A compact card is the artwork's width at a fixed height: every image in a
+/// document takes the same number of rows, whatever its shape, and each of
+/// those rows still anchors to the reference's own source line.
+#[test]
+fn a_compact_card_keeps_every_image_to_the_same_height() {
+    let base = image_base();
+    let content = "\
+# Pictures
+
+![sample](image_sample.png)
+
+![photo](image_sample.jpg)
+
+After the pictures.
+";
+    let doc = render_with(
+        content,
+        SNAPSHOT_WIDTH,
+        ImageOptions {
+            base: Some(&base),
+            encoding: ImageEncoding::Card,
+            card_rows: 3,
+            ..ImageOptions::default()
+        },
+    );
+
+    // Drawn rows only: the blank line that closes the block inherits the
+    // reference's source line, exactly as it does around the artwork.
+    for source in [2, 4] {
+        let rows: Vec<&md_render::wire::WireLine> = doc
+            .lines
+            .iter()
+            .filter(|line| line.source == Some(source) && display_width(line) > 0)
+            .collect();
+        assert_eq!(
+            rows.len(),
+            3,
+            "source line {source} must be a three-row card"
+        );
+        assert!(
+            rows.iter()
+                .all(|line| display_width(line) <= SNAPSHOT_WIDTH as usize),
+            "every card row must be inside the page"
+        );
+    }
+}
+
+#[test]
+fn no_card_line_is_wider_than_the_requested_width() {
+    let base = image_base();
+    let content = "\
+# Pictures
+
+![sample](image_sample.png)
+
+![photo](image_sample.jpg)
+
+After the pictures.
+";
+    for width in SWEEP_WIDTHS {
+        let doc = render_with(
+            content,
+            width,
+            ImageOptions {
+                base: Some(&base),
+                encoding: ImageEncoding::Card,
+                ..ImageOptions::default()
+            },
+        );
+        for (i, line) in doc.lines.iter().enumerate() {
+            assert!(
+                display_width(line) <= width as usize,
+                "card at width {width}: line {i} is {} columns wide",
+                display_width(line)
+            );
+        }
+    }
 }

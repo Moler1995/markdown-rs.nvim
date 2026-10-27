@@ -1,0 +1,12 @@
+---
+source: engine/src/image_art.rs
+expression: card_text(&lines)
+---
+|                |
+|                |
+|                |
+|image_sample.png|
+|                |
+|                |
+|                |
+|                |

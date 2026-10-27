@@ -16,7 +16,9 @@
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::block::DocBlock;
-use crate::image_art::{Artwork, Bounds, ImageOptions, StyleBudget, animated_artwork, artwork};
+use crate::image_art::{
+    Artwork, Bounds, CardColours, ImageOptions, StyleBudget, animated_artwork, artwork,
+};
 use crate::mermaid::{MermaidLink, MermaidTextBackend, render_artwork};
 use crate::style::{Line, Span, Style};
 use crate::table::layout_table;
@@ -240,6 +242,9 @@ impl<'a> Layout<'a> {
         };
         let images = ImageOptions {
             paper: Some(self.images.paper.unwrap_or(theme_paper)),
+            // A card is theme furniture, not an image setting: the caller
+            // chose the theme, and only the layout has its resolved tokens.
+            card: CardColours::from_palette(self.palette),
             ..self.images
         };
         if self.images.animation
