@@ -256,6 +256,13 @@ Every top-level key in `config.defaults`, with its default. Set a keymap to
                                                         *:MdRenderSource*
 :MdRenderSource        Show the source buffer in the current window.
 
+                                                        *md-render-edit*
+:edit                  Reloads the document from disk, in R as in any other
+                        buffer. It re-reads the source, not the rendered
+                        view, and shows the result in R; the window stays in R
+                        with the same rendered buffer. Unsaved source changes
+                        refuse it with |E37|, and `:edit!` discards them.
+
                                                         *:MdRenderReset*
 :MdRenderReset         Forget every cached render and every highlight group
                         made for a rendered style. Use it after changing the

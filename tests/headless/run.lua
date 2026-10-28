@@ -1155,6 +1155,123 @@ section('10.8', function()
 end)
 
 --------------------------------------------------------------------------------
+-- 10.9 Reloading the document from R
+--------------------------------------------------------------------------------
+
+section('10.9', function()
+  --- Errors reported since the last check, which a reload must not produce.
+  local function error_count()
+    local count = 0
+    for _, n in ipairs(notifications) do
+      if n.level >= vim.log.levels.ERROR then
+        count = count + 1
+      end
+    end
+    return count
+  end
+
+  -- A private copy, because this section changes the file on disk.
+  local copy = vim.fn.tempname() .. '.md'
+  vim.fn.writefile(vim.fn.readfile(fixture), copy)
+
+  pcall(vim.cmd, 'only')
+  vim.cmd('edit! ' .. vim.fn.fnameescape(copy))
+  md.attach(vim.api.nvim_get_current_buf(), vim.api.nvim_get_current_win())
+  truthy('10.9 the copy reaches R', wait_until(showing_rendered))
+  local st = current_state()
+  local win, rendered, source = st.win, st.rendered, st.source
+
+  -- `:edit` in R reloads the document, not the rendered buffer. R has no file
+  -- behind it, so a read used to unload it and read nothing: the view went
+  -- blank, and the filetype its name implies scheduled an attach for a buffer
+  -- that was already gone — `Invalid window id` at `attach`, which is what a
+  -- reader saw after changing the file elsewhere and pressing `:e`.
+  local errors_before = error_count()
+  vim.fn.writefile({ '# reloaded from disk', '', 'and a new line' }, copy)
+  local ok, err = pcall(vim.cmd, 'edit')
+  truthy('10.9 :edit in R does not raise', ok, tostring(err))
+  truthy('10.9 the reloaded document reaches R', wait_until(function()
+    if not vim.api.nvim_buf_is_valid(rendered) then
+      return false
+    end
+    local first = vim.api.nvim_buf_get_lines(rendered, 0, 1, false)[1] or ''
+    return first:find('reloaded from disk') ~= nil
+  end))
+  truthy('10.9 the window survives the reload', vim.api.nvim_win_is_valid(win))
+  truthy('10.9 and is the window the state names', state.windows[win] == st)
+  expect('10.9 still showing the same rendered buffer', vim.api.nvim_win_get_buf(win), rendered)
+  expect('10.9 still in R', state.windows[win] and state.windows[win].mode, 'R')
+  expect('10.9 the source is still the document', state.windows[win].source, source)
+  eq_table('10.9 and holds what is on disk',
+    vim.api.nvim_buf_get_lines(source, 0, 1, false), { '# reloaded from disk' })
+  expect('10.9 with nothing reported as an error', error_count(), errors_before)
+
+  -- The rendered buffer's filetype is not a reason to attach it: the guard is
+  -- what keeps a filetype event raised for the view — which is what reading it
+  -- does, since its name ends in the source's extension — from being taken for
+  -- a new document.
+  vim.bo[rendered].filetype = 'markdown'
+  vim.wait(100)
+  expect('10.9 a filetype event for the rendered buffer attaches nothing',
+    state.windows[win], st)
+  expect('10.9 and the state still names the document', st.source, source)
+  vim.bo[rendered].filetype = ''
+
+  -- A split, which is the case that used to close a window: R is
+  -- `bufhidden=wipe`, and wiping a buffer shown in one of several windows closes
+  -- that window.
+  vim.cmd('split')
+  local second = vim.api.nvim_get_current_win()
+  truthy('10.9 the split reaches R', wait_until(function()
+    local o = state.windows[second]
+    return o ~= nil and o.mode == 'R' and vim.api.nvim_win_get_buf(second) == o.rendered
+  end))
+  vim.fn.writefile({ '# split reload' }, copy)
+  errors_before = error_count()
+  ok, err = pcall(vim.cmd, 'edit')
+  truthy('10.9 :edit in a split does not raise', ok, tostring(err))
+  truthy('10.9 both windows survive the reload',
+    vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_is_valid(second))
+  truthy('10.9 and the reload reaches R', wait_until(function()
+    local other = state.windows[second]
+    return other ~= nil and vim.api.nvim_buf_is_valid(other.rendered)
+      and (vim.api.nvim_buf_get_lines(other.rendered, 0, 1, false)[1] or ''):find('split reload') ~= nil
+  end))
+  expect('10.9 with nothing reported as an error', error_count(), errors_before)
+
+  vim.cmd('only')
+  local one = current_state()
+  truthy('10.9 back to one window showing R', one.mode == 'R')
+
+  -- Unsaved source changes refuse a bare `:edit`, as they do in any buffer, and
+  -- leave both views as they were.
+  vim.api.nvim_buf_set_lines(one.source, 0, 0, false, { '<!-- unsaved -->' })
+  errors_before = error_count()
+  ok, err = pcall(vim.cmd, 'edit')
+  truthy('10.9 :edit with unsaved source changes is refused', not ok)
+  truthy('10.9 and says why', tostring(err):find('E37') ~= nil, tostring(err))
+  expect('10.9 the source keeps its unsaved line',
+    vim.api.nvim_buf_get_lines(one.source, 0, 1, false)[1], '<!-- unsaved -->')
+  truthy('10.9 R still shows the document it had',
+    (vim.api.nvim_buf_get_lines(one.rendered, 0, 1, false)[1] or ''):find('█') ~= nil)
+  expect('10.9 with nothing reported as an error', error_count(), errors_before)
+
+  -- And the bang discards them, as it does elsewhere.
+  vim.fn.writefile({ '# after the bang' }, copy)
+  ok, err = pcall(vim.cmd, 'edit!')
+  truthy('10.9 :edit! in R does not raise', ok, tostring(err))
+  truthy('10.9 the bang reloads the source from disk', wait_until(function()
+    return vim.api.nvim_buf_get_lines(one.source, 0, 1, false)[1] == '# after the bang'
+  end))
+  truthy('10.9 and R shows it', wait_until(function()
+    local first = vim.api.nvim_buf_get_lines(one.rendered, 0, 1, false)[1] or ''
+    return first:find('after the bang') ~= nil
+  end))
+
+  vim.fn.delete(copy)
+end)
+
+--------------------------------------------------------------------------------
 -- 11.1 Locating the block
 --------------------------------------------------------------------------------
 

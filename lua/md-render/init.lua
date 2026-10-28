@@ -116,6 +116,19 @@ local function new_rendered_buffer(st)
     end,
   })
 
+  -- `:edit` in R reloads the document, not this buffer. There is no file behind
+  -- R, so without this reader Vim unloads the buffer and reads nothing: the
+  -- rendered view is wiped, and because `bufhidden=wipe` takes the window with
+  -- it when R is one of a split, the split closes. Answering the read in the
+  -- source buffer is what makes `:e` mean what it means in every other buffer.
+  vim.api.nvim_create_autocmd('BufReadCmd', {
+    group = M.augroup,
+    buffer = buf,
+    callback = function()
+      M.reload_source(st)
+    end,
+  })
+
   -- `bufhidden=wipe` discards the buffer when the window leaves it. Keeping the
   -- map clean is the one thing Vim will not do for us — and so is the mode: a
   -- wiped buffer cannot be what the window is showing, so the state has to stop
@@ -664,6 +677,13 @@ end
 function M.attach(buf, win)
   win = win or vim.api.nvim_get_current_win()
   if not buf or not vim.api.nvim_buf_is_valid(buf) or not vim.api.nvim_win_is_valid(win) then
+    return
+  end
+  -- A rendered buffer is not a document, whatever its name or filetype says.
+  -- Its name carries the source's extension, so a read of it — `:edit` in R
+  -- with no reader of its own is one — fires `FileType`, and attaching would
+  -- treat it as the source of a new state.
+  if state.by_rendered[buf] then
     return
   end
   if not config.manages(vim.bo[buf].filetype) then
@@ -1377,6 +1397,63 @@ function M.write_source(st)
   vim.api.nvim_buf_call(source, function()
     vim.cmd('silent write')
   end)
+end
+
+--- Reload the document from disk, for an `:edit` issued while `st` is showing R.
+---
+--- Vim empties the buffer a `BufReadCmd` is called for, so R has lost its
+--- contents by the time this runs. Whatever the outcome, the answer has to put
+--- a document back on screen: the reloaded one when the read succeeded, the one
+--- that was there when it did not.
+function M.reload_source(st)
+  if state.windows[st.win] ~= st or not vim.api.nvim_win_is_valid(st.win) then
+    return
+  end
+  local source = st.source
+
+  --- Put R back the way it was, without asking the engine for anything: the
+  --- document it showed is still what the source says.
+  local function restore()
+    if st.doc and st.rendered and vim.api.nvim_buf_is_valid(st.rendered) then
+      render.apply(st.rendered, st.doc, true, image_hints(st, st.doc))
+    else
+      M.show_rendered(st.win)
+    end
+  end
+
+  if not source or not vim.api.nvim_buf_is_valid(source) then
+    restore()
+    vim.notify('md-render: nothing to reload', vim.log.levels.WARN)
+    return
+  end
+
+  -- The source is what `:edit` would be editing, so Vim's own rule applies to
+  -- it: unsaved changes refuse a bare `:edit` and are discarded by `:edit!`.
+  -- `:edit` with 'autowrite' set writes them first, so that case is left to the
+  -- source's own `:edit` below rather than refused here.
+  local bang = vim.v.cmdbang == 1
+  if vim.bo[source].modified and not bang and not vim.o.autowrite then
+    restore()
+    error('E37: No write since last change (add ! to override)', 0)
+  end
+
+  local ok, err = pcall(vim.api.nvim_buf_call, source, function()
+    vim.cmd(bang and 'silent edit!' or 'silent edit')
+  end)
+  if not ok then
+    restore()
+    vim.notify('md-render: ' .. tostring(err), vim.log.levels.ERROR)
+    return
+  end
+
+  -- A reload moves the source's changedtick even when the bytes did not change,
+  -- so this is a fresh render rather than the cached one: the reader asked for
+  -- what is on disk now, and that is what R has to show.
+  --
+  -- The old document goes back first, because the render is a spawn and the
+  -- buffer the read emptied would otherwise be an empty page until it answers.
+  restore()
+  M.show_rendered(st.win)
 end
 
 --- Set up the config and the autocmds. Returns the resolved options.
