@@ -29,6 +29,27 @@ buffer.
  <leader>mr toggles                          the same file, editable
 ```
 
+## What it looks like
+
+Headings, lists, quotes and inline code, wrapped to the window. The picture is
+the file itself, drawn by the terminal where one can draw it:
+
+![A rendered page with an inline image](doc/rendered-view.png)
+
+Mermaid diagrams are laid out as text, subgraph frames and all, so they scroll,
+search and yank like any other line:
+
+![A mermaid flowchart drawn with box characters](doc/diagram-view.png)
+
+Tables and code blocks are fitted to the width, and code keeps its syntax
+colours:
+
+![A table and a highlighted Rust block](doc/table-and-code.png)
+
+`<CR>` on a diagram opens it in a float, laid out at a budget of its own:
+
+![A diagram in the preview popup](doc/block-preview.png)
+
 ## Features
 
 - **A rendered view in the window.** Every normal-mode motion, search and yank
