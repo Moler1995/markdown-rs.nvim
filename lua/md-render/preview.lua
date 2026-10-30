@@ -73,14 +73,16 @@ local function names_mermaid(info)
   return vim.trim(info):lower() == 'mermaid'
 end
 
---- The `mermaid` fence containing 0-based source line `line`, or nil.
+--- The fence containing 0-based source line `line` that `accept` takes, or nil.
 ---
---- Returns the fence's first and last line (1-based) and its body. A fence is
---- the easy kind of block: its opener and its closer are unambiguous, so no
---- heuristic is needed — and only an explicitly tagged fence counts, so the
---- engine's untagged-fence guess (`looks_like_mermaid`) is deliberately not
---- mirrored here.
-function M.find_fence(lines, line)
+--- Returns the fence's first and last line (1-based) and the whole slice of
+--- `lines` from opener to closer, fences included. A fence is the easy kind of
+--- block: its opener and its closer are unambiguous, so no heuristic is needed.
+---
+--- An unterminated fence runs to the end of the buffer and, per CommonMark,
+--- swallows everything after it. There is no block there, and the scan stops:
+--- a later fence cannot be found by scanning past a closer that does not exist.
+local function scan_fence(lines, line, accept)
   local target = line + 1
   local i = 1
   while i <= #lines do
@@ -96,15 +98,13 @@ function M.find_fence(lines, line)
         end
       end
       if not close then
-        -- An unterminated fence runs to the end of the buffer and, per
-        -- CommonMark, swallows everything after it. There is no block here.
         return nil
       end
-      if names_mermaid(open.info) and target >= i and target <= close then
+      if accept(open) and target >= i and target <= close then
         return {
-          kind = 'mermaid',
           first = i,
           last = close,
+          info = open.info,
           lines = vim.list_slice(lines, i, close),
         }
       end
@@ -114,6 +114,42 @@ function M.find_fence(lines, line)
     end
   end
   return nil
+end
+
+--- The `mermaid` fence containing 0-based source line `line`, or nil.
+---
+--- Only an explicitly tagged fence counts, so the engine's untagged-fence guess
+--- (`looks_like_mermaid`) is deliberately not mirrored here.
+function M.find_fence(lines, line)
+  local found = scan_fence(lines, line, function(open)
+    return names_mermaid(open.info)
+  end)
+  if found then
+    found.kind = 'mermaid'
+  end
+  return found
+end
+
+--- The fenced code block containing 0-based source line `line`, whatever its
+--- language, or nil.
+---
+--- The same scan as `find_fence` with no info-string filter, so a ```rust or a
+--- bare ``` is found as readily as a ```mermaid. `body` is what a reader copies:
+--- the lines between the fences, without the opener and the closer.
+---
+--- Known divergence, shared with `find_fence`: an indented code block is not a
+--- fence and is not found, and neither is a fence indented past `MAX_FENCE_INDENT`
+--- — one nested in a list item.
+function M.find_code_fence(lines, line)
+  local found = scan_fence(lines, line, function()
+    return true
+  end)
+  if not found then
+    return nil
+  end
+  found.kind = 'code'
+  found.body = vim.list_slice(lines, found.first + 1, found.last - 1)
+  return found
 end
 
 --- True for a GFM delimiter row: cells of dashes with optional alignment colons,

@@ -247,6 +247,7 @@ and the code cannot drift apart.
 | `<C-s>` | R and S | write the source buffer |
 | `gf` | R and S | follow the link under the cursor |
 | `gF` | R and S | follow the link under the cursor in a new tab |
+| `gy` | R and S | yank the content of the code block, table or image under the cursor |
 | `gx` | R only | open the image under the cursor with the system application |
 | `<C-n>` | R and the animation popup | show the next frame of the animated image under the cursor; step one frame in the popup while paused |
 | `<CR>` | R only | preview the block or image under the cursor, or close the preview |

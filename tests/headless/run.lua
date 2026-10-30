@@ -256,7 +256,7 @@ section('8.1', function()
   eq_table('8.1 default filetypes', d.filetypes, { 'markdown' })
   eq_table('8.1 default keymaps', d.keymaps,
     { toggle = '<leader>mr', write = '<C-s>', preview = '<CR>', follow = 'gf',
-      follow_tab = 'gF',
+      follow_tab = 'gF', yank_block = 'gy',
       open_image = 'gx', frame_next = '<C-n>', pause = '<Space>',
       zoom_in = '+', zoom_out = '-', scroll_left = '<C-h>', scroll_right = '<C-l>' })
   eq_table('8.1 default preview caps', d.preview,
@@ -469,6 +469,139 @@ section('8.5', function()
       truthy(string.format('8.5 S leaves %s alone, as the README says', entry.key), in_s[lhs] == nil)
     end
   end
+end)
+
+--------------------------------------------------------------------------------
+-- 8.6 Copying the block under the cursor
+--------------------------------------------------------------------------------
+
+section('8.6', function()
+  local blocks_fixture = repo .. '/tests/fixtures/blocks.md'
+
+  local function reset_to_blocks()
+    vim.cmd('edit! ' .. vim.fn.fnameescape(blocks_fixture))
+    md.attach(vim.api.nvim_get_current_buf(), vim.api.nvim_get_current_win())
+    return wait_until(showing_rendered)
+  end
+
+  --- Put R's cursor on the display row for 0-based source line `src`.
+  local function goto_source(src)
+    local st = current_state()
+    local row = render.row_for_source(st.doc, src)
+    if row == nil then
+      return false
+    end
+    vim.api.nvim_win_set_cursor(st.win, { row + 1, 0 })
+    return true
+  end
+
+  --- Put S's cursor on 0-based source line `src`, at byte column `col`.
+  local function goto_source_in_s(src, col)
+    local st = current_state()
+    vim.api.nvim_win_set_cursor(st.win, { src + 1, col or 0 })
+    return true
+  end
+
+  --- Fill both registers with a value no block could produce, so that "the key
+  --- did nothing" is distinguishable from "the key wrote something".
+  local SENTINEL = 'md-render-test-sentinel'
+  local function arm_registers()
+    vim.fn.setreg('"', SENTINEL)
+    vim.fn.setreg('0', SENTINEL)
+  end
+
+  -- A linewise register keeps a trailing newline of its own, so the expected
+  -- text for a block copied linewise is the lines joined and terminated.
+  local function linewise(list)
+    return table.concat(list, '\n') .. '\n'
+  end
+
+  local BODY = linewise { 'fn main() {', '    println!("hi");', '}' }
+  local TABLE = linewise { '| Name | Value |', '| --- | --- |', '| a | 1 |', '| b | 2 |' }
+  local IMAGE = '![a picture](./linked.md)'
+
+  -- From R, where the cursor row is a display row and the document is what
+  -- maps it back to the source line holding the fence.
+  truthy('8.6 in R on the blocks fixture', reset_to_blocks())
+  truthy('8.6 the fence body has a display row', goto_source(6))
+  arm_registers()
+  local before = engine_calls
+  feed('gy')
+  expect('8.6 R copies the fence body without its fences', vim.fn.getreg('0'), BODY)
+  expect('8.6 and the unnamed register holds it too', vim.fn.getreg('"'), BODY)
+  expect('8.6 a block is copied linewise', vim.fn.getregtype('0'), 'V')
+  expect('8.6 copying spawns no engine', engine_calls, before)
+
+  -- The table copies its own source lines, pipes and all.
+  truthy('8.6 the table has a display row', goto_source(10))
+  arm_registers()
+  feed('gy')
+  expect('8.6 a table copies its source lines', vim.fn.getreg('0'), TABLE)
+
+  -- An image is a span rather than a block: the reference text is what is
+  -- copied, and characterwise, because that is what goes back into a paragraph.
+  truthy('8.6 the image has a display row', goto_source(15))
+  arm_registers()
+  feed('gy')
+  expect('8.6 an image copies its reference', vim.fn.getreg('0'), IMAGE)
+  expect('8.6 and does so characterwise', vim.fn.getregtype('0'), 'v')
+
+  -- A paragraph is not one of the four kinds, so the key goes back to Vim and
+  -- neither register is touched.
+  truthy('8.6 the paragraph has a display row', goto_source(2))
+  arm_registers()
+  feed('gy')
+  expect('8.6 a paragraph leaves register 0 alone', vim.fn.getreg('0'), SENTINEL)
+  expect('8.6 a paragraph leaves the unnamed register alone', vim.fn.getreg('"'), SENTINEL)
+
+  -- From S the cursor row is already a source row, and no document exists:
+  -- R's buffer is wiped on the way out, taking `st.doc` with it. The same
+  -- blocks must be found without one.
+  truthy('8.6 back in R before crossing to S', reset_to_blocks())
+  md.show_source()
+  truthy('8.6 and in S', wait_until(showing_source))
+  truthy('8.6 the cursor is in the fence body', goto_source_in_s(6))
+  arm_registers()
+  feed('gy')
+  expect('8.6 S copies the same fence body', vim.fn.getreg('0'), BODY)
+
+  truthy('8.6 the cursor is on the table', goto_source_in_s(10))
+  arm_registers()
+  feed('gy')
+  expect('8.6 S copies the same table', vim.fn.getreg('0'), TABLE)
+
+  -- In S the cursor's own byte column decides, which is the case R cannot
+  -- resolve: a display column has no byte column to compare against. The
+  -- reference starts at byte 11 of `An image: ![a picture](./linked.md)`.
+  truthy('8.6 the cursor is on the image reference', goto_source_in_s(15, 11))
+  arm_registers()
+  feed('gy')
+  expect('8.6 S copies the same reference', vim.fn.getreg('0'), IMAGE)
+
+  -- Off the reference, in the same paragraph, there is nothing to copy.
+  truthy('8.6 the cursor is on the paragraph before it', goto_source_in_s(15, 0))
+  arm_registers()
+  feed('gy')
+  expect('8.6 S leaves the registers alone off a reference', vim.fn.getreg('0'), SENTINEL)
+
+  -- `keymaps.yank_block = false` leaves the key alone, like every other option
+  -- in `keymaps`. Checked on R, whose buffer is made afresh: a mapping set on a
+  -- buffer survives an `:edit!` of it, so only a new buffer can show it.
+  local function maps(buf, lhs)
+    for _, m in ipairs(vim.api.nvim_buf_get_keymap(buf, 'n')) do
+      if m.lhs == lhs then
+        return true
+      end
+    end
+    return false
+  end
+  config.setup({ keymaps = { yank_block = false } })
+  truthy('8.6 in R with the key disabled', reset_to_blocks())
+  truthy('8.6 keymaps.yank_block = false leaves gy alone in R',
+    not maps(current_state().rendered, 'gy'))
+  config.setup({})
+  truthy('8.6 and it comes back when the option does', reset_to_blocks())
+  truthy('8.6 R maps gy again', maps(current_state().rendered, 'gy'))
 end)
 
 --------------------------------------------------------------------------------

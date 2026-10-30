@@ -1362,6 +1362,109 @@ function M.follow(win, opts)
   M.attach(vim.api.nvim_get_current_buf(), win)
 end
 
+--- The text of the block at `source`, and whether it is copied linewise.
+---
+--- Four kinds are copyable, and each contributes what a reader would paste
+--- somewhere else. A fenced code block — any language, mermaid included —
+--- contributes the lines between its fences, without the opener and the closer:
+--- the body is what goes into a REPL or a file, and the fences are markup that
+--- would have to be deleted again. A table contributes its own source lines,
+--- pipes and all: a table is already the thing being pasted. An image
+--- contributes its `![...](...)` reference, which is a span inside a paragraph
+--- rather than a block, and so is copied characterwise.
+---
+--- Anything else — a paragraph, a heading, a list item — has no boundary that
+--- can be found without parsing markdown, so it is not copyable here.
+---
+--- `doc` is nil in S, which is why the image is resolved two ways: R knows the
+--- source line a display row came from but has no byte column to compare
+--- against, and S has the cursor's own byte column.
+local function copyable(doc, row, col, source, lines)
+  local fence = preview.find_code_fence(lines, source)
+  if fence then
+    return fence.body, true
+  end
+
+  local tbl = preview.find_table(lines, source)
+  if tbl then
+    return tbl.lines, true
+  end
+
+  local ref = doc and link.image_at_row(lines, doc, row) or link.at(lines, source, col)
+  if not ref or not ref.image then
+    return nil
+  end
+  local text = lines[source + 1]
+  if not text then
+    return nil
+  end
+  return { text:sub(ref.from, ref.to) }, false
+end
+
+--- Put the block under the cursor in the unnamed and `0` registers.
+---
+--- Belongs to both states, because the block a reader wants is the one under
+--- the cursor wherever they are reading. Off a copyable block the key goes back
+--- to Vim rather than being swallowed, so `gy` keeps whatever it means in the
+--- reader's own configuration.
+---
+--- The source buffer is read directly in S and through the document in R: a
+--- display row is not a source row, and `render.source_line_for` is the only
+--- thing that knows the difference. `st.doc` is nil in S — R's buffer is wiped
+--- on the way out, taking the document with it — so its absence is the ordinary
+--- case there and only a rendering failure in R.
+function M.yank_block(win)
+  win = win or vim.api.nvim_get_current_win()
+  if not vim.api.nvim_win_is_valid(win) then
+    return
+  end
+
+  local key = config.options.keymaps.yank_block
+  local st = state.get(win)
+  local buf = vim.api.nvim_win_get_buf(win)
+  local rendered = buf == st.rendered
+  if not rendered and buf ~= st.source then
+    return feed(key)
+  end
+  if rendered and not st.doc then
+    return feed(key)
+  end
+
+  local lines = source_lines(st)
+  if not lines then
+    return feed(key)
+  end
+
+  local cursor = vim.api.nvim_win_get_cursor(win)
+  local row, col = cursor[1] - 1, cursor[2]
+  -- Written out rather than as `rendered and ... or row`: a document that maps
+  -- the row to nothing must not silently fall back to treating a display row as
+  -- a source row.
+  local source
+  if rendered then
+    source = render.source_line_for(st.doc, row)
+  else
+    source = row
+  end
+  if not source then
+    return feed(key)
+  end
+
+  local text, linewise = copyable(rendered and st.doc or nil, row, col, source, lines)
+  if not text then
+    return feed(key)
+  end
+
+  -- Both registers, because they answer different questions: `"` is what `p`
+  -- reads, and `0` is where a reader looks for the last thing they yanked.
+  local kind = linewise and 'V' or 'v'
+  vim.fn.setreg('"', text, kind)
+  vim.fn.setreg('0', text, kind)
+  status(linewise
+    and string.format('md-render: yanked %d line%s', #text, #text == 1 and '' or 's')
+    or 'md-render: yanked the image reference')
+end
+
 --- Cross from R into S at the source line under the cursor, then feed `key`.
 ---
 --- The cursor is placed before the key is fed, so that Vim's own `i`, `o` and
@@ -1504,6 +1607,13 @@ function M.set_keymaps(buf, insert_entry)
   map(options.keymaps.follow_tab, function()
     M.follow(nil, { tab = true })
   end, 'md-render: follow the link in a new tab')
+
+  -- Like the follow keys, the copy key belongs to both states: the block a
+  -- reader wants to take away is the one under the cursor, and the cursor is
+  -- in R about as often as in S.
+  map(options.keymaps.yank_block, function()
+    M.yank_block()
+  end, 'md-render: yank the block under the cursor')
 
   if not insert_entry then
     return

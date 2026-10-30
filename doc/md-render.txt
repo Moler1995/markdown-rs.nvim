@@ -213,6 +213,7 @@ Every top-level key in `config.defaults`, with its default. Set a keymap to
     preview = '<CR>',
     follow = 'gf',
     follow_tab = 'gF',
+    yank_block = 'gy',
     open_image = 'gx',
     frame_next = '<C-n>',
     pause = '<Space>',
@@ -289,6 +290,14 @@ R is the rendered view, S the source. "Both" means the map is set in each.
 |keymaps.follow_tab| (both, default `gF`)~
   Follow a file link in a new tab, leaving R where it is. A URL or an anchor
   still acts in place.
+
+|keymaps.yank_block| (both, default `gy`)~
+  Yank the content of the block under the cursor into the unnamed and `0`
+  registers. A fenced code block contributes the lines between its fences,
+  whatever its language, mermaid included; a table contributes its own source
+  lines; an image contributes its `![...](...)` reference, characterwise. A
+  paragraph, a heading or a list item is not one of these, and off all of them
+  the key goes back to Vim.
 
 |keymaps.preview| (R, default `<CR>`)~
   Preview the table, mermaid fence or image under the cursor in a popup; press

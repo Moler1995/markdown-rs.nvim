@@ -287,6 +287,15 @@ M.defaults = {
   -- Vim. It shadows `gx`, which means "open this with the system handler"
   -- already, so a URL or a path on prose keeps working.
   --
+  -- `yank_block` belongs to both states, like `follow`, because the block a
+  -- reader wants is the one under the cursor in whichever view they are reading.
+  -- It puts the block's content in the unnamed and the `0` register: a code
+  -- fence (whatever its language) contributes the lines between its fences, a
+  -- table its own source lines, and an image reference the `![...](...)` text.
+  -- A paragraph, a heading or a list item is not a block this key knows, and off
+  -- all of them it hands the key back to Vim. `gy` is the default because it
+  -- sits beside `gf` and `gx` and is bound to nothing in Vim.
+  --
   -- `pause` is the popup's playback toggle, bound there only while an animated
   -- image is playing.
   keymaps = {
@@ -295,6 +304,7 @@ M.defaults = {
     preview = '<CR>',
     follow = 'gf',
     follow_tab = 'gF',
+    yank_block = 'gy',
     open_image = 'gx',
     frame_next = '<C-n>',
     pause = '<Space>',
